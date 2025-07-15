@@ -9,12 +9,7 @@
 set -Eeuo pipefail
 trap 'echo -e "\e[31m[ERROR]\e[0m Line $LINENO: Command exited with status $?"' ERR
 
-# ----- dynamic latest version ---------------------------------
-LATEST_TAG=$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest | \
-             grep -Po '"tag_name":\s*"\K(.*?)(?=")' || true)
-FRP_VERSION=${LATEST_TAG#v}
-[[ -z $FRP_VERSION ]] && FRP_VERSION="0.63.0"   # fallback
-
+FRP_VERSION="0.63.0"
 INSTALL_DIR="/opt/frp"
 CONF_DIR="/etc/frp"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -49,8 +44,7 @@ sysreload(){ systemctl daemon-reload; }
 install_frp(){
   [[ -x $INSTALL_DIR/frps && -x $INSTALL_DIR/frpc ]] && return
   echo -e "${CYAN}Downloading FRP $FRP_VERSION…${NC}"
-  curl -fsSL -o "/tmp/$(pkg)" "https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/$(pkg)" \
-    || die "Download failed"
+  curl -fsSL -o "/tmp/$(pkg)" "https://github.com/fatedier/frp/releases/download/v${FRP_VERSION}/$(pkg)" || die "Download failed"
   mkdir -p "$INSTALL_DIR" "$CONF_DIR"
   tar -xzf "/tmp/$(pkg)" -C "$INSTALL_DIR" --strip-components=1
 }
@@ -91,6 +85,7 @@ collect_proxies(){  # arrays PROTO LOCAL REMOTE
 # ---------- config writers ----------
 
 write_frps_conf(){
+  mkdir -p "$CONF_DIR"
   local ports=""; for p in "${REMOTE[@]}"; do ports+="$p,"; done; ports="${ports%,}"
 
 cat >"${CONF_DIR}/frps.ini" <<EOF
@@ -121,6 +116,7 @@ fi
 }
 
 write_frpc_conf(){
+  mkdir -p "$CONF_DIR"
 cat >"${CONF_DIR}/frpc.ini" <<EOF
 [common]
 server_addr        = ${SERVER_IP}
@@ -161,6 +157,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+ExecStartPre=/bin/sleep 10
 ExecStart=${bin} -c ${cfg}
 Restart=always
 RestartSec=5
@@ -176,8 +173,8 @@ EOF
 create_frps(){
   clear; line; echo -e "${GREEN}Configure frps (Iran) – Unlimited${NC}"
   collect_ctrl_proto
-  [[ $CTRL_PROTO == tcp ]] && collect_domain
   ask_tls
+  [[ $ENABLE_TLS == "yes" && $CTRL_PROTO == "tcp" ]] && collect_domain
   ask BIND_PORT "Control port (TCP or UDP for QUIC)" 8443
   ask TOKEN     "Auth token"                           greatpr
   collect_proxies
