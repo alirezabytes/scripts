@@ -92,7 +92,6 @@ cat >"${CONF_DIR}/frps.ini" <<EOF
 [common]
 bind_port      = ${BIND_PORT}
 token          = ${TOKEN}
-tcp_mux        = false
 max_pool_count = 0
 allow_ports    = ${ports}
 EOF
@@ -123,7 +122,6 @@ server_addr        = ${SERVER_IP}
 server_port        = ${SERVER_PORT}
 protocol           = ${CTRL_PROTO}
 token              = ${TOKEN}
-tcp_mux            = false
 login_fail_exit    = false
 heartbeat_interval = 15
 EOF
