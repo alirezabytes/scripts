@@ -49,7 +49,16 @@ pkg(){ echo "frp_${FRP_VERSION}_linux_$(arch).tar.gz"; }
 
 line(){ local c="${1:-${CYAN}}"; printf "${c}%*s${NC}\n" 80 | tr ' ' '='; }
 
-prompt(){ local msg="$1" def="${2:-}" var="$3"; local input; read -rp "$(echo -e "${msg} [${YELLOW}${def}${NC}] : ")" input || true; if [[ -z "$input" ]]; then printf -v "$var" "%s" "$def"; else printf -v "$var" "%s" "$input"; fi; }
+prompt(){
+  local msg="$1" def="${2:-}" var="$3"
+  local input
+  read -rp "$(echo -e "${msg} [${YELLOW}${def}${NC}] : ")" input || true
+  if [[ -z "$input" ]]; then
+    printf -v "$var" "%s" "$def"
+  else
+    printf -v "$var" "%s" "$input"
+  fi
+}
 
 die(){ echo -e "${RED}ERROR:${NC} $*"; exit 1; }
 
@@ -138,7 +147,8 @@ schedule_restart(){
     7) cron_min="0"; cron_hr="0"; desc="daily";;
     *) echo "Invalid"; enter_to_continue; return;;
   esac
-  local tmp=$(mktemp)
+  local tmp
+  tmp=$(mktemp)
   sudo crontab -l 2>/dev/null > "$tmp" || true
   sed -i "/# ${tag} auto restart ${svc}$/d" "$tmp"
   echo "${cron_min} ${cron_hr} * * * /usr/bin/systemctl restart ${svc} >> /var/log/${tag}_cron.log 2>&1 # ${tag} auto restart ${svc}" >> "$tmp"
@@ -151,7 +161,8 @@ schedule_restart(){
 delete_restart(){
   clear; line "$CYAN"; echo -e "${CYAN}Delete Scheduled Restarts${NC}"; line "$CYAN"
   local tag="FRPMenu"
-  local tmp=$(mktemp)
+  local tmp
+  tmp=$(mktemp)
   sudo crontab -l 2>/dev/null > "$tmp" || true
   if ! grep -q "# ${tag} auto restart" "$tmp"; then
     echo -e "${YELLOW}No FRPMenu cron jobs found${NC}"; rm -f "$tmp"; enter_to_continue; return
@@ -178,8 +189,7 @@ view_logs(){
 }
 
 # --------------------------- CONFIG WRITERS ----------------------------------
-# We support TOML by default. You can force INI if needed.
-# Helpers to build arrays of proxies.
+# We support TOML by default.
 
 declare -A PROTO_MAP LOCAL_MAP REMOTE_MAP CUSTOM_DOMAINS_MAP
 
@@ -190,7 +200,7 @@ collect_proxies(){
     read -rp "Proxy #$i protocol (tcp/udp/http/https) [tcp] : " proto || true
     proto=${proto,,}; [[ $proto =~ ^(udp|http|https)$ ]] || proto="tcp"
     while true; do prompt "Local port (#$i)" 443 lp; validate_port "$lp" && break || echo -e "${RED}Invalid port${NC}"; done
-    while true; do prompt "Remote port on server (#$i)" "$lp" rp; validate_port "$rp" && break || echo -e "${RED}Invalid port${NC}"; end
+    while true; do prompt "Remote port on server (#$i)" "$lp" rp; validate_port "$rp" && break || echo -e "${RED}Invalid port${NC}"; done
     if [[ $proto == http || $proto == https ]]; then
       prompt "Custom domain for this proxy (optional)" "" dom
     else
@@ -358,7 +368,6 @@ create_client(){
 }
 
 # --------------------------- PROXY MANAGEMENT (CLIENT) -----------------------
-# Utilities to read/write TOML blocks
 read_frpc_config(){
   local file="$1"; local -n common_ref=$2; local -n blocks_ref=$3
   common_ref=""; blocks_ref=()
@@ -369,8 +378,10 @@ read_frpc_config(){
       if [[ -n $proxy_block ]]; then blocks_ref+=("$proxy_block"); fi
       proxy_block="$line"; in_common=false; continue
     fi
-    if $in_common; then [[ -n $line ]] && common_ref+="$line"$'\n'
-    else [[ -n $line ]] && proxy_block+=$'\n'"$line"
+    if $in_common; then
+      [[ -n $line ]] && common_ref+="$line"$'\n'
+    else
+      [[ -n $line ]] && proxy_block+=$'\n'"$line"
     fi
   done <"$file"
   [[ -n $proxy_block ]] && blocks_ref+=("$proxy_block")
@@ -525,8 +536,8 @@ show_dashboard_info(){
   done
   local port user pwd
   port=$(grep -E '^dashboard_port' "$cfg" | awk '{print $3}' | tr -d '\r')
-  user=$(grep -E '^dashboard_user' "$cfg" | awk '{print $3}' | tr -d '"\r')
-  pwd=$(grep -E '^dashboard_pwd' "$cfg" | awk '{print $3}' | tr -d '"\r')
+  user=$(grep -E '^dashboard_user' "$cfg" | awk '{print $3}' | tr -d '\"'\r)
+  pwd=$(grep -E '^dashboard_pwd' "$cfg" | awk '{print $3}' | tr -d '\"'\r)
   if [[ -n $port ]]; then
     echo -e "Port: ${port}\nUser: ${user}\nPassword: ${pwd}"
   else
@@ -539,7 +550,7 @@ show_dashboard_info(){
 remove_service(){
   local prefix="$1" # frp-server- or frp-client-
   clear; line "$CYAN"; echo -e "${CYAN}Remove ${prefix}* service${NC}"; line "$CYAN"
-  mapfile -t svcs < <(systemctl list-unit-files --full --no-pager | grep "^${prefix}.*.service" | awk '{print $1}')
+  mapfile -t svcs < <(systemctl list-unit-files --full --no-pager | grep "^${prefix}.*\\.service" | awk '{print $1}')
   if [[ ${#svcs[@]} -eq 0 ]]; then echo -e "${YELLOW}No ${prefix} services found${NC}"; enter_to_continue; return; fi
   echo "Select service to delete:"; select s in "${svcs[@]}" "Back"; do
     [[ $REPLY -gt ${#svcs[@]} ]] && return
@@ -555,7 +566,6 @@ remove_service(){
   rm -f "$SYSTEMD_DIR/$svc"
   sysreload
   [[ -f $cfg_file ]] && rm -f "$cfg_file"
-  # remove cron job
   (sudo crontab -l 2>/dev/null | grep -v "# FRPMenu auto restart ${svc}$") | sudo crontab -
   echo -e "${GREEN}${svc} removed${NC}"
   enter_to_continue
