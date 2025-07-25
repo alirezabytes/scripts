@@ -18,14 +18,14 @@ trap 'echo -e "\e[31m[ERROR]\e[0m Line $LINENO: Command exited with status $?"' 
 
 # --------------------------- GLOBAL DEFAULTS ---------------------------------
 FRP_VERSION="0.63.0"                  # default fallback version if GitHub query fails
-INSTALL_DIR="/opt/frp"               # where FRP binaries live (frps, frpc)
-CONF_BASE_DIR="/etc/frp"             # store config files here
-SYSTEMD_DIR="/etc/systemd/system"    # systemd units
-LOG_DIR="/var/log/frp"               # log destination for config files
-TLS_CERT_BASE="/etc/letsencrypt/live"# default cert root
+INSTALL_DIR="/opt/frp"                # where FRP binaries live (frps, frpc)
+CONF_BASE_DIR="/etc/frp"              # store config files here
+SYSTEMD_DIR="/etc/systemd/system"     # systemd units
+LOG_DIR="/var/log/frp"                # log destination for config files
+TLS_CERT_BASE="/etc/letsencrypt/live" # default cert root
 POOL_DEFAULT=0                        # unlimited
-CTRL_PROTO_DEFAULT="tcp"             # tcp|quic|kcp|websocket|wss
-TOKEN_DEFAULT="greatpr"              # default token
+CTRL_PROTO_DEFAULT="tcp"              # tcp|quic|kcp|websocket|wss
+TOKEN_DEFAULT="greatpr"               # default token
 BIND_PORT_DEFAULT=8443                # default bind port
 UDP_PACKET_SIZE_DEFAULT=1500          # recommended FRP advanced option
 
@@ -47,16 +47,19 @@ arch(){
 
 pkg(){ echo "frp_${FRP_VERSION}_linux_$(arch).tar.gz"; }
 
-line(){ local c="${1:-${CYAN}}"; printf "${c}%*s${NC}\n" 80 | tr ' ' '='; }
+line(){
+  local c="${1:-${CYAN}}"
+  printf "${c}%*s${NC}\n" 80 | tr ' ' '='
+}
 
 prompt(){
-  local msg="$1" def="${2:-}" var="$3"
+  local msg="$1" def="${2:-}" __varname="$3"
   local input
   read -rp "$(echo -e "${msg} [${YELLOW}${def}${NC}] : ")" input || true
   if [[ -z "$input" ]]; then
-    printf -v "$var" "%s" "$def"
+    printf -v "$__varname" "%s" "$def"
   else
-    printf -v "$var" "%s" "$input"
+    printf -v "$__varname" "%s" "$input"
   fi
 }
 
@@ -86,7 +89,6 @@ ensure_dirs(){ mkdir -p "$INSTALL_DIR" "$CONF_BASE_DIR" "$LOG_DIR" "$(dirname "$
 
 # --------------------------- INSTALL / UPDATE FRP ----------------------------
 install_frp(){
-  # Try to fetch latest version tag from GitHub
   local latest_tag
   latest_tag=$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest 2>/dev/null | grep -m1 '"tag_name"' | cut -d '"' -f4 || true)
   if [[ -n "$latest_tag" ]]; then
@@ -189,8 +191,6 @@ view_logs(){
 }
 
 # --------------------------- CONFIG WRITERS ----------------------------------
-# We support TOML by default.
-
 declare -A PROTO_MAP LOCAL_MAP REMOTE_MAP CUSTOM_DOMAINS_MAP
 
 collect_proxies(){
@@ -536,8 +536,8 @@ show_dashboard_info(){
   done
   local port user pwd
   port=$(grep -E '^dashboard_port' "$cfg" | awk '{print $3}' | tr -d '\r')
-  user=$(grep -E '^dashboard_user' "$cfg" | awk '{print $3}' | tr -d '\"'\r)
-  pwd=$(grep -E '^dashboard_pwd' "$cfg" | awk '{print $3}' | tr -d '\"'\r)
+  user=$(grep -E '^dashboard_user' "$cfg" | awk '{print $3}' | tr -d '"\r')
+  pwd=$(grep -E '^dashboard_pwd' "$cfg" | awk '{print $3}' | tr -d '"\r')
   if [[ -n $port ]]; then
     echo -e "Port: ${port}\nUser: ${user}\nPassword: ${pwd}"
   else
@@ -548,7 +548,7 @@ show_dashboard_info(){
 
 # --------------------------- REMOVE SERVICES ---------------------------------
 remove_service(){
-  local prefix="$1" # frp-server- or frp-client-
+  local prefix="$1"
   clear; line "$CYAN"; echo -e "${CYAN}Remove ${prefix}* service${NC}"; line "$CYAN"
   mapfile -t svcs < <(systemctl list-unit-files --full --no-pager | grep "^${prefix}.*\\.service" | awk '{print $1}')
   if [[ ${#svcs[@]} -eq 0 ]]; then echo -e "${YELLOW}No ${prefix} services found${NC}"; enter_to_continue; return; fi
