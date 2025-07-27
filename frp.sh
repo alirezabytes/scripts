@@ -1,85 +1,77 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  FRP Unlimited Menu (Personalized)
-#  - English messages & comments
-#  - Uses TOML configs (frps-<name>.toml / frpc-<name>.toml)
-#  - Multi-service layout: frp-server-<name>.service / frp-client-<name>.service
-#  - No apt install, no certbot operations, no cron management
-#  - Transport protocols: tcp, kcp, quic, websocket, wss
-#  - Dashboard optional (port/user/password) like script #1
-#  - Detect existing Let's Encrypt certs under /etc/letsencrypt/live
-#  - Install binaries via GitHub API (latest), like script #1
+#  FRP Unlimited Menu (modern TOML for v0.63.x)
+#  - English prompts & comments
+#  - Uses TOML (frps-<name>.toml / frpc-<name>.toml)
+#  - Multi-service systemd units: frp-server-<name>.service / frp-client-<name>.service
+#  - Fetches latest binaries from GitHub API
+#  - Protocols: tcp, kcp, quic, websocket, wss
+#  - TLS: server uses transport.tls.force, client uses transport.tls.enable
+#  - Auth: auth.method = "token" / auth.token = "..."
+#  - Dashboard via webServer.* (note: not optimized for huge proxy counts)
+#  - Adds hardening & LimitNOFILE=200000 in systemd units
 # ============================================================================
+# Safer defaults: do NOT use -e to avoid noisy traps in interactive flows
+set -Euo pipefail
+: "${FRP_DEBUG:=0}"
+# If FRP_DEBUG=1, print failing command lines. Otherwise stay quiet.
+trap 's=$?; if [[ "$FRP_DEBUG" == 1 ]]; then echo "[ERROR] line $LINENO: $BASH_COMMAND -> exit $s"; fi' ERR
 
-set -Eeuo pipefail
-trap 'status=$?; echo "[ERROR] Line $LINENO: exit $status"; exit $status' ERR
-
-# --------- Paths & globals ---------
-SCRIPT_VERSION="2.0.0"
-BASE_DIR="$(pwd)/frp"                 # per-user config root (similar to script #1)
+SCRIPT_VERSION="2.1.0"
+BASE_DIR="$(pwd)/frp"                 # per-user config root
 BIN_FRPS="/usr/local/bin/frps"
 BIN_FRPC="/usr/local/bin/frpc"
 SYSTEMD_DIR="/etc/systemd/system"
 LETSCERT_DIR="/etc/letsencrypt/live"
 
-# --------- Helpers ---------
 log(){ echo "$*"; }
 ok(){ echo "[OK] $*"; }
 err(){ echo "[ERR] $*" >&2; }
-pause(){ read -rp "Press Enter to continue..." _; }
+pause(){ read -rp "Press Enter to continue..." _ || true; }
 
 arch_tag(){
   case "$(uname -m)" in
     x86_64|amd64) echo linux_amd64 ;;
     aarch64|arm64) echo linux_arm64 ;;
     armv7l) echo linux_arm ;;
-    *) err "Unsupported architecture: $(uname -m)"; exit 1 ;;
+    *) err "Unsupported arch: $(uname -m)"; exit 1 ;;
   esac
 }
 
 latest_frp_url(){
-  local tag arch; arch=$(arch_tag)
-  tag=$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest | \
-        grep '"tag_name"' | head -n1 | sed -E 's/.*"v?([0-9.]+)".*/\1/') || true
-  [[ -z ${tag:-} ]] && { err "Failed to query latest FRP tag from GitHub"; return 1; }
+  local arch tag
+  arch=$(arch_tag)
+  tag=$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest \
+        | grep '"tag_name"' | head -n1 | sed -E 's/.*"v?([0-9.]+)".*/\1/') || true
+  [[ -z ${tag:-} ]] && { err "Failed to query latest tag"; return 1; }
   curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest \
-    | grep 'browser_download_url' \
-    | grep -E "${arch}\.tar\.gz" \
+    | grep 'browser_download_url' | grep -E "${arch}\\.tar\\.gz" \
     | cut -d '"' -f 4 | head -n1
 }
 
 install_frp(){
   log "Downloading latest FRP via GitHub API..."
-  local url; url=$(latest_frp_url) || { err "Could not resolve download URL"; return 1; }
-  [[ -z $url ]] && { err "Download URL is empty"; return 1; }
+  local url pkg tmpdir
+  url=$(latest_frp_url) || { err "Could not resolve download URL"; return 1; }
+  [[ -z $url ]] && { err "Empty URL"; return 1; }
   log "URL: $url"
-  local tmp=/tmp frp_pkg; frp_pkg="$tmp/$(basename "$url")"
-  curl -fL -o "$frp_pkg" "$url" || { err "Download failed"; return 1; }
-  local extract_dir; extract_dir="$tmp/$(basename "$frp_pkg" .tar.gz)"
-  rm -rf "$extract_dir" && mkdir -p "$extract_dir"
-  tar -xzf "$frp_pkg" -C "$extract_dir" --strip-components=1
-  install -m 0755 "$extract_dir/frps" "$BIN_FRPS"
-  install -m 0755 "$extract_dir/frpc" "$BIN_FRPC"
-  rm -rf "$extract_dir" "$frp_pkg"
-  ok "FRP binaries installed: $BIN_FRPS , $BIN_FRPC"
+  pkg="/tmp/$(basename "$url")"
+  curl -fL -o "$pkg" "$url"
+  tmpdir="/tmp/frp-extract.$$"; rm -rf "$tmpdir"; mkdir -p "$tmpdir"
+  tar -xzf "$pkg" -C "$tmpdir" --strip-components=1
+  install -m0755 "$tmpdir/frps" "$BIN_FRPS"
+  install -m0755 "$tmpdir/frpc" "$BIN_FRPC"
+  rm -rf "$tmpdir" "$pkg"
+  ok "Installed: $BIN_FRPS , $BIN_FRPC"
 }
 
 is_installed(){ [[ -x "$BIN_FRPS" && -x "$BIN_FRPC" ]]; }
-
-binary_status(){ if is_installed; then echo 'Installed'; else echo 'Not installed'; fi; }
-
-service_exists(){ systemctl list-unit-files --type=service --no-pager | grep -q "^$1\.service"; }
-
-list_services(){ systemctl list-units --type=service --all --no-pager | awk '{print $1}' | grep -E '^(frp-server|frp-client)-.*\.service$' | sed 's/\.service$//'; }
-
-safe_user(){ whoami; }
+status_binaries(){ if is_installed; then echo "Installed"; else echo "Not installed"; fi; }
 
 ensure_base(){ mkdir -p "$BASE_DIR"; }
+safe_user(){ whoami; }
 
 validate_port(){ local p=${1:-}; [[ $p =~ ^[0-9]+$ ]] && (( p>=1 && p<=65535 )); }
-
-validate_email(){ [[ ${1:-} =~ ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$ ]]; }
-
 validate_host(){
   local h=${1:-}
   local ipv4='^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$'
@@ -91,14 +83,12 @@ validate_host(){
 rand_password(){ head /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 16; }
 
 select_cert(){
-  # Print menu to stderr; output only the selected "cert|key" on stdout
+  # Prints chosen pair as "cert|key" on stdout; empty if none.
   [[ ! -d "$LETSCERT_DIR" ]] && { echo ""; return 0; }
-  mapfile -t domains < <(find "$LETSCERT_DIR" -maxdepth 1 -mindepth 1 -type d ! -name README -printf '%f
-')
+  mapfile -t domains < <(find "$LETSCERT_DIR" -maxdepth 1 -mindepth 1 -type d ! -name README -printf '%f\n')
   (( ${#domains[@]} == 0 )) && { echo ""; return 0; }
   echo "Available certificates:" >&2
-  local i=1
-  for d in "${domains[@]}"; do echo "  $i) $d" >&2; ((i++)); done
+  local i=1; for d in "${domains[@]}"; do echo "  $i) $d" >&2; ((i++)); done
   echo "  0) Cancel" >&2
   local idx; read -rp "Choose certificate [0 to cancel]: " idx || true
   [[ -z ${idx:-} ]] && idx=0
@@ -106,138 +96,207 @@ select_cert(){
   local dom="${domains[$((idx-1))]}"
   local cert="$LETSCERT_DIR/$dom/fullchain.pem"
   local key="$LETSCERT_DIR/$dom/privkey.pem"
-  if [[ -r "$cert" && -r "$key" ]]; then
-    printf '%s|%s
-' "$cert" "$key"
-  else
-    echo ""
-  fi
+  if [[ -r "$cert" && -r "$key" ]]; then printf '%s|%s\n' "$cert" "$key"; else echo ""; fi
 }
 
+# --------------------------- TOML writers (0.63.x) ---------------------------
+# Notes:
+# - Server auth is under [auth], not top-level.
+# - TLS: server uses transport.tls.force; client uses transport.tls.enable.
+# - Dashboard: webServer.*
+# - Pool: server transport.maxPoolCount caps client transport.poolCount.
+# - allowPorts: list of {single=N} / {start=.., end=..} objects.
+
 write_frps_toml(){
-  # Args: cfg_path server_name bind_port token transport udpPacketSize tls_enable cert_file key_file dashboard_port dashboard_user dashboard_pwd quic_keepalive quic_idle quic_streams
-  local cfg="$1" name="$2" bind="$3" token="$4" proto="$5" udp_sz="$6" tls="$7"
+  # Args:
+  #   $1 cfg_path
+  #   $2 name
+  #   $3 bind_port
+  #   $4 token
+  #   $5 protocol   (tcp|kcp|quic|websocket|wss)
+  #   $6 udpPacketSize
+  #   $7 tls_force  (true|false)
+  #   $8 cert_file
+  #   $9 key_file
+  #  $10 dash_port (empty to disable dashboard)
+  #  $11 dash_user
+  #  $12 dash_pwd
+  #  $13 quic_keepalive
+  #  $14 quic_idle
+  #  $15 quic_streams
+  #  $16 max_pool_cap  (server upper bound for client poolCount)
+  #  $17 server_name   (optional SNI verify name for inbound? not used on server; kept for symmetry)
+  #  $18 allow_ports_csv (comma-separated list of integers)
+  local cfg="$1" name="$2" bind="$3" token="$4" proto="$5" udp_sz="$6" tls_force="$7"
   local cfile="${8:-}" kfile="${9:-}" dport="${10:-}" duser="${11:-}" dpwd="${12:-}"
-  local q_keep="${13:-10}" q_idle="${14:-30}" q_streams="${15:-100000}"
+  local qk="${13:-10}" qi="${14:-30}" qs="${15:-100000}" maxcap="${16:-100000}" _sni="${17:-}"
+  local allow_csv="${18:-}"
 
-  cat >"$cfg" <<EOF
-# frps-$name.toml
-[common]
-bind_port = $bind
-token = "$token"
+  : >"$cfg"
+  cat >>"$cfg" <<EOF
+# frps-$name.toml (generated)
+bindAddr = "0.0.0.0"
+bindPort = $bind
+
+# Cap for client-side pre-connection pools (transport.poolCount on frpc).
+transport.maxPoolCount = $maxcap
 EOF
 
-  # tls_enable only meaningful for TCP/WS? Keep consistent with script #1
-  if [[ "$proto" == "tcp" || "$proto" == "websocket" || "$proto" == "wss" ]]; then
-    if [[ "$tls" == "true" ]]; then
-      cat >>"$cfg" <<EOF
-tls_enable = true
-EOF
-      if [[ -n "$cfile" && -n "$kfile" ]]; then
-        cat >>"$cfg" <<EOF
-cert_file = "$cfile"
-key_file = "$kfile"
-EOF
-      fi
-    else
-      echo "tls_enable = false" >>"$cfg"
-    fi
-  else
-    # For KCP/QUIC, FRP ignores tls_enable; don't write it.
-    :
-  fi
-
-  # udpPacketSize: write only when protocol != tcp
-  if [[ "$proto" != "tcp" ]]; then
-    echo "udpPacketSize = $udp_sz" >>"$cfg"
-  fi
-
-  # Protocol specific
+  # KCP / QUIC UDP bind ports
   if [[ "$proto" == "kcp" ]]; then
     echo "kcpBindPort = $bind" >>"$cfg"
   fi
   if [[ "$proto" == "quic" ]]; then
+    echo "quicBindPort = $bind" >>"$cfg"
     cat >>"$cfg" <<EOF
-quicBindPort = $bind
-[transport.quic]
-keepalivePeriod = $q_keep
-maxIdleTimeout = $q_idle
-maxIncomingStreams = $q_streams
+transport.quic.keepalivePeriod = $qk
+transport.quic.maxIdleTimeout = $qi
+transport.quic.maxIncomingStreams = $qs
 EOF
   fi
-  if [[ "$proto" == "websocket" || "$proto" == "wss" ]]; then
-    cat >>"$cfg" <<EOF
-[transport]
-protocol = "$proto"
+
+  # TLS policy
+  if [[ "$tls_force" == "true" ]]; then
+    echo "transport.tls.force = true" >>"$cfg"
+    [[ -n "$cfile" && -n "$kfile" ]] && {
+      echo "transport.tls.certFile = \"$cfile\"" >>"$cfg"
+      echo "transport.tls.keyFile  = \"$kfile\"" >>"$cfg"
+    }
+  else
+    echo "transport.tls.force = false" >>"$cfg"
+  fi
+
+  # UDP size (applies to udp/sudp proxies; keep symmetric with client)
+  if [[ "$proto" != "tcp" ]]; then
+    echo "udpPacketSize = $udp_sz" >>"$cfg"
+  fi
+
+  # Auth
+  cat >>"$cfg" <<EOF
+
+auth.method = "token"
+auth.token  = "$token"
 EOF
+
+  # allowPorts list
+  if [[ -n "$allow_csv" ]]; then
+    echo "allowPorts = [" >>"$cfg"
+    local IFS=','; for p in $allow_csv; do p=${p//[[:space:]]/}; [[ -n $p ]] && echo "  { single = $p }," >>"$cfg"; done
+    echo "]" >>"$cfg"
   fi
 
   # Dashboard
   if [[ -n "$dport" ]]; then
     cat >>"$cfg" <<EOF
 
-dashboard_port = $dport
-dashboard_user = "$duser"
-dashboard_pwd = "$dpwd"
+webServer.addr = "0.0.0.0"
+webServer.port = $dport
+webServer.user = "$duser"
+webServer.password = "$dpwd"
+# webServer.pprofEnable = false
+# enablePrometheus = true
 EOF
   fi
 }
 
 write_frpc_toml(){
-  # Args: cfg_path client_name server_addr server_port token transport tls_enable udpPacketSize
-  local cfg="$1" name="$2" saddr="$3" sport="$4" token="$5" proto="$6" tls="$7" udp_sz="$8"
-  cat >"$cfg" <<EOF
-# frpc-$name.toml
-[common]
-server_addr = "$saddr"
-server_port = $sport
-token = "$token"
+  # Args:
+  #   $1 cfg_path
+  #   $2 name
+  #   $3 server_addr
+  #   $4 server_port
+  #   $5 token
+  #   $6 protocol (tcp|kcp|quic|websocket|wss)
+  #   $7 tls_enable (true|false)
+  #   $8 udpPacketSize
+  #   $9 poolCount
+  #  $10 tls_server_name (optional)
+  local cfg="$1" name="$2" saddr="$3" sport="$4" token="$5" proto="$6" tls="$7" udp_sz="$8" pool="$9" sni="${10:-}"
+
+  : >"$cfg"
+  cat >>"$cfg" <<EOF
+# frpc-$name.toml (generated)
+serverAddr = "$saddr"
+serverPort = $sport
+loginFailExit = false
+
+log.to = "./frpc.log"
+log.level = "info"
+log.maxDays = 3
+
+auth.method = "token"
+auth.token  = "$token"
+
+# Admin (optional) for reload/logs via HTTP API
+webServer.addr = "127.0.0.1"
+webServer.port = 7400
+webServer.user = "admin"
+webServer.password = "admin"
+
+# Transport
 transport.protocol = "$proto"
+transport.poolCount = $pool
 EOF
+
   if [[ "$proto" == "tcp" || "$proto" == "websocket" || "$proto" == "wss" ]]; then
-    echo "tls_enable = $tls" >>"$cfg"
+    echo "transport.tls.enable = $tls" >>"$cfg"
+    [[ -n "$sni" ]] && echo "transport.tls.serverName = \"$sni\"" >>"$cfg"
   fi
+
   if [[ "$proto" != "tcp" ]]; then
     echo "udpPacketSize = $udp_sz" >>"$cfg"
   fi
+
   echo >>"$cfg"
 }
 
 append_proxy_block(){
-  # Args: cfg_path type name local_port remote_port [custom_domain]
+  # Args: cfg type name local_port remote_port [custom_domain]
   local cfg="$1" ptype="$2" pname="$3" lport="$4" rport="$5" cdom="${6:-}"
   {
-    echo "[$pname]"
+    echo "[[proxies]]"
     echo "name = \"$pname\""
     echo "type = \"$ptype\""
-    if [[ "$ptype" == "tcp" || "$ptype" == "udp" ]]; then
-      echo "local_ip = \"127.0.0.1\""
+    if [[ "$ptype" == tcp || "$ptype" == udp ]]; then
+      echo "localIP = \"127.0.0.1\""
     fi
-    echo "local_port = $lport"
-    echo "remote_port = $rport"
-    if [[ "$ptype" == "http" || "$ptype" == "https" ]]; then
-      if [[ -n "$cdom" ]]; then
-        echo "custom_domains = [\"$cdom\"]"
-      fi
+    echo "localPort = $lport"
+    if [[ "$ptype" == http || "$ptype" == https ]]; then
+      [[ -n "$cdom" ]] && echo "customDomains = [\"$cdom\"]"
+    else
+      echo "remotePort = $rport"
     fi
     echo
   } >>"$cfg"
 }
 
+# --------------------------- systemd helpers ---------------------------
 create_service(){
   # Args: unit_name ExecStart
   local unit="$1" exec="$2"
   cat >"$SYSTEMD_DIR/$unit.service" <<EOF
 [Unit]
 Description=$unit
-After=network.target
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
+User=$(safe_user)
+WorkingDirectory=$BASE_DIR
+ExecStartPre=/bin/sleep 5
 ExecStart=$exec
 Restart=always
 RestartSec=5
-User=$(safe_user)
+# Raise file descriptor limit for many concurrent sockets
+LimitNOFILE=200000
+
+# Hardening (keep access to $BASE_DIR and certs under /etc)
+NoNewPrivileges=true
+ProtectSystem=full
+# Do NOT enable ProtectHome when BASE_DIR is under /root; it hides /root and blocks access.
+#ProtectHome=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
@@ -246,178 +305,158 @@ EOF
   systemctl enable --now "$unit.service" >/dev/null 2>&1 || true
 }
 
-show_logs(){ local unit="$1"; journalctl -u "$unit" -n 50 --no-pager; pause; }
 
-remove_service(){
-  local unit="$1"
-  systemctl stop "$unit" >/dev/null 2>&1 || true
-  systemctl disable "$unit" >/dev/null 2>&1 || true
-  rm -f "$SYSTEMD_DIR/$unit.service"
-}
+show_logs(){ local unit="$1"; journalctl -u "$unit" -n 80 --no-pager; pause; }
+
+service_exists(){ systemctl list-unit-files --type=service --no-pager | grep -q "^$1\.service"; }
+list_services(){ systemctl list-units --type=service --all --no-pager | awk '{print $1}' | grep -E '^(frp-server|frp-client)-.*\.service$' | sed 's/\.service$//'; }
+remove_service(){ local unit="$1"; systemctl stop "$unit" >/dev/null 2>&1 || true; systemctl disable "$unit" >/dev/null 2>&1 || true; rm -f "$SYSTEMD_DIR/$unit.service"; }
 
 remove_all(){
   echo "Searching for FRP services..."
   mapfile -t units < <(list_services)
   if (( ${#units[@]} > 0 )); then
-    for u in "${units[@]}"; do
-      echo "Removing service $u"
-      remove_service "$u"
-    done
+    for u in "${units[@]}"; do echo "Removing $u"; remove_service "$u"; done
     systemctl daemon-reload
   fi
-  # Remove configs
-  if [[ -d "$BASE_DIR" ]]; then
-    rm -rf "$BASE_DIR"
-    ok "Removed configs under $BASE_DIR"
-  fi
-  # Remove binaries
-  if [[ -x "$BIN_FRPS" ]]; then rm -f "$BIN_FRPS"; fi
-  if [[ -x "$BIN_FRPC" ]]; then rm -f "$BIN_FRPC"; fi
+  [[ -d "$BASE_DIR" ]] && { rm -rf "$BASE_DIR"; ok "Removed $BASE_DIR"; }
+  [[ -x "$BIN_FRPS" ]] && rm -f "$BIN_FRPS"
+  [[ -x "$BIN_FRPC" ]] && rm -f "$BIN_FRPC"
   ok "Uninstall complete."
 }
 
-# --------- Interactive flows ---------
+# --------------------------- Interactive flows ---------------------------
 
 action_add_server(){
   ensure_base
-  echo "-- Add New FRP Server --"
+  echo "-- Add FRP Server --"
   local name
   while :; do
     read -rp "Server name (alnum, hyphen, underscore): " name || true
     name=$(echo "$name" | tr -cd '[:alnum:]_-')
     [[ -n $name ]] && break || echo "Name cannot be empty"
   done
-  local service="frp-server-$name"
-  local cfg="$BASE_DIR/frps-$name.toml"
+  local service="frp-server-$name" cfg="$BASE_DIR/frps-$name.toml"
   if service_exists "$service"; then err "Service already exists: $service"; pause; return; fi
 
   local bind token
   while :; do read -rp "Bind port (e.g. 7000): " bind || true; validate_port "$bind" && break || echo "Invalid port"; done
   while :; do read -rp "Auth token: " token || true; [[ -n $token ]] && break || echo "Token cannot be empty"; done
 
-  echo "Transport protocol options:"
-  echo "  1) tcp"
-  echo "  2) kcp"
-  echo "  3) quic"
-  echo "  4) websocket"
-  echo "  5) wss"
+  echo "Transport protocol: 1) tcp  2) kcp  3) quic  4) websocket  5) wss"
   local choice proto; read -rp "Choose [1-5]: " choice || true
-  case ${choice:-1} in
-    1) proto="tcp";; 2) proto="kcp";; 3) proto="quic";; 4) proto="websocket";; 5) proto="wss";;
-    *) proto="tcp";;
-  esac
+  case ${choice:-1} in 1) proto=tcp;;2) proto=kcp;;3) proto=quic;;4) proto=websocket;;5) proto=wss;;*) proto=tcp;; esac
 
   local udp_sz=1500
-  if [[ "$proto" != "tcp" ]]; then
-    read -rp "UDP packet size (udpPacketSize) [1500]: " udp_in || true
-    [[ -n ${udp_in:-} ]] && udp_sz="$udp_in"
+  if [[ "$proto" != tcp ]]; then
+    read -rp "UDP packet size [1500]: " x || true; [[ -n ${x:-} ]] && udp_sz="$x"
   fi
 
-  local tls_enable="false" cert_pair cert_file key_file
-  if [[ "$proto" == "tcp" || "$proto" == "websocket" || "$proto" == "wss" ]]; then
-    read -rp "Enable TLS? (y/N): " a || true
+  local tls_force=false cert_pair cert_file key_file
+  if [[ "$proto" == tcp || "$proto" == websocket || "$proto" == wss ]]; then
+    read -rp "Force TLS-only connections? (y/N): " a || true
     if [[ ${a,,} =~ ^y ]]; then
-      tls_enable="true"
+      tls_force=true
       cert_pair=$(select_cert)
       if [[ -n $cert_pair ]]; then
         cert_file="${cert_pair%%|*}"; key_file="${cert_pair##*|}"
         echo "Using cert: $cert_file"
       else
-        echo "No certificate selected/found. TLS will be enabled without explicit cert paths (if supported)."
+        echo "No certificate selected; server will still require TLS but use default key loading if supported."
       fi
     fi
   fi
 
-  local enable_dash="n" dport="" duser="" dpwd=""
-  read -rp "Enable dashboard? (y/N): " enable_dash || true
-  if [[ ${enable_dash,,} =~ ^y ]]; then
+  local dport="" duser="admin" dpwd=""
+  read -rp "Enable dashboard? (y/N): " d || true
+  if [[ ${d,,} =~ ^y ]]; then
     while :; do read -rp "Dashboard port (e.g. 7500): " dport || true; validate_port "$dport" && break || echo "Invalid port"; done
     read -rp "Dashboard username [admin]: " duser || true; duser=${duser:-admin}
     dpwd=$(rand_password)
-    read -rp "Dashboard password (leave empty for random: $dpwd): " inpwd || true
-    [[ -n ${inpwd:-} ]] && dpwd="$inpwd"
-    echo "Dashboard credentials -> user: $duser  pass: $dpwd"
+    read -rp "Dashboard password (empty = random: $dpwd): " t || true; [[ -n ${t:-} ]] && dpwd="$t"
+    echo "Dashboard creds -> user: $duser  pass: $dpwd"
   fi
 
   local qk=10 qi=30 qs=100000
-  if [[ "$proto" == "quic" ]]; then
+  if [[ "$proto" == quic ]]; then
     read -rp "QUIC keepalivePeriod [10]: " t || true; [[ -n ${t:-} ]] && qk="$t"
     read -rp "QUIC maxIdleTimeout [30]: " t || true; [[ -n ${t:-} ]] && qi="$t"
     read -rp "QUIC maxIncomingStreams [100000]: " t || true; [[ -n ${t:-} ]] && qs="$t"
   fi
 
-  write_frps_toml "$cfg" "$name" "$bind" "$token" "$proto" "$udp_sz" "$tls_enable" "$cert_file" "$key_file" "$dport" "$duser" "$dpwd" "$qk" "$qi" "$qs"
+  local maxcap=100000
+  read -rp "Max pool cap (server upper bound, default 100000): " t || true; [[ -n ${t:-} ]] && maxcap="$t"
+
+  # Build allowPorts list from user provided remote ports later on client. If you want to restrict now:
+  local allow_csv=""
+  read -rp "Restrict allowed ports? comma-separated list or empty for no limit: " allow_csv || true
+
+  write_frps_toml "$cfg" "$name" "$bind" "$token" "$proto" "$udp_sz" "$tls_force" \
+                   "$cert_file" "$key_file" "$dport" "$duser" "$dpwd" "$qk" "$qi" "$qs" "$maxcap" "" "$allow_csv"
   ok "Config written: $cfg"
 
   create_service "$service" "$BIN_FRPS -c $cfg"
   ok "Service started: $service"
-  read -rp "View logs now? (y/N): " v || v=""
-if [[ ${v,,} =~ ^y ]]; then
-  show_logs "$service"
-fi
+  read -rp "Show logs? (y/N): " v || true; [[ ${v,,} =~ ^y ]] && show_logs "$service"
 }
 
 action_add_client(){
   ensure_base
-  echo "-- Add New FRP Client --"
+  echo "-- Add FRP Client --"
   local name
   while :; do
     read -rp "Client name (alnum, hyphen, underscore): " name || true
     name=$(echo "$name" | tr -cd '[:alnum:]_-')
     [[ -n $name ]] && break || echo "Name cannot be empty"
   done
-  local service="frp-client-$name"
-  local cfg="$BASE_DIR/frpc-$name.toml"
-  if service_exists "$service"; then err "Service already exists: $service"; pause; return; fi
+  local service="frp-client-$name" cfg="$BASE_DIR/frpc-$name.toml"
+  if service_exists "$service"; then err "Service exists: $service"; pause; return; fi
 
   local saddr sport token
-  while :; do read -rp "Server address (domain/IP): " saddr || true; validate_host "$saddr" && break || echo "Invalid address"; done
-  while :; do read -rp "Server port (e.g. 7000): " sport || true; validate_port "$sport" && break || echo "Invalid port"; done
+  while :; do read -rp "Server address (IP/host): " saddr || true; validate_host "$saddr" && break || echo "Invalid"; done
+  while :; do read -rp "Server port (e.g. 7000): " sport || true; validate_port "$sport" && break || echo "Invalid"; done
   while :; do read -rp "Auth token: " token || true; [[ -n $token ]] && break || echo "Token cannot be empty"; done
 
-  echo "Transport protocol options:"
-  echo "  1) tcp"
-  echo "  2) kcp"
-  echo "  3) quic"
-  echo "  4) websocket"
-  echo "  5) wss"
+  echo "Transport protocol: 1) tcp  2) kcp  3) quic  4) websocket  5) wss"
   local choice proto; read -rp "Choose [1-5]: " choice || true
-  case ${choice:-1} in
-    1) proto="tcp";; 2) proto="kcp";; 3) proto="quic";; 4) proto="websocket";; 5) proto="wss";;
-    *) proto="tcp";;
-  esac
+  case ${choice:-1} in 1) proto=tcp;;2) proto=kcp;;3) proto=quic;;4) proto=websocket;;5) proto=wss;;*) proto=tcp;; esac
 
-  local tls_enable="true"
-  if [[ "$proto" == "tcp" || "$proto" == "websocket" || "$proto" == "wss" ]]; then
-    read -rp "Does server use TLS? (Y/n): " t || true
-    [[ ${t,,} =~ ^n ]] && tls_enable="false" || tls_enable="true"
+  local tls_enable=true sni=""
+  if [[ "$proto" == tcp || "$proto" == websocket || "$proto" == wss ]]; then
+    read -rp "Use TLS to server? (Y/n): " t || true
+    [[ ${t,,} =~ ^n ]] && tls_enable=false || tls_enable=true
+    if $tls_enable; then
+      read -rp "TLS serverName (SNI, optional – set your certificate hostname): " sni || true
+    fi
   fi
 
   local udp_sz=1500
-  if [[ "$proto" != "tcp" ]]; then
-    read -rp "UDP packet size (udpPacketSize) [1500]: " inp || true
-    [[ -n ${inp:-} ]] && udp_sz="$inp"
+  if [[ "$proto" != tcp ]]; then
+    read -rp "UDP packet size [1500]: " x || true; [[ -n ${x:-} ]] && udp_sz="$x"
   fi
 
-  # Write base client TOML
-  write_frpc_toml "$cfg" "$name" "$saddr" "$sport" "$token" "$proto" "$tls_enable" "$udp_sz"
+  local pool=1
+  read -rp "Client poolCount (pre-connections) [1]: " x || true; [[ -n ${x:-} ]] && pool="$x"
 
-  echo "You can create multiple proxies. Type 'done' when finished."
+  write_frpc_toml "$cfg" "$name" "$saddr" "$sport" "$token" "$proto" "$tls_enable" "$udp_sz" "$pool" "$sni"
+  ok "Base client config written: $cfg"
+
+  echo "You can append multiple proxies. Type 'done' to finish."
   local idx=1
   while :; do
     echo "--- Proxy #$idx ---"
     local lport rport ptype cdom=""
     read -rp "Local port (or 'done'): " lport || true
-    [[ ${lport,,} == "done" ]] && break
-    validate_port "$lport" || { echo "Invalid port"; continue; }
-    while :; do read -rp "Remote port: " rport || true; validate_port "$rport" && break || echo "Invalid port"; done
-    echo "Proxy type: 1) tcp  2) udp  3) http  4) https"
-    read -rp "Choose [1-4]: " pt || true
-    case ${pt:-1} in
-      1) ptype="tcp";; 2) ptype="udp";; 3) ptype="http";; 4) ptype="https";; *) ptype="tcp";;
-    esac
-    if [[ "$ptype" == "http" || "$ptype" == "https" ]]; then
+    [[ ${lport,,} == done ]] && break
+    validate_port "$lport" || { echo "Invalid"; continue; }
+    echo "Type: 1) tcp  2) udp  3) http  4) https"
+    read -rp "Choose [1-4]: " t || true
+    case ${t:-1} in 1) ptype=tcp;;2) ptype=udp;;3) ptype=http;;4) ptype=https;; *) ptype=tcp;; esac
+    if [[ "$ptype" == http || "$ptype" == https ]]; then
       read -rp "Custom domain (optional): " cdom || true
+      rport=0  # http/https don't need fixed remote port
+    else
+      while :; do read -rp "Remote port: " rport || true; validate_port "$rport" && break || echo "Invalid"; done
     fi
     local pname="${ptype}_${name}_${idx}"
     append_proxy_block "$cfg" "$ptype" "$pname" "$lport" "$rport" "$cdom"
@@ -427,29 +466,25 @@ action_add_client(){
 
   create_service "$service" "$BIN_FRPC -c $cfg"
   ok "Service started: $service"
-  read -rp "View logs now? (y/N): " v || v=""
-if [[ ${v,,} =~ ^y ]]; then
-  show_logs "$service"
-fi
+  read -rp "Show logs? (y/N): " v || true; [[ ${v,,} =~ ^y ]] && show_logs "$service"
 }
 
-# --- Parse & manage client proxies ---
+# --------------------------- Client config parser (manage ports) ---------------------------
+# Minimal parser for [[proxies]] blocks.
+
 read_frpc_config(){
-  # $1 cfg, outputs global COMMON and PROXIES array (each block string)
   local cfg="$1"; COMMON=""; PROXIES=()
-  local in_common=false in_block=false block="" header
+  local in_block=false block=""
   while IFS='' read -r line || [[ -n "$line" ]]; do
-    local t="${line%%$'\r'}" # strip CR
-    if [[ $t =~ ^\[common\] ]]; then in_common=true; in_block=false; continue; fi
-    if [[ $t =~ ^\[.*\] ]]; then
-      # new block
+    local t="${line%%$'\r'}"
+    if [[ $t =~ ^\[\[proxies\]\] ]]; then
       if [[ -n $block ]]; then PROXIES+=("$block"); fi
-      block="$t"
-      in_block=true; in_common=false; continue
+      block="[[proxies]]"; in_block=true; continue
     fi
-    if $in_common; then
-      [[ -n ${t//[[:space:]]/} ]] && COMMON+="$t\n"
-    elif $in_block; then
+    if $in_block; then
+      if [[ $t =~ ^\[\[visitors\]\] || $t =~ ^\[\[proxies\]\] ]]; then
+        PROXIES+=("$block"); block="[[proxies]]"; continue
+      fi
       [[ -n ${t//[[:space:]]/} ]] && block+=$'\n'"$t"
     fi
   done <"$cfg"
@@ -460,24 +495,18 @@ write_frpc_with_blocks(){
   local cfg="$1"; shift
   : >"$cfg"
   echo "# regenerated by menu" >>"$cfg"
-  echo "[common]" >>"$cfg"
-  [[ -n ${COMMON:-} ]] && echo -e "$COMMON" >>"$cfg"
-  for b in "${PROXIES[@]}"; do
-    echo >>"$cfg"; echo "$b" >>"$cfg"
-  done
+  # keep the head of file (we won't re-write all globals here for simplicity)
+  for b in "${PROXIES[@]}"; do echo >>"$cfg"; echo "$b" >>"$cfg"; done
 }
-
-extract_field(){ echo "$1" | grep -E "^$2\s*=\s*" | awk -F'=' '{print $2}' | tr -d ' "\r'; }
 
 manage_client_ports(){
   echo "-- Manage Client Ports --"
   mapfile -t units < <(systemctl list-units --type=service --all --no-pager | awk '{print $1}' | sed -n 's/\.service$//p' | grep '^frp-client-')
-  (( ${#units[@]} == 0 )) && { echo "No frp-client-* services found"; pause; return; }
+  (( ${#units[@]} == 0 )) && { echo "No client services found"; pause; return; }
   local i=1; for u in "${units[@]}"; do echo "  $i) $u"; ((i++)); done
-  read -rp "Choose client: " idx || true
+  local idx; read -rp "Choose client: " idx || true
   (( idx>=1 && idx<=${#units[@]} )) || { echo "Invalid"; pause; return; }
-  local unit="${units[$((idx-1))]}" name="${unit#frp-client-}"
-  local cfg="$BASE_DIR/frpc-$name.toml"
+  local unit="${units[$((idx-1))]}" name="${unit#frp-client-}" cfg="$BASE_DIR/frpc-$name.toml"
   [[ -f "$cfg" ]] || { err "Config not found: $cfg"; pause; return; }
 
   while :; do
@@ -492,109 +521,86 @@ manage_client_ports(){
       1)
         read_frpc_config "$cfg"
         if (( ${#PROXIES[@]} == 0 )); then echo "No proxies"; else
-          local idx=1
+          local j=1
           for blk in "${PROXIES[@]}"; do
             local nm type lp rp dom
             nm=$(echo "$blk" | grep -E '^name\s*=' | awk -F'=' '{print $2}' | tr -d ' "')
             type=$(echo "$blk" | grep -E '^type\s*=' | awk -F'=' '{print $2}' | tr -d ' "')
-            lp=$(echo "$blk" | grep -E '^local_port\s*=' | awk -F'=' '{print $2}' | tr -d ' ')
-            rp=$(echo "$blk" | grep -E '^remote_port\s*=' | awk -F'=' '{print $2}' | tr -d ' ')
-            dom=$(echo "$blk" | grep -E '^custom_domains\s*=' | sed -E 's/.*\[(.*)\].*/\1/' | tr -d ' "')
-            echo "$idx) $nm  type=$type  local=$lp  remote=$rp  domains=$dom"
-            ((idx++))
+            lp=$(echo "$blk" | grep -E '^localPort\s*=' | awk -F'=' '{print $2}' | tr -d ' ')
+            rp=$(echo "$blk" | grep -E '^remotePort\s*=' | awk -F'=' '{print $2}' | tr -d ' ')
+            dom=$(echo "$blk" | grep -E '^customDomains\s*=' | sed -E 's/.*\[(.*)\].*/\1/' | tr -d ' "')
+            echo "$j) $nm  type=$type  local=$lp  remote=$rp  domains=$dom"
+            ((j++))
           done
         fi
         pause;;
       2)
-        local l r pt dom=""; while :; do read -rp "Local port: " l || true; validate_port "$l" && break || echo "Invalid"; done
-        while :; do read -rp "Remote port: " r || true; validate_port "$r" && break || echo "Invalid"; done
+        local l r pt dom=""
+        while :; do read -rp "Local port: " l || true; validate_port "$l" && break || echo "Invalid"; done
         echo "Type 1) tcp 2) udp 3) http 4) https"; read -rp "Choose: " pt || true
-        case ${pt:-1} in 1) pt="tcp";;2) pt="udp";;3) pt="http";;4) pt="https";;*) pt="tcp";; esac
-        if [[ $pt == http || $pt == https ]]; then read -rp "Custom domain (optional): " dom || true; fi
-        read_frpc_config "$cfg"; local n=$(( ${#PROXIES[@]} + 1 )) pname="${pt}_${name}_${n}"
+        case ${pt:-1} in 1) pt=tcp;;2) pt=udp;;3) pt=http;;4) pt=https;; *) pt=tcp;; esac
+        if [[ $pt == http || $pt == https ]]; then read -rp "Custom domain (optional): " dom || true; r=0; else while :; do read -rp "Remote port: " r || true; validate_port "$r" && break || echo "Invalid"; done; fi
+        read_frpc_config "$cfg"; local n=$(( ${#PROXIES[@]} + 1 )) pname="${pt}_${name}_$n"
         append_proxy_block "$cfg" "$pt" "$pname" "$l" "$r" "$dom"
         systemctl restart "$unit" || true; ok "Added & restarted"; pause;;
       3)
         read_frpc_config "$cfg"; (( ${#PROXIES[@]} == 0 )) && { echo "No proxies"; pause; continue; }
         local j=1; for _ in "${PROXIES[@]}"; do echo "  $j) block $j"; ((j++)); done
         read -rp "Select block: " j || true; (( j>=1 && j<=${#PROXIES[@]} )) || { echo "Invalid"; pause; continue; }
-        local blk="${PROXIES[$((j-1))]}"
-        local nm type lp rp dom
+        local blk="${PROXIES[$((j-1))]}" nm type lp rp dom
         nm=$(echo "$blk" | grep -E '^name\s*=' | awk -F'=' '{print $2}' | tr -d ' "')
         type=$(echo "$blk" | grep -E '^type\s*=' | awk -F'=' '{print $2}' | tr -d ' "')
-        lp=$(echo "$blk" | grep -E '^local_port\s*=' | awk -F'=' '{print $2}' | tr -d ' ')
-        rp=$(echo "$blk" | grep -E '^remote_port\s*=' | awk -F'=' '{print $2}' | tr -d ' ')
-        dom=$(echo "$blk" | grep -E '^custom_domains\s*=' | sed -E 's/.*\[(.*)\].*/\1/' | tr -d ' "')
+        lp=$(echo "$blk" | grep -E '^localPort\s*=' | awk -F'=' '{print $2}' | tr -d ' ')
+        rp=$(echo "$blk" | grep -E '^remotePort\s*=' | awk -F'=' '{print $2}' | tr -d ' ')
+        dom=$(echo "$blk" | grep -E '^customDomains\s*=' | sed -E 's/.*\[(.*)\].*/\1/' | tr -d ' "')
         read -rp "Local port [$lp]: " nl || true; nl=${nl:-$lp}; validate_port "$nl" || { echo "Invalid"; pause; continue; }
-        read -rp "Remote port [$rp]: " nr || true; nr=${nr:-$rp}; validate_port "$nr" || { echo "Invalid"; pause; continue; }
+        if [[ $type == http || $type == https ]]; then r=0; else read -rp "Remote port [$rp]: " nr || true; nr=${nr:-$rp}; validate_port "$nr" || { echo "Invalid"; pause; continue; }; fi
         echo "Type 1) tcp 2) udp 3) http 4) https (current $type)"; read -rp "Choose: " nt || true
-        case ${nt:-} in 1) type="tcp";;2) type="udp";;3) type="http";;4) type="https";; esac
+        case ${nt:-} in 1) type=tcp;;2) type=udp;;3) type=http;;4) type=https;; esac
         if [[ $type == http || $type == https ]]; then
-          read -rp "Custom domain [$dom] (empty to keep, 'none' to remove): " nd || true
+          read -rp "Custom domain [$dom] (empty keep, 'none' remove): " nd || true
           if [[ ${nd,,} == none ]]; then dom=""; elif [[ -n ${nd:-} ]]; then dom="$nd"; fi
-        else dom=""; fi
+          nr=0
+        else dom=""; nr=${nr:-$rp}; fi
         # rebuild block
-        blk="[$nm]\nname = \"$nm\"\ntype = \"$type\"\n"
-        if [[ $type == tcp || $type == udp ]]; then blk+="local_ip = \"127.0.0.1\"\n"; fi
-        blk+="local_port = $nl\nremote_port = $nr\n"
-        if [[ -n $dom ]]; then blk+="custom_domains = [\"$dom\"]"; fi
+        blk="[[proxies]]\nname = \"$nm\"\ntype = \"$type\"\n"
+        if [[ $type == tcp || $type == udp ]]; then blk+="localIP = \"127.0.0.1\"\n"; fi
+        blk+="localPort = $nl\n"; [[ $type == http || $type == https ]] || blk+="remotePort = $nr\n"
+        [[ -n $dom ]] && blk+="customDomains = [\"$dom\"]\n"
         PROXIES[$((j-1))]="$blk"
         write_frpc_with_blocks "$cfg"
         systemctl restart "$unit" || true; ok "Updated & restarted"; pause;;
       4)
         read_frpc_config "$cfg"; (( ${#PROXIES[@]} == 0 )) && { echo "No proxies"; pause; continue; }
         local j=1; for _ in "${PROXIES[@]}"; do echo "  $j) block $j"; ((j++)); done
-        read -rp "Select block to delete: " j || true
-        (( j>=1 && j<=${#PROXIES[@]} )) || { echo "Invalid"; pause; continue; }
+        read -rp "Select block to delete: " j || true; (( j>=1 && j<=${#PROXIES[@]} )) || { echo "Invalid"; pause; continue; }
         unset 'PROXIES[$((j-1))]'; PROXIES=("${PROXIES[@]}")
         write_frpc_with_blocks "$cfg"
         systemctl restart "$unit" || true; ok "Deleted & restarted"; pause;;
       5) break;;
-      *) echo "Invalid";;
+      *) :;;
     esac
   done
 }
 
 show_dashboard_info(){
-  echo "-- Show FRP Dashboard Info --"
+  echo "-- Server Dashboard Info --"
   mapfile -t units < <(systemctl list-units --type=service --all --no-pager | awk '{print $1}' | sed -n 's/\.service$//p' | grep '^frp-server-')
-  (( ${#units[@]} == 0 )) && { echo "No frp-server-* services found"; pause; return; }
+  (( ${#units[@]} == 0 )) && { echo "No frp-server-* services"; pause; return; }
   local i=1; for u in "${units[@]}"; do echo "  $i) $u"; ((i++)); done
-  read -rp "Choose server: " idx || true
-  (( idx>=1 && idx<=${#units[@]} )) || { echo "Invalid"; pause; return; }
-  local unit="${units[$((idx-1))]}" name="${unit#frp-server-}"
-  local cfg="$BASE_DIR/frps-$name.toml"
+  local idx; read -rp "Choose: " idx || true; (( idx>=1 && idx<=${#units[@]} )) || { echo "Invalid"; pause; return; }
+  local unit="${units[$((idx-1))]}" name="${unit#frp-server-}" cfg="$BASE_DIR/frps-$name.toml"
   [[ -f "$cfg" ]] || { err "Config not found: $cfg"; pause; return; }
   local port user pwd
-  port=$(grep -E '^dashboard_port\s*=' "$cfg" | awk '{print $3}' | tr -d '\r') || true
-  user=$(grep -E '^dashboard_user\s*=' "$cfg" | awk '{print $3}' | tr -d '"\r') || true
-  pwd=$(grep -E '^dashboard_pwd\s*=' "$cfg" | awk '{print $3}' | tr -d '"\r') || true
+  port=$(grep -E '^webServer\.port\s*=' "$cfg" | awk '{print $3}' | tr -d '\r') || true
+  user=$(grep -E '^webServer\.user\s*=' "$cfg" | awk '{print $3}' | tr -d '"\r') || true
+  pwd=$(grep -E '^webServer\.password\s*=' "$cfg" | awk '{print $3}' | tr -d '"\r') || true
   if [[ -n ${port:-} ]]; then
     echo "Dashboard:"; echo "  Port : $port"; echo "  User : $user"; echo "  Pass : $pwd"
   else
     echo "Dashboard not enabled for this server."
   fi
   pause
-}
-
-view_logs_menu(){
-  echo "1) Server logs"; echo "2) Client logs"; echo "3) Back"
-  read -rp "Choice: " c || true
-  case ${c:-3} in
-    1)
-      mapfile -t units < <(systemctl list-units --type=service --all --no-pager | awk '{print $1}' | sed -n 's/\.service$//p' | grep '^frp-server-')
-      (( ${#units[@]} == 0 )) && { echo "No server services"; pause; return; }
-      local i=1; for u in "${units[@]}"; do echo "  $i) $u"; ((i++)); done
-      read -rp "Choose: " idx || true; (( idx>=1 && idx<=${#units[@]} )) || { echo "Invalid"; pause; return; }
-      show_logs "${units[$((idx-1))]}";;
-    2)
-      mapfile -t units < <(systemctl list-units --type=service --all --no-pager | awk '{print $1}' | sed -n 's/\.service$//p' | grep '^frp-client-')
-      (( ${#units[@]} == 0 )) && { echo "No client services"; pause; return; }
-      local i=1; for u in "${units[@]}"; do echo "  $i) $u"; ((i++)); done
-      read -rp "Choose: " idx || true; (( idx>=1 && idx<=${#units[@]} )) || { echo "Invalid"; pause; return; }
-      show_logs "${units[$((idx-1))]}";;
-    *) :;;
-  esac
 }
 
 delete_unit_menu(){
@@ -605,37 +611,48 @@ delete_unit_menu(){
       mapfile -t units < <(systemctl list-units --type=service --all --no-pager | awk '{print $1}' | sed -n 's/\.service$//p' | grep '^frp-server-')
       (( ${#units[@]} == 0 )) && { echo "No server services"; pause; return; }
       local i=1; for u in "${units[@]}"; do echo "  $i) $u"; ((i++)); done
-      read -rp "Choose: " idx || true; (( idx>=1 && idx<=${#units[@]} )) || { echo "Invalid"; pause; return; }
-      local unit="${units[$((idx-1))]}"
-local name="${unit#frp-server-}"
-local cfg="$BASE_DIR/frps-$name.toml"
-      remove_service "$unit"; systemctl daemon-reload
-      [[ -f "$cfg" ]] && rm -f "$cfg"
-      ok "Deleted $unit and its config"
-      pause;;
+      local idx; read -rp "Choose: " idx || true; (( idx>=1 && idx<=${#units[@]} )) || { echo "Invalid"; pause; return; }
+      local unit="${units[$((idx-1))]}" name="${unit#frp-server-}" cfg="$BASE_DIR/frps-$name.toml"
+      remove_service "$unit"; systemctl daemon-reload; [[ -f "$cfg" ]] && rm -f "$cfg"
+      ok "Deleted $unit and its config"; pause;;
     2)
       mapfile -t units < <(systemctl list-units --type=service --all --no-pager | awk '{print $1}' | sed -n 's/\.service$//p' | grep '^frp-client-')
       (( ${#units[@]} == 0 )) && { echo "No client services"; pause; return; }
       local i=1; for u in "${units[@]}"; do echo "  $i) $u"; ((i++)); done
-      read -rp "Choose: " idx || true; (( idx>=1 && idx<=${#units[@]} )) || { echo "Invalid"; pause; return; }
-      local unit="${units[$((idx-1))]}"
-local name="${unit#frp-client-}"
-local cfg="$BASE_DIR/frpc-$name.toml"
-      remove_service "$unit"; systemctl daemon-reload
-      [[ -f "$cfg" ]] && rm -f "$cfg"
-      ok "Deleted $unit and its config"
-      pause;;
+      local idx; read -rp "Choose: " idx || true; (( idx>=1 && idx<=${#units[@]} )) || { echo "Invalid"; pause; return; }
+      local unit="${units[$((idx-1))]}" name="${unit#frp-client-}" cfg="$BASE_DIR/frpc-$name.toml"
+      remove_service "$unit"; systemctl daemon-reload; [[ -f "$cfg" ]] && rm -f "$cfg"
+      ok "Deleted $unit and its config"; pause;;
     *) :;;
   esac
 }
 
-# --------- Main menu ---------
+view_logs_menu(){
+  echo "1) Server logs"; echo "2) Client logs"; echo "3) Back"
+  read -rp "Choice: " c || true
+  case ${c:-3} in
+    1)
+      mapfile -t units < <(systemctl list-units --type=service --all --no-pager | awk '{print $1}' | sed -n 's/\.service$//p' | grep '^frp-server-')
+      (( ${#units[@]} == 0 )) && { echo "No server services"; pause; return; }
+      local i=1; for u in "${units[@]}"; do echo "  $i) $u"; ((i++)); done
+      local idx; read -rp "Choose: " idx || true; (( idx>=1 && idx<=${#units[@]} )) || { echo "Invalid"; pause; return; }
+      show_logs "${units[$((idx-1))]}";;
+    2)
+      mapfile -t units < <(systemctl list-units --type=service --all --no-pager | awk '{print $1}' | sed -n 's/\.service$//p' | grep '^frp-client-')
+      (( ${#units[@]} == 0 )) && { echo "No client services"; pause; return; }
+      local i=1; for u in "${units[@]}"; do echo "  $i) $u"; ((i++)); done
+      local idx; read -rp "Choose: " idx || true; (( idx>=1 && idx<=${#units[@]} )) || { echo "Invalid"; pause; return; }
+      show_logs "${units[$((idx-1))]}";;
+    *) :;;
+  esac
+}
+
 main_menu(){
   while :; do
     clear
-    echo "FRP Unlimited Menu (personalized) v$SCRIPT_VERSION"
+    echo "FRP Unlimited Menu (modern) v$SCRIPT_VERSION"
     echo "Repository: fatedier/frp"
-    echo "Binary status: $(binary_status)"
+    echo "Binary status: $(status_binaries)"
     echo "Config root: $BASE_DIR"
     echo
     echo "1) Install / Update FRP binaries"
@@ -682,9 +699,7 @@ main_menu(){
       4) show_dashboard_info ;;
       5) view_logs_menu ;;
       6) delete_unit_menu ;;
-      7)
-        read -rp "Are you sure to REMOVE ALL (y/N)? " a || true
-        [[ ${a,,} =~ ^y ]] && remove_all || echo "Cancelled"; pause ;;
+      7) read -rp "REMOVE ALL (y/N)? " a || true; [[ ${a,,} =~ ^y ]] && remove_all || echo "Cancelled"; pause ;;
       0) exit 0 ;;
       *) : ;;
     esac
