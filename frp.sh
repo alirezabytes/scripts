@@ -1,51 +1,43 @@
 #!/usr/bin/env bash
 # ============================================================================
 #  FRP Unlimited Menu (modern TOML for v0.63.x)
-#  - English prompts & comments
 #  - Uses TOML (frps-<name>.toml / frpc-<name>.toml)
 #  - Multi-service systemd units: frp-server-<name>.service / frp-client-<name>.service
-#  - Fetches latest binaries from GitHub API
+#  - Fetches latest binaries from GitHub API (latest release)
 #  - Protocols: tcp, kcp, quic, websocket, wss
 #  - TLS: server uses transport.tls.force, client uses transport.tls.enable
-#  - Auth: auth.method = "token" / auth.token = "..."
-#  - Dashboard via webServer.* (note: not optimized for huge proxy counts)
-#  - Adds hardening & LimitNOFILE=200000 in systemd units
-#  - Defaults: frps transport.maxPoolCount=2048, frpc transport.poolCount=128
+#  - Dashboard via webServer.*
+#  - Hardening & LimitNOFILE=200000 in systemd units
+#  - **Pool options removed** (no transport.maxPoolCount / transport.poolCount)
+#  - **Heartbeat tuned**: frps transport.heartbeatTimeout=90, frpc transport.heartbeatInterval=15 & heartbeatTimeout=90
+#  - We DO NOT write transport.tcpMux at all (keep upstream default)
 # ============================================================================
-# Safer defaults: do NOT use -e to avoid noisy traps in interactive flows
 set -Euo pipefail
 : "${FRP_DEBUG:=0}"
-# If FRP_DEBUG=1, print failing command lines. Otherwise stay quiet.
 trap 's=$?; if [[ "$FRP_DEBUG" == 1 ]]; then echo "[ERROR] line $LINENO: $BASH_COMMAND -> exit $s"; fi' ERR
 
-SCRIPT_VERSION="2.2.1"
+SCRIPT_VERSION="2.3.0-no-pool"
 BASE_DIR="$(pwd)/frp"                 # per-user config root (absolute at creation time)
 BIN_FRPS="/usr/local/bin/frps"
 BIN_FRPC="/usr/local/bin/frpc"
 SYSTEMD_DIR="/etc/systemd/system"
 LETSCERT_DIR="/etc/letsencrypt/live"
 
+# Heartbeat defaults
+FRPS_HEARTBEAT_TIMEOUT=90   # seconds
+FRPC_HEARTBEAT_INTERVAL=10  # seconds
+FRPC_HEARTBEAT_TIMEOUT=90   # seconds
+
 log(){ echo "$*"; }
 ok(){ echo "[OK] $*"; }
 err(){ echo "[ERR] $*" >&2; }
 pause(){ read -rp "Press Enter to continue..." _ || true; }
 
-arch_tag(){
-  case "$(uname -m)" in
-    x86_64|amd64)   echo linux_amd64 ;;
-    aarch64|arm64)  echo linux_arm64 ;;
-    armv7l)         echo linux_arm ;;
-    *) err "Unsupported arch: $(uname -m)"; exit 1 ;;
-  esac
-}
+arch_tag(){ case "$(uname -m)" in x86_64|amd64) echo linux_amd64;; aarch64|arm64) echo linux_arm64;; armv7l) echo linux_arm;; *) err "Unsupported arch: $(uname -m)"; exit 1;; esac; }
 
-latest_frp_url(){
-  local arch
-  arch=$(arch_tag)
-  curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest \
-    | grep 'browser_download_url' | grep -E "${arch}\\.tar\\.gz" \
-    | cut -d '"' -f 4 | head -n1
-}
+latest_frp_url(){ local arch; arch=$(arch_tag); curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest \
+  | grep 'browser_download_url' | grep -E "${arch}\\.tar\\.gz" \
+  | cut -d '"' -f 4 | head -n1; }
 
 install_frp(){
   log "Downloading latest FRP via GitHub API..."
@@ -60,9 +52,8 @@ install_frp(){
   install -m0755 "$tmpdir/frps" "$BIN_FRPS"
   install -m0755 "$tmpdir/frpc" "$BIN_FRPC"
   rm -rf "$tmpdir" "$pkg"
-  # quick sanity
-  if ! "$BIN_FRPS" -v >/dev/null 2>&1; then err "frps failed to run. Wrong arch?"; return 1; fi
-  if ! "$BIN_FRPC" -v >/dev/null 2>&1; then err "frpc failed to run. Wrong arch?"; return 1; fi
+  "$BIN_FRPS" -v >/dev/null 2>&1 || { err "frps failed to run. Wrong arch?"; return 1; }
+  "$BIN_FRPC" -v >/dev/null 2>&1 || { err "frpc failed to run. Wrong arch?"; return 1; }
   ok "Installed: $BIN_FRPS , $BIN_FRPC"
 }
 
@@ -84,7 +75,6 @@ validate_host(){
 rand_password(){ head /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 16; }
 
 select_cert(){
-  # Prints chosen pair as "cert|key" on stdout; empty if none.
   [[ ! -d "$LETSCERT_DIR" ]] && { echo ""; return 0; }
   mapfile -t domains < <(find "$LETSCERT_DIR" -maxdepth 1 -mindepth 1 -type d ! -name README -printf '%f\n')
   (( ${#domains[@]} == 0 )) && { echo ""; return 0; }
@@ -102,11 +92,9 @@ select_cert(){
 
 # --------------------------- TOML writers (0.63.x) ---------------------------
 # Notes:
-# - Server auth is under [auth], not top-level.
-# - TLS: server uses transport.tls.force; client uses transport.tls.enable.
-# - Dashboard: webServer.*
-# - Pool: server transport.maxPoolCount caps client transport.poolCount.
-# - allowPorts: list of {single=N} / {start=.., end=..} objects.
+# - We DO NOT write transport.tcpMux (keep upstream default true).
+# - Pool lines are REMOVED.
+# - Heartbeats are set explicitly.
 
 write_frps_toml(){
   # Args:
@@ -119,19 +107,16 @@ write_frps_toml(){
   #   $7 tls_force  (true|false)
   #   $8 cert_file
   #   $9 key_file
-  #  $10 dash_port (empty to disable dashboard)
+  #  $10 dash_port (empty to disable)
   #  $11 dash_user
   #  $12 dash_pwd
   #  $13 quic_keepalive
   #  $14 quic_idle
   #  $15 quic_streams
-  #  $16 max_pool_cap  (server upper bound for client poolCount)
-  #  $17 server_name   (unused here)
-  #  $18 allow_ports_csv (comma-separated list of integers)
+  #  $16 allow_ports_csv
   local cfg="$1" name="$2" bind="$3" token="$4" proto="$5" udp_sz="$6" tls_force="$7"
   local cfile="${8:-}" kfile="${9:-}" dport="${10:-}" duser="${11:-}" dpwd="${12:-}"
-  local qk="${13:-10}" qi="${14:-30}" qs="${15:-100000}" maxcap="${16:-2048}" _sni="${17:-}"
-  local allow_csv="${18:-}"
+  local qk="${13:-10}" qi="${14:-30}" qs="${15:-100000}" allow_csv="${16:-}"
 
   : >"$cfg"
   cat >>"$cfg" <<EOF
@@ -139,8 +124,8 @@ write_frps_toml(){
 bindAddr = "0.0.0.0"
 bindPort = $bind
 
-# Cap for client-side pre-connection pools (transport.poolCount on frpc).
-transport.maxPoolCount = $maxcap
+# Heartbeat (server side)
+transport.heartbeatTimeout = $FRPS_HEARTBEAT_TIMEOUT
 EOF
 
   # KCP / QUIC UDP bind ports
@@ -167,7 +152,7 @@ EOF
     echo "transport.tls.force = false" >>"$cfg"
   fi
 
-  # UDP size
+  # UDP size for non-TCP transports
   if [[ "$proto" != "tcp" ]]; then
     echo "udpPacketSize = $udp_sz" >>"$cfg"
   fi
@@ -210,9 +195,8 @@ write_frpc_toml(){
   #   $6 protocol (tcp|kcp|quic|websocket|wss)
   #   $7 tls_enable (true|false)
   #   $8 udpPacketSize
-  #   $9 poolCount
-  #  $10 tls_server_name (optional)
-  local cfg="$1" name="$2" saddr="$3" sport="$4" token="$5" proto="$6" tls="$7" udp_sz="$8" pool="$9" sni="${10:-}"
+  #   $9 tls_server_name (optional)
+  local cfg="$1" name="$2" saddr="$3" sport="$4" token="$5" proto="$6" tls="$7" udp_sz="$8" sni="${9:-}"
 
   : >"$cfg"
   cat >>"$cfg" <<EOF
@@ -233,7 +217,9 @@ webServer.password = "admin"
 
 # Transport
 transport.protocol = "$proto"
-transport.poolCount = $pool
+# Heartbeat (client side)
+transport.heartbeatInterval = $FRPC_HEARTBEAT_INTERVAL
+transport.heartbeatTimeout  = $FRPC_HEARTBEAT_TIMEOUT
 EOF
 
   if [[ "$proto" == "tcp" || "$proto" == "websocket" || "$proto" == "wss" ]]; then
@@ -270,7 +256,6 @@ append_proxy_block(){
 
 # --------------------------- systemd helpers ---------------------------
 create_service(){
-  # Args: unit_name ExecStart
   local unit="$1" exec="$2"
   cat >"$SYSTEMD_DIR/$unit.service" <<EOF
 [Unit]
@@ -286,14 +271,10 @@ ExecStartPre=/bin/sleep 5
 ExecStart=$exec
 Restart=always
 RestartSec=5
-# Raise file descriptor limit for many concurrent sockets
 LimitNOFILE=200000
 
-# Hardening (keep access to $BASE_DIR and certs under /etc)
 NoNewPrivileges=true
 ProtectSystem=full
-# Do NOT enable ProtectHome when BASE_DIR is under /root; it hides /root and blocks access.
-#ProtectHome=true
 PrivateTmp=true
 
 [Install]
@@ -369,8 +350,7 @@ action_add_server(){
   if [[ ${d,,} =~ ^y ]]; then
     while :; do read -rp "Dashboard port (e.g. 7500): " dport || true; validate_port "$dport" && break || echo "Invalid port"; done
     read -rp "Dashboard username [admin]: " duser || true; duser=${duser:-admin}
-    dpwd=$(rand_password)
-    read -rp "Dashboard password (empty = random: $dpwd): " t || true; [[ -n ${t:-} ]] && dpwd="$t"
+    dpwd=$(rand_password); read -rp "Dashboard password (empty = random: $dpwd): " t || true; [[ -n ${t:-} ]] && dpwd="$t"
     echo "Dashboard creds -> user: $duser  pass: $dpwd"
   fi
 
@@ -381,14 +361,11 @@ action_add_server(){
     read -rp "QUIC maxIncomingStreams [100000]: " t || true; [[ -n ${t:-} ]] && qs="$t"
   fi
 
-  local maxcap=2048
-  read -rp "Max pool cap (server upper bound, default 2048): " t || true; [[ -n ${t:-} ]] && maxcap="$t"
-
   local allow_csv=""
   read -rp "Restrict allowed ports? comma-separated list or empty for no limit: " allow_csv || true
 
   write_frps_toml "$cfg" "$name" "$bind" "$token" "$proto" "$udp_sz" "$tls_force" \
-                   "$cert_file" "$key_file" "$dport" "$duser" "$dpwd" "$qk" "$qi" "$qs" "$maxcap" "" "$allow_csv"
+                   "$cert_file" "$key_file" "$dport" "$duser" "$dpwd" "$qk" "$qi" "$qs" "$allow_csv"
   ok "Config written: $cfg"
 
   create_service "$service" "$BIN_FRPS -c $cfg"
@@ -422,7 +399,7 @@ action_add_client(){
     read -rp "Use TLS to server? (Y/n): " t || true
     [[ ${t,,} =~ ^n ]] && tls_enable=false || tls_enable=true
     if $tls_enable; then
-      read -rp "TLS serverName (SNI). Enter the hostname in the server's certificate (e.g. example.com). Leave empty if you're already connecting by that domain: " sni || true
+      read -rp "TLS serverName (SNI). Hostname in server certificate (optional): " sni || true
     fi
   fi
 
@@ -431,10 +408,7 @@ action_add_client(){
     read -rp "UDP packet size [1500]: " x || true; [[ -n ${x:-} ]] && udp_sz="$x"
   fi
 
-  local pool=128
-  read -rp "Client poolCount (pre-connections) [128]: " x || true; [[ -n ${x:-} ]] && pool="$x"
-
-  write_frpc_toml "$cfg" "$name" "$saddr" "$sport" "$token" "$proto" "$tls_enable" "$udp_sz" "$pool" "$sni"
+  write_frpc_toml "$cfg" "$name" "$saddr" "$sport" "$token" "$proto" "$tls_enable" "$udp_sz" "$sni"
   ok "Base client config written: $cfg"
 
   echo "You can append multiple proxies. Type 'done' to finish."
@@ -450,7 +424,7 @@ action_add_client(){
     case ${t:-1} in 1) ptype=tcp;;2) ptype=udp;;3) ptype=http;;4) ptype=https;; *) ptype=tcp;; esac
     if [[ "$ptype" == http || "$ptype" == https ]]; then
       read -rp "Custom domain (optional): " cdom || true
-      rport=0  # http/https don't need fixed remote port
+      rport=0
     else
       while :; do read -rp "Remote port: " rport || true; validate_port "$rport" && break || echo "Invalid"; done
     fi
@@ -466,7 +440,6 @@ action_add_client(){
 }
 
 # --------------------------- Client config parser (manage ports) ---------------------------
-# Parse head section (globals) and [[proxies]] blocks, then rewrite preserving head.
 
 read_frpc_config(){
   local cfg="$1"; FRPC_HEAD=""; PROXIES=()
@@ -497,9 +470,7 @@ read_frpc_config(){
 write_frpc_with_blocks(){
   local cfg="$1"; shift
   : >"$cfg"
-  # restore head
   [[ -n ${FRPC_HEAD:-} ]] && echo -ne "$FRPC_HEAD" >>"$cfg"
-  # append proxies
   for b in "${PROXIES[@]}"; do echo >>"$cfg"; echo "$b" >>"$cfg"; done
 }
 
@@ -566,7 +537,6 @@ manage_client_ports(){
           if [[ ${nd,,} == none ]]; then dom=""; elif [[ -n ${nd:-} ]]; then dom="$nd"; fi
           nr=0
         else dom=""; nr=${nr:-$rp}; fi
-        # rebuild block
         blk="[[proxies]]\nname = \"$nm\"\ntype = \"$type\"\n"
         if [[ $type == tcp || $type == udp ]]; then blk+="localIP = \"127.0.0.1\"\n"; fi
         blk+="localPort = $nl\n"; [[ $type == http || $type == https ]] || blk+="remotePort = $nr\n"
