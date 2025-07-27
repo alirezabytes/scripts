@@ -10,6 +10,7 @@
 #  - Auth: auth.method = "token" / auth.token = "..."
 #  - Dashboard via webServer.* (note: not optimized for huge proxy counts)
 #  - Adds hardening & LimitNOFILE=200000 in systemd units
+#  - Defaults: frps transport.maxPoolCount=2048, frpc transport.poolCount=128
 # ============================================================================
 # Safer defaults: do NOT use -e to avoid noisy traps in interactive flows
 set -Euo pipefail
@@ -17,7 +18,7 @@ set -Euo pipefail
 # If FRP_DEBUG=1, print failing command lines. Otherwise stay quiet.
 trap 's=$?; if [[ "$FRP_DEBUG" == 1 ]]; then echo "[ERROR] line $LINENO: $BASH_COMMAND -> exit $s"; fi' ERR
 
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.2.0"
 BASE_DIR="$(pwd)/frp"                 # per-user config root
 BIN_FRPS="/usr/local/bin/frps"
 BIN_FRPC="/usr/local/bin/frpc"
@@ -31,8 +32,8 @@ pause(){ read -rp "Press Enter to continue..." _ || true; }
 
 arch_tag(){
   case "$(uname -m)" in
-    x86_64|amd64) echo linux_amd64 ;;
-    aarch64|arm64) echo linux_arm64 ;;
+    x86_128|amd128) echo linux_amd128 ;;
+    aarch128|arm128) echo linux_arm128 ;;
     armv7l) echo linux_arm ;;
     *) err "Unsupported arch: $(uname -m)"; exit 1 ;;
   esac
@@ -381,8 +382,8 @@ action_add_server(){
     read -rp "QUIC maxIncomingStreams [100000]: " t || true; [[ -n ${t:-} ]] && qs="$t"
   fi
 
-  local maxcap=100000
-  read -rp "Max pool cap (server upper bound, default 100000): " t || true; [[ -n ${t:-} ]] && maxcap="$t"
+  local maxcap=2048
+  read -rp "Max pool cap (server upper bound, default 2048): " t || true; [[ -n ${t:-} ]] && maxcap="$t"
 
   # Build allowPorts list from user provided remote ports later on client. If you want to restrict now:
   local allow_csv=""
@@ -432,8 +433,8 @@ action_add_client(){
     read -rp "UDP packet size [1500]: " x || true; [[ -n ${x:-} ]] && udp_sz="$x"
   fi
 
-  local pool=1
-  read -rp "Client poolCount (pre-connections) [1]: " x || true; [[ -n ${x:-} ]] && pool="$x"
+  local pool=128
+  read -rp "Client poolCount (pre-connections) [128]: " x || true; [[ -n ${x:-} ]] && pool="$x"
 
   write_frpc_toml "$cfg" "$name" "$saddr" "$sport" "$token" "$proto" "$tls_enable" "$udp_sz" "$pool" "$sni"
   ok "Base client config written: $cfg"
