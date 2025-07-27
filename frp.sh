@@ -220,9 +220,6 @@ serverAddr = "$saddr"
 serverPort = $sport
 loginFailExit = false
 
-log.to = "./frpc.log"
-log.level = "info"
-log.maxDays = 3
 
 auth.method = "token"
 auth.token  = "$token"
@@ -426,7 +423,7 @@ action_add_client(){
     read -rp "Use TLS to server? (Y/n): " t || true
     [[ ${t,,} =~ ^n ]] && tls_enable=false || tls_enable=true
     if $tls_enable; then
-      read -rp "TLS serverName (SNI, optional – set your certificate hostname): " sni || true
+      read -rp "TLS serverName (SNI). Enter the hostname in the server's certificate (e.g. example.com). Leave empty if you're already connecting by that domain: " sni || true
     fi
   fi
 
