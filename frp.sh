@@ -18,8 +18,8 @@ set -Euo pipefail
 # If FRP_DEBUG=1, print failing command lines. Otherwise stay quiet.
 trap 's=$?; if [[ "$FRP_DEBUG" == 1 ]]; then echo "[ERROR] line $LINENO: $BASH_COMMAND -> exit $s"; fi' ERR
 
-SCRIPT_VERSION="2.2.0"
-BASE_DIR="$(pwd)/frp"                 # per-user config root
+SCRIPT_VERSION="2.2.1"
+BASE_DIR="$(pwd)/frp"                 # per-user config root (absolute at creation time)
 BIN_FRPS="/usr/local/bin/frps"
 BIN_FRPC="/usr/local/bin/frpc"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -32,19 +32,16 @@ pause(){ read -rp "Press Enter to continue..." _ || true; }
 
 arch_tag(){
   case "$(uname -m)" in
-    x86_128|amd128) echo linux_amd128 ;;
-    aarch128|arm128) echo linux_arm128 ;;
-    armv7l) echo linux_arm ;;
+    x86_64|amd64)   echo linux_amd64 ;;
+    aarch64|arm64)  echo linux_arm64 ;;
+    armv7l)         echo linux_arm ;;
     *) err "Unsupported arch: $(uname -m)"; exit 1 ;;
   esac
 }
 
 latest_frp_url(){
-  local arch tag
+  local arch
   arch=$(arch_tag)
-  tag=$(curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest \
-        | grep '"tag_name"' | head -n1 | sed -E 's/.*"v?([0-9.]+)".*/\1/') || true
-  [[ -z ${tag:-} ]] && { err "Failed to query latest tag"; return 1; }
   curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest \
     | grep 'browser_download_url' | grep -E "${arch}\\.tar\\.gz" \
     | cut -d '"' -f 4 | head -n1
@@ -63,6 +60,9 @@ install_frp(){
   install -m0755 "$tmpdir/frps" "$BIN_FRPS"
   install -m0755 "$tmpdir/frpc" "$BIN_FRPC"
   rm -rf "$tmpdir" "$pkg"
+  # quick sanity
+  if ! "$BIN_FRPS" -v >/dev/null 2>&1; then err "frps failed to run. Wrong arch?"; return 1; fi
+  if ! "$BIN_FRPC" -v >/dev/null 2>&1; then err "frpc failed to run. Wrong arch?"; return 1; fi
   ok "Installed: $BIN_FRPS , $BIN_FRPC"
 }
 
@@ -126,11 +126,11 @@ write_frps_toml(){
   #  $14 quic_idle
   #  $15 quic_streams
   #  $16 max_pool_cap  (server upper bound for client poolCount)
-  #  $17 server_name   (optional SNI verify name for inbound? not used on server; kept for symmetry)
+  #  $17 server_name   (unused here)
   #  $18 allow_ports_csv (comma-separated list of integers)
   local cfg="$1" name="$2" bind="$3" token="$4" proto="$5" udp_sz="$6" tls_force="$7"
   local cfile="${8:-}" kfile="${9:-}" dport="${10:-}" duser="${11:-}" dpwd="${12:-}"
-  local qk="${13:-10}" qi="${14:-30}" qs="${15:-100000}" maxcap="${16:-100000}" _sni="${17:-}"
+  local qk="${13:-10}" qi="${14:-30}" qs="${15:-100000}" maxcap="${16:-2048}" _sni="${17:-}"
   local allow_csv="${18:-}"
 
   : >"$cfg"
@@ -167,7 +167,7 @@ EOF
     echo "transport.tls.force = false" >>"$cfg"
   fi
 
-  # UDP size (applies to udp/sudp proxies; keep symmetric with client)
+  # UDP size
   if [[ "$proto" != "tcp" ]]; then
     echo "udpPacketSize = $udp_sz" >>"$cfg"
   fi
@@ -179,14 +179,14 @@ auth.method = "token"
 auth.token  = "$token"
 EOF
 
-  # allowPorts list
+  # allowPorts list (optional)
   if [[ -n "$allow_csv" ]]; then
     echo "allowPorts = [" >>"$cfg"
     local IFS=','; for p in $allow_csv; do p=${p//[[:space:]]/}; [[ -n $p ]] && echo "  { single = $p }," >>"$cfg"; done
     echo "]" >>"$cfg"
   fi
 
-  # Dashboard
+  # Dashboard (optional)
   if [[ -n "$dport" ]]; then
     cat >>"$cfg" <<EOF
 
@@ -255,11 +255,11 @@ append_proxy_block(){
     echo "[[proxies]]"
     echo "name = \"$pname\""
     echo "type = \"$ptype\""
-    if [[ "$ptype" == tcp || "$ptype" == udp ]]; then
+    if [[ "$ptype" == "tcp" || "$ptype" == "udp" ]]; then
       echo "localIP = \"127.0.0.1\""
     fi
     echo "localPort = $lport"
-    if [[ "$ptype" == http || "$ptype" == https ]]; then
+    if [[ "$ptype" == "http" || "$ptype" == "https" ]]; then
       [[ -n "$cdom" ]] && echo "customDomains = [\"$cdom\"]"
     else
       echo "remotePort = $rport"
@@ -302,7 +302,6 @@ EOF
   systemctl daemon-reload
   systemctl enable --now "$unit.service" >/dev/null 2>&1 || true
 }
-
 
 show_logs(){ local unit="$1"; journalctl -u "$unit" -n 80 --no-pager; pause; }
 
@@ -360,7 +359,7 @@ action_add_server(){
         cert_file="${cert_pair%%|*}"; key_file="${cert_pair##*|}"
         echo "Using cert: $cert_file"
       else
-        echo "No certificate selected; server will still require TLS but use default key loading if supported."
+        echo "No certificate selected; TLS will be required and frps must be able to load default certs."
       fi
     fi
   fi
@@ -385,7 +384,6 @@ action_add_server(){
   local maxcap=2048
   read -rp "Max pool cap (server upper bound, default 2048): " t || true; [[ -n ${t:-} ]] && maxcap="$t"
 
-  # Build allowPorts list from user provided remote ports later on client. If you want to restrict now:
   local allow_csv=""
   read -rp "Restrict allowed ports? comma-separated list or empty for no limit: " allow_csv || true
 
@@ -468,19 +466,26 @@ action_add_client(){
 }
 
 # --------------------------- Client config parser (manage ports) ---------------------------
-# Minimal parser for [[proxies]] blocks.
+# Parse head section (globals) and [[proxies]] blocks, then rewrite preserving head.
 
 read_frpc_config(){
-  local cfg="$1"; COMMON=""; PROXIES=()
-  local in_block=false block=""
+  local cfg="$1"; FRPC_HEAD=""; PROXIES=()
+  local in_blocks=false in_block=false block=""
   while IFS='' read -r line || [[ -n "$line" ]]; do
     local t="${line%%$'\r'}"
     if [[ $t =~ ^\[\[proxies\]\] ]]; then
+      in_blocks=true
       if [[ -n $block ]]; then PROXIES+=("$block"); fi
-      block="[[proxies]]"; in_block=true; continue
+      block="[[proxies]]"
+      in_block=true
+      continue
+    fi
+    if ! $in_blocks; then
+      FRPC_HEAD+="$t\n"
+      continue
     fi
     if $in_block; then
-      if [[ $t =~ ^\[\[visitors\]\] || $t =~ ^\[\[proxies\]\] ]]; then
+      if [[ $t =~ ^\[\[proxies\]\] ]]; then
         PROXIES+=("$block"); block="[[proxies]]"; continue
       fi
       [[ -n ${t//[[:space:]]/} ]] && block+=$'\n'"$t"
@@ -492,8 +497,9 @@ read_frpc_config(){
 write_frpc_with_blocks(){
   local cfg="$1"; shift
   : >"$cfg"
-  echo "# regenerated by menu" >>"$cfg"
-  # keep the head of file (we won't re-write all globals here for simplicity)
+  # restore head
+  [[ -n ${FRPC_HEAD:-} ]] && echo -ne "$FRPC_HEAD" >>"$cfg"
+  # append proxies
   for b in "${PROXIES[@]}"; do echo >>"$cfg"; echo "$b" >>"$cfg"; done
 }
 
@@ -537,7 +543,7 @@ manage_client_ports(){
         while :; do read -rp "Local port: " l || true; validate_port "$l" && break || echo "Invalid"; done
         echo "Type 1) tcp 2) udp 3) http 4) https"; read -rp "Choose: " pt || true
         case ${pt:-1} in 1) pt=tcp;;2) pt=udp;;3) pt=http;;4) pt=https;; *) pt=tcp;; esac
-        if [[ $pt == http || $pt == https ]]; then read -rp "Custom domain (optional): " dom || true; r=0; else while :; do read -rp "Remote port: " r || true; validate_port "$r" && break || echo "Invalid"; done; fi
+        if [[ $pt == http || $pt == https ]]; then dom=""; r=0; else while :; do read -rp "Remote port: " r || true; validate_port "$r" && break || echo "Invalid"; done; fi
         read_frpc_config "$cfg"; local n=$(( ${#PROXIES[@]} + 1 )) pname="${pt}_${name}_$n"
         append_proxy_block "$cfg" "$pt" "$pname" "$l" "$r" "$dom"
         systemctl restart "$unit" || true; ok "Added & restarted"; pause;;
@@ -571,7 +577,8 @@ manage_client_ports(){
       4)
         read_frpc_config "$cfg"; (( ${#PROXIES[@]} == 0 )) && { echo "No proxies"; pause; continue; }
         local j=1; for _ in "${PROXIES[@]}"; do echo "  $j) block $j"; ((j++)); done
-        read -rp "Select block to delete: " j || true; (( j>=1 && j<=${#PROXIES[@]} )) || { echo "Invalid"; pause; continue; }
+        read -rp "Select block to delete: " j || true
+        (( j>=1 && j<=${#PROXIES[@]} )) || { echo "Invalid"; pause; continue; }
         unset 'PROXIES[$((j-1))]'; PROXIES=("${PROXIES[@]}")
         write_frpc_with_blocks "$cfg"
         systemctl restart "$unit" || true; ok "Deleted & restarted"; pause;;
