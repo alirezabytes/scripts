@@ -9,14 +9,14 @@
 #  - Dashboard via webServer.*
 #  - Hardening & LimitNOFILE=200000 in systemd units
 #  - **Pool options removed** (no transport.maxPoolCount / transport.poolCount)
-#  - **Heartbeat tuned**: frps transport.heartbeatTimeout=90, frpc transport.heartbeatInterval=15 & heartbeatTimeout=90
+#  - **Heartbeat tuned**: frps transport.heartbeatTimeout=90, frpc transport.heartbeatInterval=10 & heartbeatTimeout=90
 #  - We DO NOT write transport.tcpMux at all (keep upstream default)
 # ============================================================================
 set -Euo pipefail
 : "${FRP_DEBUG:=0}"
 trap 's=$?; if [[ "$FRP_DEBUG" == 1 ]]; then echo "[ERROR] line $LINENO: $BASH_COMMAND -> exit $s"; fi' ERR
 
-SCRIPT_VERSION="2.3.0-no-pool"
+SCRIPT_VERSION="2.3.1-no-pool-fix-nounset"
 BASE_DIR="$(pwd)/frp"                 # per-user config root (absolute at creation time)
 BIN_FRPS="/usr/local/bin/frps"
 BIN_FRPC="/usr/local/bin/frpc"
@@ -25,7 +25,7 @@ LETSCERT_DIR="/etc/letsencrypt/live"
 
 # Heartbeat defaults
 FRPS_HEARTBEAT_TIMEOUT=90   # seconds
-FRPC_HEARTBEAT_INTERVAL=10  # seconds
+FRPC_HEARTBEAT_INTERVAL=10  # seconds (kept in sync with banner)
 FRPC_HEARTBEAT_TIMEOUT=90   # seconds
 
 log(){ echo "$*"; }
@@ -33,11 +33,21 @@ ok(){ echo "[OK] $*"; }
 err(){ echo "[ERR] $*" >&2; }
 pause(){ read -rp "Press Enter to continue..." _ || true; }
 
-arch_tag(){ case "$(uname -m)" in x86_64|amd64) echo linux_amd64;; aarch64|arm64) echo linux_arm64;; armv7l) echo linux_arm;; *) err "Unsupported arch: $(uname -m)"; exit 1;; esac; }
+arch_tag(){
+  case "$(uname -m)" in
+    x86_64|amd64) echo linux_amd64 ;;
+    aarch64|arm64) echo linux_arm64 ;;
+    armv7l) echo linux_arm ;;
+    *) err "Unsupported arch: $(uname -m)"; exit 1 ;;
+  esac
+}
 
-latest_frp_url(){ local arch; arch=$(arch_tag); curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest \
-  | grep 'browser_download_url' | grep -E "${arch}\\.tar\\.gz" \
-  | cut -d '"' -f 4 | head -n1; }
+latest_frp_url(){
+  local arch; arch=$(arch_tag)
+  curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest \
+    | grep 'browser_download_url' | grep -E "${arch}\\.tar\\.gz" \
+    | cut -d '"' -f 4 | head -n1
+}
 
 install_frp(){
   log "Downloading latest FRP via GitHub API..."
@@ -79,7 +89,8 @@ select_cert(){
   mapfile -t domains < <(find "$LETSCERT_DIR" -maxdepth 1 -mindepth 1 -type d ! -name README -printf '%f\n')
   (( ${#domains[@]} == 0 )) && { echo ""; return 0; }
   echo "Available certificates:" >&2
-  local i=1; for d in "${domains[@]}"; do echo "  $i) $d" >&2; ((i++)); done
+  local i=1
+  for d in "${domains[@]}"; do echo "  $i) $d" >&2; ((i++)); done
   echo "  0) Cancel" >&2
   local idx; read -rp "Choose certificate [0 to cancel]: " idx || true
   [[ -z ${idx:-} ]] && idx=0
@@ -91,10 +102,6 @@ select_cert(){
 }
 
 # --------------------------- TOML writers (0.63.x) ---------------------------
-# Notes:
-# - We DO NOT write transport.tcpMux (keep upstream default true).
-# - Pool lines are REMOVED.
-# - Heartbeats are set explicitly.
 
 write_frps_toml(){
   # Args:
@@ -204,7 +211,6 @@ write_frpc_toml(){
 serverAddr = "$saddr"
 serverPort = $sport
 loginFailExit = false
-
 
 auth.method = "token"
 auth.token  = "$token"
@@ -393,7 +399,7 @@ action_add_client(){
 
   echo "Transport protocol: 1) tcp  2) kcp  3) quic  4) websocket  5) wss"
   local choice proto; read -rp "Choose [1-5]: " choice || true
-  case ${choice:-1} in 1) proto=tcp;;2) proto=kcp;;3) proto=quic;;4) proto=websocket;;5) proto=wss;;*) proto=tcp;; esac
+  case ${choice:-1} in 1) proto=tcp;;2) proto=kcp;;3) proto=quic;;4) websocket) proto=websocket;;5) proto=wss;;*) proto=tcp;; esac
 
   local tls_enable=true sni=""
   if [[ "$proto" == tcp || "$proto" == websocket || "$proto" == wss ]]; then
@@ -482,11 +488,17 @@ manage_client_ports(){
   local i=1; for u in "${units[@]}"; do echo "  $i) $u"; ((i++)); done
   local idx; read -rp "Choose client: " idx || true
   (( idx>=1 && idx<=${#units[@]} )) || { echo "Invalid"; pause; return; }
-  local unit="${units[$((idx-1))]}" name="${unit#frp-client-}" cfg="$BASE_DIR/frpc-$name.toml"
+
+  # ---- FIX for nounset: split assignments
+  local unit name cfg
+  unit="${units[$((idx-1))]}"
+  name="${unit#frp-client-}"
+  cfg="$BASE_DIR/frpc-$name.toml"
+
   [[ -f "$cfg" ]] || { err "Config not found: $cfg"; pause; return; }
 
   while :; do
-    echo "\nClient: $name"
+    printf "\nClient: %s\n" "$name"
     echo "1) View ports"
     echo "2) Add port"
     echo "3) Edit port"
@@ -496,7 +508,9 @@ manage_client_ports(){
     case ${c:-1} in
       1)
         read_frpc_config "$cfg"
-        if (( ${#PROXIES[@]} == 0 )); then echo "No proxies"; else
+        if (( ${#PROXIES[@]} == 0 )); then
+          echo "No proxies"
+        else
           local j=1
           for blk in "${PROXIES[@]}"; do
             local nm type lp rp dom
@@ -530,7 +544,11 @@ manage_client_ports(){
         rp=$(echo "$blk" | grep -E '^remotePort\s*=' | awk -F'=' '{print $2}' | tr -d ' ')
         dom=$(echo "$blk" | grep -E '^customDomains\s*=' | sed -E 's/.*\[(.*)\].*/\1/' | tr -d ' "')
         read -rp "Local port [$lp]: " nl || true; nl=${nl:-$lp}; validate_port "$nl" || { echo "Invalid"; pause; continue; }
-        if [[ $type == http || $type == https ]]; then r=0; else read -rp "Remote port [$rp]: " nr || true; nr=${nr:-$rp}; validate_port "$nr" || { echo "Invalid"; pause; continue; }; fi
+        if [[ $type == http || $type == https ]]; then
+          r=0
+        else
+          read -rp "Remote port [$rp]: " nr || true; nr=${nr:-$rp}; validate_port "$nr" || { echo "Invalid"; pause; continue; }
+        fi
         echo "Type 1) tcp 2) udp 3) http 4) https (current $type)"; read -rp "Choose: " nt || true
         case ${nt:-} in 1) type=tcp;;2) type=udp;;3) type=http;;4) type=https;; esac
         if [[ $type == http || $type == https ]]; then
@@ -565,14 +583,23 @@ show_dashboard_info(){
   (( ${#units[@]} == 0 )) && { echo "No frp-server-* services"; pause; return; }
   local i=1; for u in "${units[@]}"; do echo "  $i) $u"; ((i++)); done
   local idx; read -rp "Choose: " idx || true; (( idx>=1 && idx<=${#units[@]} )) || { echo "Invalid"; pause; return; }
-  local unit="${units[$((idx-1))]}" name="${unit#frp-server-}" cfg="$BASE_DIR/frps-$name.toml"
+
+  # ---- FIX for nounset: split assignments
+  local unit name cfg
+  unit="${units[$((idx-1))]}"
+  name="${unit#frp-server-}"
+  cfg="$BASE_DIR/frps-$name.toml"
+
   [[ -f "$cfg" ]] || { err "Config not found: $cfg"; pause; return; }
   local port user pwd
   port=$(grep -E '^webServer\.port\s*=' "$cfg" | awk '{print $3}' | tr -d '\r') || true
   user=$(grep -E '^webServer\.user\s*=' "$cfg" | awk '{print $3}' | tr -d '"\r') || true
   pwd=$(grep -E '^webServer\.password\s*=' "$cfg" | awk '{print $3}' | tr -d '"\r') || true
   if [[ -n ${port:-} ]]; then
-    echo "Dashboard:"; echo "  Port : $port"; echo "  User : $user"; echo "  Pass : $pwd"
+    echo "Dashboard:"
+    echo "  Port : $port"
+    echo "  User : $user"
+    echo "  Pass : $pwd"
   else
     echo "Dashboard not enabled for this server."
   fi
@@ -588,7 +615,13 @@ delete_unit_menu(){
       (( ${#units[@]} == 0 )) && { echo "No server services"; pause; return; }
       local i=1; for u in "${units[@]}"; do echo "  $i) $u"; ((i++)); done
       local idx; read -rp "Choose: " idx || true; (( idx>=1 && idx<=${#units[@]} )) || { echo "Invalid"; pause; return; }
-      local unit="${units[$((idx-1))]}" name="${unit#frp-server-}" cfg="$BASE_DIR/frps-$name.toml"
+
+      # ---- FIX for nounset: split assignments
+      local unit name cfg
+      unit="${units[$((idx-1))]}"
+      name="${unit#frp-server-}"
+      cfg="$BASE_DIR/frps-$name.toml"
+
       remove_service "$unit"; systemctl daemon-reload; [[ -f "$cfg" ]] && rm -f "$cfg"
       ok "Deleted $unit and its config"; pause;;
     2)
@@ -596,7 +629,13 @@ delete_unit_menu(){
       (( ${#units[@]} == 0 )) && { echo "No client services"; pause; return; }
       local i=1; for u in "${units[@]}"; do echo "  $i) $u"; ((i++)); done
       local idx; read -rp "Choose: " idx || true; (( idx>=1 && idx<=${#units[@]} )) || { echo "Invalid"; pause; return; }
-      local unit="${units[$((idx-1))]}" name="${unit#frp-client-}" cfg="$BASE_DIR/frpc-$name.toml"
+
+      # ---- FIX for nounset: split assignments
+      local unit name cfg
+      unit="${units[$((idx-1))]}"
+      name="${unit#frp-client-}"
+      cfg="$BASE_DIR/frpc-$name.toml"
+
       remove_service "$unit"; systemctl daemon-reload; [[ -f "$cfg" ]] && rm -f "$cfg"
       ok "Deleted $unit and its config"; pause;;
     *) :;;
