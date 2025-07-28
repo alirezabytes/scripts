@@ -16,7 +16,7 @@ set -Euo pipefail
 : "${FRP_DEBUG:=0}"
 trap 's=$?; if [[ "$FRP_DEBUG" == 1 ]]; then echo "[ERROR] line $LINENO: $BASH_COMMAND -> exit $s"; fi' ERR
 
-SCRIPT_VERSION="2.3.1-no-pool-fix-nounset"
+SCRIPT_VERSION="2.3.2-no-pool-fix-nounset"
 BASE_DIR="$(pwd)/frp"                 # per-user config root (absolute at creation time)
 BIN_FRPS="/usr/local/bin/frps"
 BIN_FRPC="/usr/local/bin/frpc"
@@ -25,7 +25,7 @@ LETSCERT_DIR="/etc/letsencrypt/live"
 
 # Heartbeat defaults
 FRPS_HEARTBEAT_TIMEOUT=90   # seconds
-FRPC_HEARTBEAT_INTERVAL=10  # seconds (kept in sync with banner)
+FRPC_HEARTBEAT_INTERVAL=10  # seconds
 FRPC_HEARTBEAT_TIMEOUT=90   # seconds
 
 log(){ echo "$*"; }
@@ -294,7 +294,7 @@ show_logs(){ local unit="$1"; journalctl -u "$unit" -n 80 --no-pager; pause; }
 
 service_exists(){ systemctl list-unit-files --type=service --no-pager | grep -q "^$1\.service"; }
 list_services(){ systemctl list-units --type=service --all --no-pager | awk '{print $1}' | grep -E '^(frp-server|frp-client)-.*\.service$' | sed 's/\.service$//'; }
-remove_service(){ local unit="$1"; systemctl stop "$unit" >/dev/null 2>&1 || true; systemctl disable "$unit" >/dev/null 2>&1 || true; rm -f "$SYSTEMD_DIR/$unit.service"; }
+remove_service(){ local unit="$1"; systemctl stop "$unit" >/dev/null 2>&1 || true; systemctl disable "$unit" >/devnull 2>&1 || true; rm -f "$SYSTEMD_DIR/$unit.service"; }
 
 remove_all(){
   echo "Searching for FRP services..."
@@ -329,7 +329,14 @@ action_add_server(){
 
   echo "Transport protocol: 1) tcp  2) kcp  3) quic  4) websocket  5) wss"
   local choice proto; read -rp "Choose [1-5]: " choice || true
-  case ${choice:-1} in 1) proto=tcp;;2) proto=kcp;;3) proto=quic;;4) proto=websocket;;5) proto=wss;;*) proto=tcp;; esac
+  case ${choice:-1} in
+    1) proto=tcp ;;
+    2) proto=kcp ;;
+    3) proto=quic ;;
+    4) proto=websocket ;;
+    5) proto=wss ;;
+    *) proto=tcp ;;
+  esac
 
   local udp_sz=1500
   if [[ "$proto" != tcp ]]; then
@@ -399,10 +406,17 @@ action_add_client(){
 
   echo "Transport protocol: 1) tcp  2) kcp  3) quic  4) websocket  5) wss"
   local choice proto; read -rp "Choose [1-5]: " choice || true
-  case ${choice:-1} in 1) proto=tcp;;2) proto=kcp;;3) proto=quic;;4) websocket) proto=websocket;;5) proto=wss;;*) proto=tcp;; esac
+  case ${choice:-1} in
+    1) proto=tcp ;;
+    2) proto=kcp ;;
+    3) proto=quic ;;
+    4) proto=websocket ;;
+    5) proto=wss ;;
+    *) proto=tcp ;;
+  esac
 
   local tls_enable=true sni=""
-  if [[ "$proto" == tcp || "$proto" == websocket || "$proto" == wss ]]; then
+  if [[ "$proto" == tcp || "$proto" == websocket || "$proto" == "wss" ]]; then
     read -rp "Use TLS to server? (Y/n): " t || true
     [[ ${t,,} =~ ^n ]] && tls_enable=false || tls_enable=true
     if $tls_enable; then
