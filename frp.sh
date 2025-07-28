@@ -294,7 +294,7 @@ show_logs(){ local unit="$1"; journalctl -u "$unit" -n 80 --no-pager; pause; }
 
 service_exists(){ systemctl list-unit-files --type=service --no-pager | grep -q "^$1\.service"; }
 list_services(){ systemctl list-units --type=service --all --no-pager | awk '{print $1}' | grep -E '^(frp-server|frp-client)-.*\.service$' | sed 's/\.service$//'; }
-remove_service(){ local unit="$1"; systemctl stop "$unit" >/dev/null 2>&1 || true; systemctl disable "$unit" >/devnull 2>&1 || true; rm -f "$SYSTEMD_DIR/$unit.service"; }
+remove_service(){ local unit="$1"; systemctl stop "$unit" >/dev/null 2>&1 || true; systemctl disable "$unit" >/dev/null 2>&1 || true; rm -f "$SYSTEMD_DIR/$unit.service"; }
 
 remove_all(){
   echo "Searching for FRP services..."
@@ -544,7 +544,10 @@ manage_client_ports(){
         echo "Type 1) tcp 2) udp 3) http 4) https"; read -rp "Choose: " pt || true
         case ${pt:-1} in 1) pt=tcp;;2) pt=udp;;3) pt=http;;4) pt=https;; *) pt=tcp;; esac
         if [[ $pt == http || $pt == https ]]; then dom=""; r=0; else while :; do read -rp "Remote port: " r || true; validate_port "$r" && break || echo "Invalid"; done; fi
-        read_frpc_config "$cfg"; local n=$(( ${#PROXIES[@]} + 1 )) pname="${pt}_${name}_$n"
+        read_frpc_config "$cfg"
+        local n pname
+        n=$(( ${#PROXIES[@]} + 1 ))
+        pname="${pt}_${name}_$n"
         append_proxy_block "$cfg" "$pt" "$pname" "$l" "$r" "$dom"
         systemctl restart "$unit" || true; ok "Added & restarted"; pause;;
       3)
