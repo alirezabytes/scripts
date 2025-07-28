@@ -330,7 +330,8 @@ action_add_server(){
     read -rp "UDP packet size [1500]: " x || true; [[ -n ${x:-} ]] && udp_sz="$x"
   fi
 
-  local tls_force=false cert_pair cert_file key_file
+  local tls_force=false cert_pair
+  local cert_file="" key_file=""
   if [[ "$proto" == tcp || "$proto" == websocket || "$proto" == wss ]]; then
     read -rp "Force TLS-only connections? (y/N): " a || true
     if [[ ${a,,} =~ ^y ]]; then
