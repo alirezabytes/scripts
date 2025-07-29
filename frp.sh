@@ -8,6 +8,7 @@
 #  * Enables Prometheus automatically when dashboard enabled
 #  * Supports proxyBindAddr for KCP/QUIC
 #  * Avoids writing default keys via helper maybe_add()
+#  * Adds heartbeat, poolcount, and compression options
 # ============================================================================
 set -Euo pipefail
 : "${FRP_DEBUG:=0}"
@@ -108,6 +109,8 @@ write_frps_toml(){
   local cfg="$1" name="$2" bind="$3" token="$4" proto="$5" udp_sz="$6" tls_force="$7"
   local cfile="${8:-}" kfile="${9:-}" dport="${10:-}" duser="${11:-}" dpwd="${12:-}"
   local qk="${13:-10}" qi="${14:-30}" qs="${15:-100000}" allow_csv="${16:-}"
+  local heartbeat_enable="${17:-false}" hi="${18:-10}" ht="${19:-90}"
+  local pool_count="${20:-0}" compression="${21:-false}"
 
   : >"$cfg"
   cat >>"$cfg" <<EOF
@@ -158,10 +161,26 @@ webServer.password = "$dpwd"
 enablePrometheus = true
 EOF
   fi
+
+  if [[ "$heartbeat_enable" == "true" ]]; then
+    echo "transport.heartbeatInterval = $hi" >>"$cfg"
+    echo "transport.heartbeatTimeout = $ht" >>"$cfg"
+  fi
+
+  if (( pool_count > 0 )); then
+    echo "transport.poolCount = $pool_count" >>"$cfg"
+  fi
+
+  if [[ "$compression" == "true" ]]; then
+    echo "transport.useCompression = true" >>"$cfg"
+  fi
 }
 
 write_frpc_toml(){
   local cfg="$1" name="$2" saddr="$3" sport="$4" token="$5" proto="$6" tls="$7" udp_sz="$8" sni="${9:-}"
+  local heartbeat_enable="${10:-false}" hi="${11:-10}" ht="${12:-90}"
+  local pool_count="${13:-0}" compression="${14:-false}"
+
   : >"$cfg"
   cat >>"$cfg" <<EOF
 # frpc-$name.toml (generated)
@@ -185,6 +204,19 @@ EOF
     echo "udpPacketSize = $udp_sz" >>"$cfg"
   fi
   echo >>"$cfg"
+
+  if [[ "$heartbeat_enable" == "true" ]]; then
+    echo "transport.heartbeatInterval = $hi" >>"$cfg"
+    echo "transport.heartbeatTimeout = $ht" >>"$cfg"
+  fi
+
+  if (( pool_count > 0 )); then
+    echo "transport.poolCount = $pool_count" >>"$cfg"
+  fi
+
+  if [[ "$compression" == "true" ]]; then
+    echo "transport.useCompression = true" >>"$cfg"
+  fi
 }
 
 append_proxy_block(){
@@ -299,7 +331,7 @@ action_add_server(){
   read -rp "Enable dashboard? (y/N): " d || true
   if [[ ${d,,} =~ ^y ]]; then
     while :; do read -rp "Dashboard port (e.g. 7500): " dport || true; validate_port "$dport" && break || echo "Invalid port"; done
-    read -rp "Dashboard username [admin]: " duser || true; duser=${duser:-admin}
+    read -rp "Dashboard username [admin]: " duser || true; Wduser=${duser:-admin}
     dpwd=$(rand_password); read -rp "Dashboard password (empty=random): " t || true; [[ -n ${t:-} ]] && dpwd="$t"
   fi
 
@@ -323,8 +355,32 @@ action_add_server(){
     proxy_bind=${proxy_bind:-0.0.0.0}
   fi
 
+  # Heartbeat
+  local heartbeat_enable=false hi=10 ht=90
+  read -rp "Enable heartbeat? (y/N): " h || true
+  if [[ ${h,,} =~ ^y ]]; then
+    heartbeat_enable=true
+    read -rp "Heartbeat interval [10]: " hi || true; hi=${hi:-10}
+    read -rp "Heartbeat timeout [90]: " ht || true; ht=${ht:-90}
+  fi
+
+  # Poolcount
+  local pool_count=0
+  read -rp "Use poolcount? (y/N): " p || true
+  if [[ ${p,,} =~ ^y ]]; then
+    read -rp "poolCount value: " pool_count || true; pool_count=${pool_count:-0}
+  fi
+
+  # Compression
+  local compression=false
+  read -rp "Enable traffic compression? (y/N): " c || true
+  if [[ ${c,,} =~ ^y ]]; then
+    compression=true
+  fi
+
   write_frps_toml "$cfg" "$name" "$bind" "$token" "$proto" "$udp_sz" "$tls_force" \
-                   "$cert_file" "$key_file" "$dport" "$duser" "$dpwd" "$qk" "$qi" "$qs" "$allow_csv"
+                   "$cert_file" "$key_file" "$dport" "$duser" "$dpwd" "$qk" "$qi" "$qs" "$allow_csv" \
+                   "$heartbeat_enable" "$hi" "$ht" "$pool_count" "$compression"
 
   if (( max_pool > 0 )); then echo "transport.maxPoolCount = $max_pool" >>"$cfg"; fi
   if [[ -n "$proxy_bind" ]]; then echo "proxyBindAddr = \"$proxy_bind\"" >>"$cfg"; fi
@@ -375,12 +431,31 @@ action_add_client(){
     read -rp "UDP packet size [1500]: " x || true; [[ -n ${x:-} ]] && udp_sz="$x"
   fi
 
-  write_frpc_toml "$cfg" "$name" "$saddr" "$sport" "$token" "$proto" "$tls_enable" "$udp_sz" "$sni"
+  # Heartbeat
+  local heartbeat_enable=false hi=10 ht=90
+  read -rp "Enable heartbeat? (y/N): " h || true
+  if [[ ${h,,} =~ ^y ]]; then
+    heartbeat_enable=true
+    read -rp "Heartbeat interval [10]: " hi || true; hi=${hi:-10}
+    read -rp "Heartbeat timeout [90]: " ht || true; ht=${ht:-90}
+  fi
 
+  # Poolcount
   local pool_count=0
-  read -rp "poolCount (0 = disabled) [0]: " pool_count || true
-  pool_count=${pool_count:-0}
-  if (( pool_count > 0 )); then echo "transport.poolCount = $pool_count" >>"$cfg"; fi
+  read -rp "Use poolcount? (y/N): " p || true
+  if [[ ${p,,} =~ ^y ]]; then
+    read -rp "poolCount value: " pool_count || true; pool_count=${pool_count:-0}
+  fi
+
+  # Compression
+  local compression=false
+  read -rp "Enable traffic compression? (y/N): " c || true
+  if [[ ${c,,} =~ ^y ]]; then
+    compression=true
+  fi
+
+  write_frpc_toml "$cfg" "$name" "$saddr" "$sport" "$token" "$proto" "$tls_enable" "$udp_sz" "$sni" \
+                  "$heartbeat_enable" "$hi" "$ht" "$pool_count" "$compression"
 
   ok "Base client config written: $cfg"
   echo "You can append multiple proxies. Type 'done' to finish."
@@ -414,7 +489,7 @@ action_add_client(){
 read_frpc_config(){
   local cfg="$1"; FRPC_HEAD=""; PROXIES=()
   local in_blocks=false in_block=false block=""
-  while IFS='' read -r多元 line || [[ -n "$line" ]]; do
+  while IFS='' read -r line || [[ -n "$line" ]]; do
     local t="${line%%$'\r'}"
     if [[ $t =~ ^\[\[proxies\]\] ]]; then
       in_blocks=true
