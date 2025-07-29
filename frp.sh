@@ -419,11 +419,13 @@ action_add_client(){
     *) proto=tcp ;;
   esac
 
-  local tls_enable=true sni=""
+  local tls_enable="true" sni=""
   if [[ "$proto" == tcp || "$proto" == websocket || "$proto" == wss ]]; then
     read -rp "Use TLS to server? (Y/n): " t || true
-    [[ ${t,,} =~ ^n ]] && tls_enable=false
-    if $tls_enable; then read -rp "TLS serverName (SNI) [optional]: " sni || true; fi
+    [[ ${t,,} =~ ^n ]] && tls_enable="false"
+    if [[ "$tls_enable" == "true" ]]; then
+      read -rp "TLS serverName (SNI) [optional]: " sni || true
+    fi
   fi
 
   local udp_sz=1500
@@ -432,10 +434,10 @@ action_add_client(){
   fi
 
   # Heartbeat
-  local heartbeat_enable=false hi=10 ht=90
+  local heartbeat_enable="false" hi=10 ht=90
   read -rp "Enable heartbeat? (y/N): " h || true
   if [[ ${h,,} =~ ^y ]]; then
-    heartbeat_enable=true
+    heartbeat_enable="true"
     read -rp "Heartbeat interval [10]: " hi || true; hi=${hi:-10}
     read -rp "Heartbeat timeout [90]: " ht || true; ht=${ht:-90}
   fi
@@ -448,10 +450,10 @@ action_add_client(){
   fi
 
   # Compression
-  local compression=false
+  local compression="false"
   read -rp "Enable traffic compression? (y/N): " c || true
   if [[ ${c,,} =~ ^y ]]; then
-    compression=true
+    compression="true"
   fi
 
   write_frpc_toml "$cfg" "$name" "$saddr" "$sport" "$token" "$proto" "$tls_enable" "$udp_sz" "$sni" \
