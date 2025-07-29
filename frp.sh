@@ -345,6 +345,10 @@ action_add_server(){
   local allow_csv=""
   read -rp "Restrict allowed ports? Comma‑separated list or empty: " allow_csv || true
 
+  local max_pool=0
+  read -rp "TCP connection pool maxPoolCount [0]: " max_pool || true
+  max_pool=${max_pool:-0}
+
   local proxy_bind=""
   if [[ "$proto" == kcp || "$proto" == quic ]]; then
     read -rp "UDP bind address [0.0.0.0]: " proxy_bind || true
