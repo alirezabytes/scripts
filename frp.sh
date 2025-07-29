@@ -198,7 +198,7 @@ webServer.password = "admin"
 
 transport.protocol = "$proto"
 EOF
-  maybe_add "transport.tls.enable" "$tls" "true" "$cfg"
+  maybe_add "transport.tls.enable" "$tls" "false" "$cfg"
   [[ -n "$sni" ]] && echo "transport.tls.serverName = \"$sni\"" >>"$cfg"
   if [[ "$proto" == "kcp" || "$proto" == "quic" ]]; then
     echo "udpPacketSize = $udp_sz" >>"$cfg"
