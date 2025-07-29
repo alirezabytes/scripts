@@ -110,7 +110,7 @@ write_frps_toml(){
   local cfile="${8:-}" kfile="${9:-}" dport="${10:-}" duser="${11:-}" dpwd="${12:-}"
   local qk="${13:-10}" qi="${14:-30}" qs="${15:-100000}" allow_csv="${16:-}"
   local heartbeat_enable="${17:-false}" hi="${18:-10}" ht="${19:-90}"
-  local pool_count="${20:-0}" compression="${21:-false}"
+  local max_pool="${20:-0}" compression="${21:-false}"
 
   : >"$cfg"
   cat >>"$cfg" <<EOF
@@ -163,12 +163,11 @@ EOF
   fi
 
   if [[ "$heartbeat_enable" == "true" ]]; then
-    echo "transport.heartbeatInterval = $hi" >>"$cfg"
     echo "transport.heartbeatTimeout = $ht" >>"$cfg"
   fi
 
-  if (( pool_count > 0 )); then
-    echo "transport.poolCount = $pool_count" >>"$cfg"
+  if (( max_pool > 0 )); then
+    echo "transport.maxPoolCount = $max_pool" >>"$cfg"
   fi
 
   if [[ "$compression" == "true" ]]; then
@@ -331,7 +330,7 @@ action_add_server(){
   read -rp "Enable dashboard? (y/N): " d || true
   if [[ ${d,,} =~ ^y ]]; then
     while :; do read -rp "Dashboard port (e.g. 7500): " dport || true; validate_port "$dport" && break || echo "Invalid port"; done
-    read -rp "Dashboard username [admin]: " duser || true; Wduser=${duser:-admin}
+    read -rp "Dashboard username [admin]: " duser || true; duser=${duser:-admin}
     dpwd=$(rand_password); read -rp "Dashboard password (empty=random): " t || true; [[ -n ${t:-} ]] && dpwd="$t"
   fi
 
@@ -380,9 +379,8 @@ action_add_server(){
 
   write_frps_toml "$cfg" "$name" "$bind" "$token" "$proto" "$udp_sz" "$tls_force" \
                    "$cert_file" "$key_file" "$dport" "$duser" "$dpwd" "$qk" "$qi" "$qs" "$allow_csv" \
-                   "$heartbeat_enable" "$hi" "$ht" "$pool_count" "$compression"
+                   "$heartbeat_enable" "$hi" "$ht" "$max_pool" "$compression"
 
-  if (( max_pool > 0 )); then echo "transport.maxPoolCount = $max_pool" >>"$cfg"; fi
   if [[ -n "$proxy_bind" ]]; then echo "proxyBindAddr = \"$proxy_bind\"" >>"$cfg"; fi
 
   ok "Config written: $cfg"
