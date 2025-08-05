@@ -9,6 +9,7 @@
 #  * Supports proxyBindAddr for KCP/QUIC
 #  * Avoids writing default keys via helper maybe_add()
 #  * Adds heartbeat, poolcount, and compression options
+#  * Adds TCP multiplexing (tcpMux) option
 # ============================================================================
 set -Euo pipefail
 : "${FRP_DEBUG:=0}"
@@ -59,7 +60,7 @@ install_frp(){
   url=$(latest_frp_url) || { err "Could not resolve download URL"; return 1; }
   [[ -z $url ]] && { err "Empty URL"; return 1; }
   log "URL: $url"
-  pkg="/tmp/$(basename "$url")"
+ Algorithms pkg="/tmp/$(basename "$url")"
   curl -fL -o "$pkg" "$url"
   tmpdir="/tmp/frp-extract.$$"; rm -rf "$tmpdir"; mkdir -p "$tmpdir"
   tar -xzf "$pkg" -C "$tmpdir" --strip-components=1
@@ -110,7 +111,7 @@ write_frps_toml(){
   local cfile="${8:-}" kfile="${9:-}" dport="${10:-}" duser="${11:-}" dpwd="${12:-}"
   local qk="${13:-10}" qi="${14:-30}" qs="${15:-100000}" allow_csv="${16:-}"
   local heartbeat_enable="${17:-false}" hi="${18:-10}" ht="${19:-90}"
-  local max_pool="${20:-0}" compression="${21:-false}"
+  local max_pool="${20:-0}" compression="${21:-false}" tcp_mux="${22:-false}"
 
   : >"$cfg"
   cat >>"$cfg" <<EOF
@@ -173,12 +174,15 @@ EOF
   if [[ "$compression" == "true" ]]; then
     echo "transport.useCompression = true" >>"$cfg"
   fi
+
+  # Add TCP multiplexing setting
+  echo "transport.tcpMux = $tcp_mux" >>"$cfg"
 }
 
 write_frpc_toml(){
   local cfg="$1" name="$2" saddr="$3" sport="$4" token="$5" proto="$6" tls="$7" udp_sz="$8" sni="${9:-}"
   local heartbeat_enable="${10:-false}" hi="${11:-10}" ht="${12:-90}"
-  local pool_count="${13:-0}" compression="${14:-false}"
+  local pool_count="${13:-0}" compression="${14:-false}" tcp_mux="${15:-false}"
 
   : >"$cfg"
   cat >>"$cfg" <<EOF
@@ -216,6 +220,9 @@ EOF
   if [[ "$compression" == "true" ]]; then
     echo "transport.useCompression = true" >>"$cfg"
   fi
+
+  # Add TCP multiplexing setting
+  echo "transport.tcpMux = $tcp_mux" >>"$cfg"
 }
 
 append_proxy_block(){
@@ -377,9 +384,16 @@ action_add_server(){
     compression=true
   fi
 
+  # TCP multiplexing
+  local tcp_mux=false
+  read -rp "Enable TCP multiplexing (tcpMux)? (y/N): " t || true
+  if [[ ${t,,} =~ ^y ]]; then
+    tcp_mux=true
+  fi
+
   write_frps_toml "$cfg" "$name" "$bind" "$token" "$proto" "$udp_sz" "$tls_force" \
                    "$cert_file" "$key_file" "$dport" "$duser" "$dpwd" "$qk" "$qi" "$qs" "$allow_csv" \
-                   "$heartbeat_enable" "$hi" "$ht" "$max_pool" "$compression"
+                   "$heartbeat_enable" "$hi" "$ht" "$max_pool" "$compression" "$tcp_mux"
 
   if [[ -n "$proxy_bind" ]]; then echo "proxyBindAddr = \"$proxy_bind\"" >>"$cfg"; fi
 
@@ -454,8 +468,15 @@ action_add_client(){
     compression="true"
   fi
 
+  # TCP multiplexing
+  local tcp_mux=false
+  read -rp "Enable TCP multiplexing (tcpMux)? (y/N): " t || true
+  if [[ ${t,,} =~ ^y ]]; then
+    tcp_mux=true
+  fi
+
   write_frpc_toml "$cfg" "$name" "$saddr" "$sport" "$token" "$proto" "$tls_enable" "$udp_sz" "$sni" \
-                  "$heartbeat_enable" "$hi" "$ht" "$pool_count" "$compression"
+                  "$heartbeat_enable" "$hi" "$ht" "$pool_count" "$compression" "$tcp_mux"
 
   ok "Base client config written: $cfg"
   echo "You can append multiple proxies. Type 'done' to finish."
