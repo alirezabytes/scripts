@@ -60,7 +60,7 @@ install_frp(){
   url=$(latest_frp_url) || { err "Could not resolve download URL"; return 1; }
   [[ -z $url ]] && { err "Empty URL"; return 1; }
   log "URL: $url"
- Algorithms pkg="/tmp/$(basename "$url")"
+  pkg="/tmp/$(basename "$url")"
   curl -fL -o "$pkg" "$url"
   tmpdir="/tmp/frp-extract.$$"; rm -rf "$tmpdir"; mkdir -p "$tmpdir"
   tar -xzf "$pkg" -C "$tmpdir" --strip-components=1
