@@ -173,13 +173,6 @@ user_management() {
 }
 
 install_and_configure_ocserv_with_lets_encrypt() {
-  # Change DNS
-  rm -rf /etc/resolv.conf
-  cat << EOF > /etc/resolv.conf
-nameserver 8.8.8.8
-nameserver 8.8.4.4
-EOF
-
   apt-get update
 
   # Enabling ipv4_forward
@@ -407,13 +400,6 @@ obtain_a_trusted_tls_certificate_from_lets_encrypt() {
 }
 
 install_and_configure_ocserv_without_lets_encrypt() {
-  # Change DNS
-  rm -rf /etc/resolv.conf
-  cat << EOF > /etc/resolv.conf
-nameserver 8.8.8.8
-nameserver 8.8.4.4
-EOF
-
   apt-get update
   # Enabling ipv4_forward
   sed -i -e 's@#net.ipv4.ip_forward=1@net.ipv4.ip_forward=1@g' /etc/sysctl.conf
