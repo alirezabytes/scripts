@@ -8,11 +8,12 @@
 # * Adds heartbeat/check-alive mechanism (optional ping/reconnect)
 # * Allows custom SSH options (e.g., compression, multiplexing)
 # * Uninstall removes all services, configs, binaries if applicable
+# * Simplified port forward input: ask for remote and local ports separately
 # ============================================================================
 set -Euo pipefail
 : "${DEBUG:=0}"
 trap 's=$?; if [[ "$DEBUG" == 1 ]]; then echo "[ERROR] line $LINENO: $BASH_COMMAND -> exit $s"; fi' ERR
-SCRIPT_VERSION="1.0.0-multi-support"
+SCRIPT_VERSION="1.1.0-simplified-ports"
 BASE_DIR="$(pwd)/reverse_ssh" # per-user config root
 GLOBAL_KEY_FILE="/root/.ssh/id_rsa_reverse_ssh"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -165,16 +166,17 @@ action_add_tunnel(){
   read -rp "Enable multiplexing? (y/N): " m || true; [[ ${m,,} =~ ^y ]] && multiplexing="true"
   read -rp "Enable heartbeat/reconnect? (Y/n): " h || true; [[ ${h,,} =~ ^n ]] && heartbeat="false"
   local forwards=()
-  echo "Add port forwards. Format: remote_port:localhost:local_port (e.g., 2222:localhost:22). Type 'done' to finish."
+  echo "Add port forwards. Type 'done' to finish."
   local idx=1
   while :; do
     echo "--- Forward #$idx ---"
-    local fwd
-    read -rp "Forward (or 'done'): " fwd || true
-    [[ ${fwd,,} == done ]] && break
-    [[ $fwd =~ ^[0-9]+:localhost:[0-9]+$ ]] || { echo "Invalid format"; continue; }
-    validate_port "${fwd%%:*}" || { echo "Invalid remote port"; continue; }
-    validate_port "${fwd##*:}" || { echo "Invalid local port"; continue; }
+    local remote_port local_port fwd
+    read -rp "Remote port (on server, or 'done'): " remote_port || true
+    [[ ${remote_port,,} == done ]] && break
+    validate_port "$remote_port" || { echo "Invalid remote port"; continue; }
+    read -rp "Local port (on this machine): " local_port || true
+    validate_port "$local_port" || { echo "Invalid local port"; continue; }
+    fwd="$remote_port:localhost:$local_port"
     forwards+=("$fwd")
     ok "Added forward: $fwd"
     ((idx++))
@@ -219,14 +221,18 @@ manage_tunnel_forwards(){
         fi
         pause;;
       2)
-        local fwd
+        local remote_port local_port fwd
         while :; do
-          read -rp "New forward (remote:localhost:local): " fwd || true
-          [[ $fwd =~ ^[0-9]+:localhost:[0-9]+$ ]] || { echo "Invalid"; continue; }
-          validate_port "${fwd%%:*}" || { echo "Invalid remote"; continue; }
-          validate_port "${fwd##*:}" || { echo "Invalid local"; continue; }
+          read -rp "Remote port (on server): " remote_port || true
+          validate_port "$remote_port" || { echo "Invalid remote port"; continue; }
           break
         done
+        while :; do
+          read -rp "Local port (on this machine): " local_port || true
+          validate_port "$local_port" || { echo "Invalid local port"; continue; }
+          break
+        done
+        fwd="$remote_port:localhost:$local_port"
         read_tunnel_config "$script"
         FORWARDS+=("$fwd")
         write_tunnel_with_forwards "$script"
@@ -235,12 +241,15 @@ manage_tunnel_forwards(){
         read_tunnel_config "$script"; (( ${#FORWARDS[@]} == 0 )) && { echo "No forwards"; pause; continue; }
         local j=1; for fwd in "${FORWARDS[@]}"; do echo " $j) $fwd"; ((j++)); done
         read -rp "Select forward: " j || true; (( j>=1 && j<=${#FORWARDS[@]} )) || { echo "Invalid"; pause; continue; }
-        local old_fwd="${FORWARDS[$((j-1))]}"
-        local nfwd
-        read -rp "New forward [$old_fwd]: " nfwd || true; nfwd=${nfwd:-$old_fwd}
-        [[ $nfwd =~ ^[0-9]+:localhost:[0-9]+$ ]] || { echo "Invalid"; pause; continue; }
-        validate_port "${nfwd%%:*}" || { echo "Invalid remote"; pause; continue; }
-        validate_port "${nfwd##*:}" || { echo "Invalid local"; pause; continue; }
+        local old_fwd="${FORWARDS[$((j-1))]}" old_remote old_local
+        old_remote="${old_fwd%%:*}"
+        old_local="${old_fwd##*:}"
+        local new_remote new_local nfwd
+        read -rp "New remote port [$old_remote]: " new_remote || true; new_remote=${new_remote:-$old_remote}
+        validate_port "$new_remote" || { echo "Invalid remote port"; pause; continue; }
+        read -rp "New local port [$old_local]: " new_local || true; new_local=${new_local:-$old_local}
+        validate_port "$new_local" || { echo "Invalid local port"; pause; continue; }
+        nfwd="$new_remote:localhost:$new_local"
         FORWARDS[$((j-1))]="$nfwd"
         write_tunnel_with_forwards "$script"
         systemctl restart "$unit" || true; ok "Updated & restarted"; pause;;
