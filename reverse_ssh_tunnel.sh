@@ -10,11 +10,12 @@
 # * Uninstall removes all services, configs, binaries if applicable
 # * Simplified port forward input: ask for remote and local ports separately
 # * Adapted key handling, copy, and GatewayPorts like original script
+# * Restored full .service content for better stability and security
 # ============================================================================
 set -Euo pipefail
 : "${DEBUG:=0}"
 trap 's=$?; if [[ "$DEBUG" == 1 ]]; then echo "[ERROR] line $LINENO: $BASH_COMMAND -> exit $s"; fi' ERR
-SCRIPT_VERSION="1.2.0-original-key-handling"
+SCRIPT_VERSION="1.3.0-full-service"
 BASE_DIR="$(pwd)/reverse_ssh" # per-user config root
 GLOBAL_KEY_FILE="/root/.ssh/id_rsa"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -103,12 +104,20 @@ create_service(){
   local unit="$1" exec="$2"
   cat >"$SYSTEMD_DIR/$unit.service" <<EOF
 [Unit]
-Description=Reverse SSH Tunnel.
-After=network.target
+Description=Reverse SSH Tunnel: $unit
+After=network-online.target
+Wants=network-online.target
 [Service]
+Type=simple
+User=root
+ExecStartPre=/bin/sleep 5
+ExecStart=$exec
 Restart=always
 RestartSec=10
-ExecStart=$exec
+LimitNOFILE=200000
+NoNewPrivileges=true
+ProtectSystem=full
+PrivateTmp=true
 [Install]
 WantedBy=multi-user.target
 EOF
