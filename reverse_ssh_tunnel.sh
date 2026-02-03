@@ -3,24 +3,30 @@
 # Reverse SSH Tunnel Unlimited Menu
 # English-only edition – updated February 2026
 # * Supports multiple tunnels (services) with multiple port forwards
-# * Manages SSH keys per-tunnel or global
+# * Manages SSH keys per-tunnel or global, with check and generate like original
 # * Validates inputs, handles systemd services
 # * Adds heartbeat/check-alive mechanism (optional ping/reconnect)
 # * Allows custom SSH options (e.g., compression, multiplexing)
 # * Uninstall removes all services, configs, binaries if applicable
 # * Simplified port forward input: ask for remote and local ports separately
+# * Adapted key handling, copy, and GatewayPorts like original script
 # ============================================================================
 set -Euo pipefail
 : "${DEBUG:=0}"
 trap 's=$?; if [[ "$DEBUG" == 1 ]]; then echo "[ERROR] line $LINENO: $BASH_COMMAND -> exit $s"; fi' ERR
-SCRIPT_VERSION="1.1.0-simplified-ports"
+SCRIPT_VERSION="1.2.0-original-key-handling"
 BASE_DIR="$(pwd)/reverse_ssh" # per-user config root
-GLOBAL_KEY_FILE="/root/.ssh/id_rsa_reverse_ssh"
+GLOBAL_KEY_FILE="/root/.ssh/id_rsa"
 SYSTEMD_DIR="/etc/systemd/system"
 log(){ echo "$*"; }
 ok(){ echo "[OK] $*"; }
 err(){ echo "[ERR] $*" >&2; }
 pause(){ read -rp "Press Enter to continue..." _ || true; }
+printc() {
+    local text="$1"
+    local color="$2"
+    echo -e "\e[${color}m${text}\e[0m"
+}
 # ─────────────────────────────────────────── helper ──────────────────────────
 validate_port(){ local p=${1:-}; [[ $p =~ ^[0-9]+$ ]] && (( p>=1 && p<=65535 )); }
 validate_host(){
@@ -30,21 +36,27 @@ validate_host(){
   local domain='^([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,63}$'
   [[ $h =~ $ipv4 || $h =~ $ipv6 || $h =~ $domain ]]
 }
-rand_password(){ head /dev/urandom | tr -dc 'A-Za-z0-9' | head -c 16; }
 ensure_base(){ mkdir -p "$BASE_DIR"; }
-safe_user(){ whoami; }
 # ────────────────────────────── SSH key helpers ─────────────────────────────
-generate_key(){ local kf="$1"; ssh-keygen -t rsa -f "$kf" -q -N ""; ok "Generated key: $kf"; }
+generate_key(){ local kf="$1"; ssh-keygen -t rsa -f "$kf" -q -N ""; printc "New SSH Key generated!" "32"; }
 copy_key_to_server(){
   local kf="$1" sip="$2" sport="$3"
-  read -rsp "Enter server password for key install: " spwd; echo
-  expect -c "spawn ssh-copy-id -i $kf.pub -p $sport root@$sip; expect assword: {send $spwd\r}; interact" >/dev/null 2>&1
+  printc "Enter tunnel vps password for installing ssh key" "32"
+  ssh-copy-id -i "$kf.pub" -p "$sport" root@"$sip"
   ok "Key copied to $sip:$sport"
 }
 enable_gateway_ports(){
   local sip="$1" sport="$2"
-  ssh -p "$sport" root@"$sip" "sed -i -E '/^\s*#?\s*GatewayPorts/ { s/^#//; s/\bno\b/yes/ }' /etc/ssh/sshd_config; systemctl restart ssh"
+  ssh -p "$sport" root@"$sip" "sed -i -E '/^\s*#?\s*GatewayPorts/ { s/^#//; s/\bno\b/yes/ }' /etc/ssh/sshd_config; service ssh restart;"
   ok "Enabled GatewayPorts on server"
+}
+check_and_generate_key(){
+  local kf="$1"
+  if [[ -e "$kf" ]]; then
+    printc "SSH Key created already" "32"
+  else
+    generate_key "$kf"
+  fi
 }
 # ────────────────────────────── Config writers ──────────────────────────────
 write_tunnel_script(){
@@ -91,25 +103,18 @@ create_service(){
   local unit="$1" exec="$2"
   cat >"$SYSTEMD_DIR/$unit.service" <<EOF
 [Unit]
-Description=Reverse SSH Tunnel: $unit
-After=network-online.target
-Wants=network-online.target
+Description=Reverse SSH Tunnel.
+After=network.target
 [Service]
-Type=simple
-User=root
-ExecStartPre=/bin/sleep 5
-ExecStart=$exec
 Restart=always
 RestartSec=10
-LimitNOFILE=200000
-NoNewPrivileges=true
-ProtectSystem=full
-PrivateTmp=true
+ExecStart=$exec
 [Install]
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
   systemctl enable --now "$unit.service" >/dev/null 2>&1 || true
+  systemctl status "$unit.service"
 }
 show_logs(){ local unit="$1"; journalctl -u "$unit" -n 80 --no-pager; pause; }
 service_exists(){ systemctl list-unit-files --type=service --no-pager | grep -q "^$1\.service"; }
@@ -144,7 +149,7 @@ write_tunnel_with_forwards(){
 # ───────────────────────────── interactive flows ────────────────────────────
 action_add_tunnel(){
   ensure_base
-  echo "-- Add Reverse SSH Tunnel --"
+  printc "-- Add Reverse SSH Tunnel --" "31"
   local name
   while :; do
     read -rp "Tunnel name (alnum, hyphen, underscore): " name || true
@@ -155,10 +160,12 @@ action_add_tunnel(){
   if service_exists "$service"; then err "Service already exists: $service"; pause; return; fi
   local sip sport key_file="$GLOBAL_KEY_FILE" use_global_key="true"
   while :; do read -rp "Server IP/host: " sip || true; validate_host "$sip" && break || echo "Invalid"; done
+  printc "VPS Tunnel IP: $sip" "32"
   while :; do read -rp "Server SSH port [22]: " sport || true; sport=${sport:-22}; validate_port "$sport" && break || echo "Invalid"; done
-  if [[ ! -f "$key_file" ]]; then generate_key "$key_file"; fi
+  printc "VPS Tunnel SSH Port: $sport" "32"
   read -rp "Use global SSH key ($key_file)? (Y/n): " ug || true
-  [[ ${ug,,} =~ ^n ]] && { use_global_key="false"; key_file="$BASE_DIR/id_rsa_$name"; generate_key "$key_file"; }
+  [[ ${ug,,} =~ ^n ]] && { use_global_key="false"; key_file="$BASE_DIR/id_rsa_$name"; }
+  check_and_generate_key "$key_file"
   copy_key_to_server "$key_file" "$sip" "$sport"
   enable_gateway_ports "$sip" "$sport"
   local compression="false" multiplexing="false" heartbeat="true"
@@ -174,8 +181,10 @@ action_add_tunnel(){
     read -rp "Remote port (on server, or 'done'): " remote_port || true
     [[ ${remote_port,,} == done ]] && break
     validate_port "$remote_port" || { echo "Invalid remote port"; continue; }
+    printc "VPS Tunnel Listening Port: $remote_port" "32"
     read -rp "Local port (on this machine): " local_port || true
     validate_port "$local_port" || { echo "Invalid local port"; continue; }
+    printc "Listen From $sip:$remote_port And Forward to Port: $local_port" "32"
     fwd="$remote_port:localhost:$local_port"
     forwards+=("$fwd")
     ok "Added forward: $fwd"
@@ -289,7 +298,7 @@ view_logs_menu(){
 main_menu(){
   while :; do
     clear
-    echo "Reverse SSH Tunnel Unlimited Menu v$SCRIPT_VERSION"
+    printc "Reverse SSH Tunnel Unlimited Menu v$SCRIPT_VERSION" "31"
     echo "Config root : $BASE_DIR"
     echo
     echo "1) Add new tunnel"
