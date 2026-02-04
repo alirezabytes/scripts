@@ -176,7 +176,6 @@ main_menu() {
         echo "5) Exit"
         echo
         read -rp "Choose an option [1-5]: " choice
-
         case $choice in
             1) install_tunnel ;;
             2) show_status; read -rp "Press Enter to continue..." ;;
@@ -211,7 +210,7 @@ install_tunnel() {
     echo "Status: systemctl status $SERVICE_NAME"
 }
 
-# ──────────────────────────────────────────── Start ────────────────────────────
+# ──────────────────────────────────────────── Entry Point ─────────────────────
 check_root
 
 if [[ -f "$SYSTEMD_PATH" ]]; then
