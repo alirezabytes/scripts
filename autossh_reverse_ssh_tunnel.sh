@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
+
 # ============================================================================
 # Reverse SSH Tunnel Manager with autossh
 # Interactive menu only - no command-line arguments needed
 # All messages in English
-# Fixed service name: reverse_ssh_tunnel
-# With autossh -M monitoring port for auto-reconnect
 # ============================================================================
 
 set -e
@@ -19,8 +18,8 @@ print_error()   { echo -e "${RED}[ERROR]${NC} $1" >&2; }
 print_success() { echo -e "${GREEN}[OK]${NC} $1"; }
 print_info()    { echo -e "${YELLOW}[INFO]${NC} $1"; }
 
-# Fixed paths - no more variable service name
-SERVICE_NAME="reverse_ssh_tunnel"
+# Paths
+SERVICE_NAME="reverse-ssh-tunnel"
 TUNNEL_SCRIPT="/usr/local/bin/${SERVICE_NAME}.sh"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 KEY_FILE="/root/.ssh/id_rsa"
@@ -37,14 +36,14 @@ show_menu() {
     echo -e "${YELLOW}============================================================${NC}"
     echo "          Reverse SSH Tunnel Manager (autossh)"
     echo -e "${YELLOW}============================================================${NC}"
-    echo " 1) Install / Setup new reverse tunnel"
-    echo " 2) Uninstall / Remove tunnel completely"
-    echo " 3) Start the tunnel service"
-    echo " 4) Stop the tunnel service"
-    echo " 5) Restart the tunnel service"
-    echo " 6) Show service status"
-    echo " 7) Show recent logs (last 50 lines)"
-    echo " 0) Exit"
+    echo "  1) Install / Setup new reverse tunnel"
+    echo "  2) Uninstall / Remove tunnel completely"
+    echo "  3) Start the tunnel service"
+    echo "  4) Stop the tunnel service"
+    echo "  5) Restart the tunnel service"
+    echo "  6) Show service status"
+    echo "  7) Show recent logs (last 50 lines)"
+    echo "  0) Exit"
     echo -e "${YELLOW}============================================================${NC}"
     read -r -p "Enter choice (0-7): " choice
 }
@@ -97,23 +96,19 @@ create_tunnel_script() {
     cat > "$TUNNEL_SCRIPT" << EOF
 #!/usr/bin/env bash
 # Persistent reverse tunnel - auto-generated
-# autossh -M enables monitoring → auto restart on disconnect (~every 10s check)
 
-MONITOR_PORT=65371   # <<<< Monitoring port - change if conflict
-
-autossh -M \$MONITOR_PORT \\
+autossh -M 0 \\
     -o ServerAliveInterval=10 \\
     -o ServerAliveCountMax=3 \\
     -o ExitOnForwardFailure=yes \\
     -o TCPKeepAlive=yes \\
     -o IPQoS=throughput \\
-    -o ConnectTimeout=15 \\
     -N -R ${remote_port}:localhost:${local_port} \\
     -p ${ssh_port} root@${ip}
 EOF
 
     chmod +x "$TUNNEL_SCRIPT"
-    print_success "Tunnel script created at $TUNNEL_SCRIPT"
+    print_success "Tunnel script created"
 }
 
 create_systemd_service() {
@@ -137,7 +132,7 @@ WantedBy=multi-user.target
 EOF
 
     systemctl daemon-reload
-    print_success "Systemd service file created: $SERVICE_FILE"
+    print_success "Systemd service file created"
 }
 
 do_install() {
@@ -180,13 +175,10 @@ do_uninstall() {
     rm -f "$SERVICE_FILE" "$TUNNEL_SCRIPT"
     systemctl daemon-reload
     print_success "Tunnel service and files removed."
-    print_info "SSH keys are not deleted. Remove manually if needed: rm -f $KEY_FILE ${KEY_FILE}.pub"
+    print_info "SSH keys are not deleted. Remove manually if needed."
 }
 
-# ──────────────────────────────────────────────
-# Main - always show menu
-# ──────────────────────────────────────────────
-
+# Main loop - always show menu
 check_root
 
 while true; do
