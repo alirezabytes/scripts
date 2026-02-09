@@ -14,7 +14,7 @@
 set -Euo pipefail
 : "${FRP_DEBUG:=0}"
 trap 's=$?; if [[ "$FRP_DEBUG" == 1 ]]; then echo "[ERROR] line $LINENO: $BASH_COMMAND -> exit $s"; fi' ERR
-SCRIPT_VERSION="2.4.0-pool-support"
+SCRIPT_VERSION="2.4.1-pool-support"
 BASE_DIR="$(pwd)/frp" # per‑user config root
 BIN_FRPS="/usr/local/bin/frps"
 BIN_FRPC="/usr/local/bin/frpc"
@@ -116,10 +116,12 @@ transport.quic.maxIdleTimeout = $qi
 transport.quic.maxIncomingStreams = $qs
 EOF
   fi
-  echo "transport.tls.force = $tls_force" >>"$cfg"
-  if [[ "$tls_force" == "true" && -n "$cfile" && -n "$kfile" ]]; then
-    echo "transport.tls.certFile = \"$cfile\"" >>"$cfg"
-    echo "transport.tls.keyFile = \"$kfile\"" >>"$cfg"
+  if [[ -n "$proto" ]]; then
+    echo "transport.tls.force = $tls_force" >>"$cfg"
+    if [[ "$tls_force" == "true" && -n "$cfile" && -n "$kfile" ]]; then
+      echo "transport.tls.certFile = \"$cfile\"" >>"$cfg"
+      echo "transport.tls.keyFile = \"$kfile\"" >>"$cfg"
+    fi
   fi
   if [[ "$proto" == "kcp" || "$proto" == "quic" ]]; then
     echo "udpPacketSize = $udp_sz" >>"$cfg"
@@ -268,25 +270,40 @@ action_add_server(){
   local bind token
   while :; do read -rp "Bind port (e.g. 7000): " bind || true; validate_port "$bind" && break || echo "Invalid port"; done
   while :; do read -rp "Auth token: " token || true; [[ -n $token ]] && break || echo "Token cannot be empty"; done
-  echo "Transport protocol: 1) tcp 2) kcp 3) quic"
-  local choice proto; read -rp "Choose [1-3]: " choice || true
-  case ${choice:-1} in
-    1) proto=tcp ;;
-    2) proto=kcp ;;
-    3) proto=quic ;;
-    *) proto=tcp ;;
-  esac
+  local proto="" specify_proto
+  read -rp "Do you want to specify a transport protocol? (y/N): " specify_proto || true
+  if [[ ${specify_proto,,} =~ ^y ]]; then
+    echo "Transport protocol: 1) tcp 2) kcp 3) quic 4) websocket 5) wss"
+    local choice; read -rp "Choose [1-5]: " choice || true
+    case ${choice:-1} in
+      1) proto=tcp ;;
+      2) proto=kcp ;;
+      3) proto=quic ;;
+      4) proto=websocket ;;
+      5) proto=wss ;;
+      *) proto=tcp ;;
+    esac
+  else
+    proto=tcp  # Default to tcp if not specified
+  fi
   local udp_sz=1500
   if [[ "$proto" == kcp || "$proto" == quic ]]; then
     read -rp "UDP packet size [1500]: " x || true; [[ -n ${x:-} ]] && udp_sz="$x"
   fi
   local tls_force=false cert_pair cert_file="" key_file=""
-  if [[ "$proto" == tcp ]]; then
-    read -rp "Force TLS-only connections? (y/N): " a || true
-    if [[ ${a,,} =~ ^y ]]; then
+  if [[ "$proto" == tcp || "$proto" == websocket || "$proto" == wss ]]; then
+    if [[ "$proto" == wss ]]; then
       tls_force=true
+      echo "WSS requires TLS. Forcing TLS-only connections."
       cert_pair=$(select_cert)
-      if [[ -n $cert_pair ]]; then cert_file="${cert_pair%%|*}"; key_file="${cert_pair##*|}"; fi
+      if [[ -n $cert_pair ]]; then cert_file="${cert_pair%%|*}"; key_file="${cert_pair##*|}"; else err "Certificate required for WSS. Cancelling."; pause; return; fi
+    else
+      read -rp "Force TLS-only connections? (y/N): " a || true
+      if [[ ${a,,} =~ ^y ]]; then
+        tls_force=true
+        cert_pair=$(select_cert)
+        if [[ -n $cert_pair ]]; then cert_file="${cert_pair%%|*}"; key_file="${cert_pair##*|}"; fi
+      fi
     fi
   fi
   local dport="" duser="admin" dpwd=""
@@ -297,7 +314,7 @@ action_add_server(){
     dpwd=$(rand_password); read -rp "Dashboard password (empty=random): " t || true; [[ -n ${t:-} ]] && dpwd="$t"
   fi
   local qk=10 qi=30 qs=100000
-  if [[ "$proto" == quic ]]; then
+  if [[ "$proto" == "quic" ]]; then
     read -rp "QUIC keepalivePeriod [10]: " t || true; [[ -n ${t:-} ]] && qk="$t"
     read -rp "QUIC maxIdleTimeout [30]: " t || true; [[ -n ${t:-} ]] && qi="$t"
     read -rp "QUIC maxIncomingStreams [100000]: " t || true; [[ -n ${t:-} ]] && qs="$t"
@@ -362,19 +379,20 @@ action_add_client(){
   while :; do read -rp "Server address (IP/host): " saddr || true; validate_host "$saddr" && break || echo "Invalid"; done
   while :; do read -rp "Server port (e.g. 7000): " sport || true; validate_port "$sport" && break || echo "Invalid"; done
   while :; do read -rp "Auth token: " token || true; [[ -n $token ]] && break || echo "Token cannot be empty"; done
-  echo "Transport protocol: 1) tcp 2) kcp 3) quic 4) websocket"
-  local choice proto; read -rp "Choose [1-4]: " choice || true
+  echo "Transport protocol: 1) tcp 2) kcp 3) quic 4) websocket 5) wss"
+  local choice proto; read -rp "Choose [1-5]: " choice || true
   case ${choice:-1} in
     1) proto=tcp ;;
     2) proto=kcp ;;
     3) proto=quic ;;
     4) proto=websocket ;;
+    5) proto=wss ;;
     *) proto=tcp ;;
   esac
-  local tls_enable="false" sni=""
-  if [[ "$proto" == tcp || "$proto" == websocket ]]; then
-    read -rp "Use TLS to server? (y/N): " t || true
-    if [[ ${t,,} =~ ^y ]]; then tls_enable="true"; fi
+  local tls_enable="true" sni=""
+  if [[ "$proto" == tcp || "$proto" == websocket || "$proto" == wss ]]; then
+    read -rp "Use TLS to server? (Y/n): " t || true
+    [[ ${t,,} =~ ^n ]] && tls_enable="false"
     if [[ "$tls_enable" == "true" ]]; then
       read -rp "TLS serverName (SNI) [optional]: " sni || true
     fi
