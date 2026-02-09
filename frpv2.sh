@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
-# FRP Unlimited Menu (modern TOML for v0.63.x+)
-# English-only edition – updated February 2026
+# FRP Unlimited Menu (modern TOML for v0.63.x)
+# English‑only edition – updated July 2025
 # * Adds poolCount / maxPoolCount support (default 0)
 # * Correct udpPacketSize condition (KCP & QUIC only)
 # * Writes transport.tls.enable **only** when false
@@ -10,14 +10,12 @@
 # * Avoids writing default keys via helper maybe_add()
 # * Adds heartbeat, poolcount, and compression options
 # * Adds TCP multiplexing (tcpMux) option
-# * Fixed WSS: force tls_enable=true and require SNI
-# * Use official GitHub latest release for download
 # ============================================================================
 set -Euo pipefail
 : "${FRP_DEBUG:=0}"
 trap 's=$?; if [[ "$FRP_DEBUG" == 1 ]]; then echo "[ERROR] line $LINENO: $BASH_COMMAND -> exit $s"; fi' ERR
-SCRIPT_VERSION="2.5.0-wss-fix"
-BASE_DIR="$(pwd)/frp" # per-user config root
+SCRIPT_VERSION="2.4.0-pool-support"
+BASE_DIR="$(pwd)/frp" # per‑user config root
 BIN_FRPS="/usr/local/bin/frps"
 BIN_FRPC="/usr/local/bin/frpc"
 SYSTEMD_DIR="/etc/systemd/system"
@@ -36,23 +34,23 @@ maybe_add(){ # $1 key $2 value $3 default $4 cfg_path
 }
 # ─────────────────────────────────── arch / download ─────────────────────────
 arch_tag(){
-case "$(uname -m)" in
-x86_64|amd64) echo linux_amd64 ;;
-aarch64|arm64) echo linux_arm64 ;;
-armv7l) echo linux_arm ;;
-*) err "Unsupported arch: $(uname -m)"; exit 1 ;;
-esac
+  case "$(uname -m)" in
+    x86_64|amd64) echo linux_amd64 ;;
+    aarch64|arm64) echo linux_arm64 ;;
+    armv7l) echo linux_arm ;;
+    *) err "Unsupported arch: $(uname -m)"; exit 1 ;;
+  esac
 }
 latest_frp_url(){
-local arch; arch=$(arch_tag)
-curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest \
-| grep 'browser_download_url' | grep -E "${arch}\\.tar\\.gz" \
-| cut -d '"' -f 4 | head -n1
+  local arch; arch=$(arch_tag)
+  curl -fsSL https://api.github.com/repos/fatedier/frp/releases/latest \
+    | grep 'browser_download_url' | grep -E "${arch}\\.tar\\.gz" \
+    | cut -d '"' -f 4 | head -n1
 }
 install_frp(){
-log "Downloading latest FRP via GitHub API..."
+  log "Downloading latest FRP via GitHub API..."
   local url pkg tmpdir
-url=$(latest_frp_url) || { err "Could not resolve download URL"; return 1; }
+  url=$(latest_frp_url) || { err "Could not resolve download URL"; return 1; }
   [[ -z $url ]] && { err "Empty URL"; return 1; }
   log "URL: $url"
   pkg="/tmp/$(basename "$url")"
@@ -108,7 +106,7 @@ write_frps_toml(){
 bindAddr = "0.0.0.0"
 bindPort = $bind
 EOF
-  maybe_add "transport.heartbeatTimeout" "$ht" "90" "$cfg"
+  maybe_add "transport.heartbeatTimeout" "$DEFAULT_FRPS_HEARTBEAT_TIMEOUT" "90" "$cfg"
   if [[ "$proto" == "kcp" ]]; then echo "kcpBindPort = $bind" >>"$cfg"; fi
   if [[ "$proto" == "quic" ]]; then
     echo "quicBindPort = $bind" >>"$cfg"
@@ -157,6 +155,7 @@ EOF
   if [[ "$compression" == "true" ]]; then
     echo "transport.useCompression = true" >>"$cfg"
   fi
+  # Add TCP multiplexing setting
   echo "transport.tcpMux = $tcp_mux" >>"$cfg"
 }
 write_frpc_toml(){
@@ -193,6 +192,7 @@ EOF
   if [[ "$compression" == "true" ]]; then
     echo "transport.useCompression = true" >>"$cfg"
   fi
+  # Add TCP multiplexing setting
   echo "transport.tcpMux = $tcp_mux" >>"$cfg"
 }
 append_proxy_block(){
@@ -303,7 +303,7 @@ action_add_server(){
     read -rp "QUIC maxIncomingStreams [100000]: " t || true; [[ -n ${t:-} ]] && qs="$t"
   fi
   local allow_csv=""
-  read -rp "Restrict allowed ports? Comma-separated list or empty: " allow_csv || true
+  read -rp "Restrict allowed ports? Comma‑separated list or empty: " allow_csv || true
   local max_pool=0
   read -rp "TCP connection pool maxPoolCount [0]: " max_pool || true
   max_pool=${max_pool:-0}
@@ -319,6 +319,12 @@ action_add_server(){
     heartbeat_enable=true
     read -rp "Heartbeat interval [10]: " hi || true; hi=${hi:-10}
     read -rp "Heartbeat timeout [90]: " ht || true; ht=${ht:-90}
+  fi
+  # Poolcount
+  local pool_count=0
+  read -rp "Use poolcount? (y/N): " p || true
+  if [[ ${p,,} =~ ^y ]]; then
+    read -rp "poolCount value: " pool_count || true; pool_count=${pool_count:-0}
   fi
   # Compression
   local compression=false
@@ -356,28 +362,21 @@ action_add_client(){
   while :; do read -rp "Server address (IP/host): " saddr || true; validate_host "$saddr" && break || echo "Invalid"; done
   while :; do read -rp "Server port (e.g. 7000): " sport || true; validate_port "$sport" && break || echo "Invalid"; done
   while :; do read -rp "Auth token: " token || true; [[ -n $token ]] && break || echo "Token cannot be empty"; done
-  echo "Transport protocol: 1) tcp 2) kcp 3) quic 4) websocket 5) wss"
-  local choice proto; read -rp "Choose [1-5]: " choice || true
+  echo "Transport protocol: 1) tcp 2) kcp 3) quic 4) websocket"
+  local choice proto; read -rp "Choose [1-4]: " choice || true
   case ${choice:-1} in
     1) proto=tcp ;;
     2) proto=kcp ;;
     3) proto=quic ;;
     4) proto=websocket ;;
-    5) proto=wss ;;
     *) proto=tcp ;;
   esac
   local tls_enable="false" sni=""
-  if [[ "$proto" == tcp || "$proto" == websocket || "$proto" == wss ]]; then
-    if [[ "$proto" == wss ]]; then
-      tls_enable="true"
-      echo "WSS requires TLS enabled."
-      while :; do read -rp "TLS serverName (SNI, required for WSS): " sni || true; [[ -n $sni ]] && break || echo "SNI cannot be empty for WSS"; done
-    else
-      read -rp "Use TLS to server? (y/N): " t || true
-      [[ ${t,,} =~ ^y ]] && tls_enable="true"
-      if [[ "$tls_enable" == "true" ]]; then
-        read -rp "TLS serverName (SNI) [optional]: " sni || true
-      fi
+  if [[ "$proto" == tcp || "$proto" == websocket ]]; then
+    read -rp "Use TLS to server? (y/N): " t || true
+    if [[ ${t,,} =~ ^y ]]; then tls_enable="true"; fi
+    if [[ "$tls_enable" == "true" ]]; then
+      read -rp "TLS serverName (SNI) [optional]: " sni || true
     fi
   fi
   local udp_sz=1500
