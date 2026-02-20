@@ -1,26 +1,34 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Reverse SSH Tunnel Manager (AutoSSH + systemd)
+# Reverse SSH Tunnel Manager (Menu-driven)
 # Features:
-#   - install: create a new reverse tunnel service
-#   - remove : stop/disable and delete the service unit
-#   - status : show service status
-#   - list   : list managed services
+# - Create/Install reverse tunnel as a systemd service (autossh)
+# - Remove one tunnel service (service only) + optional remote sshd_config reset (restore from .back)
+# - Edit/Reconfigure existing service
+# - Status / List / Logs
+# - Uninstall everything (local) + optional remote sshd_config reset for one or multiple remote VPS
 #
-# Notes:
-#   - Script must be run as root.
-#   - Uses /etc/systemd/system/<service>.service for systemd unit.
-#   - Keeps SSH key as-is (does not delete /root/.ssh/id_rsa).
+# Remote behavior:
+# - On APPLY (harden), create one-time backup: /etc/ssh/sshd_config.back (no overwrite)
+# - On RESET, restore sshd_config from /etc/ssh/sshd_config.back and restart ssh/sshd
+#
+# Requirements: autossh, openssh-client
+# Run as root.
 
 SERVICE_PREFIX="reverse_ssh_tunnel"
 DEFAULT_SERVICE_NAME="${SERVICE_PREFIX}"
 KEY_FILE="/root/.ssh/id_rsa"
+KEY_PUB="/root/.ssh/id_rsa.pub"
 
 printc() {
   local text="$1"
   local color="$2"
   echo -e "\e[${color}m${text}\e[0m"
+}
+
+pause() {
+  read -rp "Press Enter to continue... " _
 }
 
 die() {
@@ -35,26 +43,21 @@ require_root() {
 }
 
 ensure_deps() {
-  # Install required packages
   apt-get update -y >/dev/null 2>&1 || true
   apt-get install -y autossh openssh-client >/dev/null
 }
 
-generate_key() {
+ensure_key() {
   mkdir -p /root/.ssh
   chmod 700 /root/.ssh
+  if [[ -f "$KEY_FILE" ]]; then
+    chmod 600 "$KEY_FILE" || true
+    [[ -f "$KEY_PUB" ]] && chmod 644 "$KEY_PUB" || true
+    return 0
+  fi
   ssh-keygen -t rsa -b 4096 -f "$KEY_FILE" -q -N ""
   chmod 600 "$KEY_FILE"
-  chmod 644 "${KEY_FILE}.pub"
-  printc "New SSH key generated at: $KEY_FILE" "32"
-}
-
-ensure_key() {
-  if [[ -f "$KEY_FILE" ]]; then
-    printc "SSH key already exists: $KEY_FILE" "33"
-  else
-    generate_key
-  fi
+  chmod 644 "$KEY_PUB"
 }
 
 unit_path() {
@@ -67,20 +70,59 @@ service_exists() {
   systemctl list-unit-files --type=service | awk '{print $1}' | grep -qx "${name}.service"
 }
 
+list_services() {
+  systemctl list-unit-files --type=service | awk '{print $1}' | grep -E "^${SERVICE_PREFIX}.*\.service$" || true
+}
+
+read_nonempty() {
+  local prompt="$1"
+  local var
+  while true; do
+    read -rp "$prompt" var
+    if [[ -n "${var// }" ]]; then
+      echo "$var"
+      return 0
+    fi
+    echo "Value cannot be empty."
+  done
+}
+
+ask_yes_no() {
+  local prompt="$1"
+  local default="${2:-N}"
+  local ans
+  while true; do
+    read -rp "${prompt} (y/N): " ans
+    ans="${ans:-$default}"
+    case "$ans" in
+      y|Y) return 0 ;;
+      n|N) return 1 ;;
+      *) echo "Please answer y or n." ;;
+    esac
+  done
+}
+
+# --- Remote APPLY (harden) with one-time backup ---
 remote_harden_sshd() {
   local ip="$1"
   local port="$2"
 
-  # Configure sshd on the remote VPS for stable reverse tunnels + allow binding on 0.0.0.0 (GatewayPorts)
   ssh -p "$port" -o StrictHostKeyChecking=accept-new root@"$ip" << 'EOF'
 set -e
-
 SSHD_CONFIG="/etc/ssh/sshd_config"
+BACKUP="/etc/ssh/sshd_config.back"
+
+# Create a one-time backup (do not overwrite if exists)
+if [ ! -f "$BACKUP" ]; then
+  cp -a "$SSHD_CONFIG" "$BACKUP"
+  echo "Backup created: $BACKUP"
+else
+  echo "Backup already exists: $BACKUP"
+fi
 
 ensure_param() {
   local key="$1"
   local value="$2"
-
   if grep -Eq "^\s*#?\s*${key}\b" "$SSHD_CONFIG"; then
     sed -i -E "s|^\s*#?\s*${key}\b.*|${key} ${value}|" "$SSHD_CONFIG"
   else
@@ -99,39 +141,37 @@ systemctl restart sshd.service 2>/dev/null || true
 EOF
 }
 
-install_tunnel() {
-  local name="${1:-$DEFAULT_SERVICE_NAME}"
+# --- Remote RESET (restore from backup) ---
+remote_reset_sshd() {
+  local ip="$1"
+  local port="$2"
 
-  if service_exists "$name"; then
-    die "Service '${name}' already exists. Use another name or remove it first."
-  fi
+  ssh -p "$port" -o StrictHostKeyChecking=accept-new root@"$ip" << 'EOF'
+set -e
+SSHD_CONFIG="/etc/ssh/sshd_config"
+BACKUP="/etc/ssh/sshd_config.back"
 
-  ensure_deps
-  ensure_key
+if [ ! -f "$BACKUP" ]; then
+  echo "ERROR: Backup not found: $BACKUP"
+  echo "Cannot restore. (Maybe the script never applied changes on this server.)"
+  exit 1
+fi
 
-  printc "\nReverse SSH Tunnel Manager" "31"
-  printc "Service name: $name" "36"
-  echo
+cp -a "$BACKUP" "$SSHD_CONFIG"
+echo "Restored from backup: $BACKUP -> $SSHD_CONFIG"
 
-  read -rp "Enter tunnel VPS IP/Host: " TUNNEL_VPS_IP
-  [[ -n "${TUNNEL_VPS_IP}" ]] || die "Tunnel VPS IP/Host cannot be empty."
+systemctl daemon-reload
+systemctl restart ssh.service 2>/dev/null || true
+systemctl restart sshd.service 2>/dev/null || true
+EOF
+}
 
-  read -rp "Enter tunnel VPS SSH port: " TUNNEL_VPS_SSH_PORT
-  [[ -n "${TUNNEL_VPS_SSH_PORT}" ]] || die "SSH port cannot be empty."
-
-  printc "Copying SSH key to remote (ssh-copy-id)..." "32"
-  ssh-copy-id -p "$TUNNEL_VPS_SSH_PORT" -o StrictHostKeyChecking=accept-new root@"$TUNNEL_VPS_IP"
-
-  printc "Configuring remote sshd parameters (keepalive + GatewayPorts)..." "32"
-  remote_harden_sshd "$TUNNEL_VPS_IP" "$TUNNEL_VPS_SSH_PORT"
-
-  read -rp "Enter tunnel VPS listening port (remote port): " TUNNEL_VPS_LISTENING_PORT
-  [[ -n "${TUNNEL_VPS_LISTENING_PORT}" ]] || die "Remote listening port cannot be empty."
-
-  read -rp "Enter local port to forward to (this server): " LOCAL_FORWARD_PORT
-  [[ -n "${LOCAL_FORWARD_PORT}" ]] || die "Local forward port cannot be empty."
-
-  printc "\nCreating systemd service unit..." "32"
+write_unit() {
+  local name="$1"
+  local tunnel_ip="$2"
+  local tunnel_ssh_port="$3"
+  local remote_listen_port="$4"
+  local local_forward_port="$5"
 
   cat > "$(unit_path "$name")" <<EOT
 [Unit]
@@ -141,14 +181,12 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-
-# AutoSSH (no monitoring port) + keepalives + fail fast if forward fails
 ExecStart=/usr/bin/autossh -M 0 \\
   -o ServerAliveInterval=30 \\
   -o ServerAliveCountMax=3 \\
   -o ExitOnForwardFailure=yes \\
   -o StrictHostKeyChecking=accept-new \\
-  -N -R ${TUNNEL_VPS_LISTENING_PORT}:127.0.0.1:${LOCAL_FORWARD_PORT} root@${TUNNEL_VPS_IP} -p ${TUNNEL_VPS_SSH_PORT}
+  -N -R ${remote_listen_port}:127.0.0.1:${local_forward_port} root@${tunnel_ip} -p ${tunnel_ssh_port}
 
 Restart=always
 RestartSec=5
@@ -156,97 +194,304 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOT
+}
+
+pick_service_name() {
+  echo
+  printc "Enter service name (default: ${DEFAULT_SERVICE_NAME})" "36"
+  read -rp "Service name: " name
+  name="${name:-$DEFAULT_SERVICE_NAME}"
+
+  # Enforce prefix to keep things organized
+  if [[ "$name" != ${SERVICE_PREFIX}* ]]; then
+    name="${SERVICE_PREFIX}_${name}"
+  fi
+
+  if ! [[ "$name" =~ ^[a-zA-Z0-9._-]+$ ]]; then
+    die "Invalid service name. Use only letters, numbers, dot, underscore, dash."
+  fi
+
+  echo "$name"
+}
+
+maybe_remote_reset_prompt() {
+  echo
+  if ask_yes_no "Reset remote sshd_config by restoring /etc/ssh/sshd_config.back ?" "N"; then
+    local rip rport
+    rip="$(read_nonempty "Enter remote VPS IP/Host: ")"
+    rport="$(read_nonempty "Enter remote VPS SSH port: ")"
+    printc "Restoring remote sshd_config from backup..." "33"
+    if remote_reset_sshd "$rip" "$rport"; then
+      printc "Remote restore done." "32"
+    else
+      printc "Remote restore failed (see errors above)." "31"
+    fi
+  else
+    printc "Skipping remote restore." "33"
+  fi
+}
+
+create_install_flow() {
+  ensure_deps
+  ensure_key
+
+  local name
+  name="$(pick_service_name)"
+
+  if service_exists "$name"; then
+    printc "Service already exists: ${name}.service" "33"
+    printc "Use Edit option if you want to change its config." "33"
+    pause
+    return 0
+  fi
+
+  echo
+  local tunnel_ip tunnel_ssh_port remote_listen_port local_forward_port
+  tunnel_ip="$(read_nonempty "Enter tunnel VPS IP/Host: ")"
+  tunnel_ssh_port="$(read_nonempty "Enter tunnel VPS SSH port: ")"
+
+  printc "Copying SSH key to remote (ssh-copy-id)..." "32"
+  ssh-copy-id -p "$tunnel_ssh_port" -o StrictHostKeyChecking=accept-new root@"$tunnel_ip"
+
+  printc "Configuring remote sshd parameters (keepalive + GatewayPorts) + creating backup..." "32"
+  remote_harden_sshd "$tunnel_ip" "$tunnel_ssh_port"
+
+  remote_listen_port="$(read_nonempty "Enter tunnel VPS listening port (remote port): ")"
+  local_forward_port="$(read_nonempty "Enter local port to forward to (this server): ")"
+
+  write_unit "$name" "$tunnel_ip" "$tunnel_ssh_port" "$remote_listen_port" "$local_forward_port"
 
   systemctl daemon-reload
   systemctl enable --now "${name}.service" >/dev/null
 
-  printc "\nService installed and started successfully." "32"
-  printc "Check status with: systemctl status ${name}.service" "36"
-  echo
+  printc "Installed & started: ${name}.service" "32"
   systemctl --no-pager status "${name}.service" || true
+  pause
 }
 
-remove_tunnel() {
-  local name="${1:-$DEFAULT_SERVICE_NAME}"
+remove_flow() {
+  local name
+  name="$(pick_service_name)"
 
   if ! service_exists "$name"; then
-    die "Service '${name}' not found."
+    printc "Service not found: ${name}.service" "31"
+    pause
+    return 0
   fi
 
-  printc "Stopping service..." "33"
+  echo
+  if ! ask_yes_no "Are you sure you want to remove '${name}.service' (local unit only)?" "N"; then
+    printc "Canceled." "33"
+    pause
+    return 0
+  fi
+
   systemctl stop "${name}.service" >/dev/null 2>&1 || true
-
-  printc "Disabling service..." "33"
   systemctl disable "${name}.service" >/dev/null 2>&1 || true
-
-  local path
-  path="$(unit_path "$name")"
-
-  printc "Removing unit file: $path" "33"
-  rm -f "$path"
-
+  rm -f "$(unit_path "$name")"
   systemctl daemon-reload
   systemctl reset-failed "${name}.service" >/dev/null 2>&1 || true
 
-  printc "Service '${name}' removed successfully." "32"
-  printc "Note: SSH key is NOT deleted: $KEY_FILE" "36"
+  printc "Removed: ${name}.service" "32"
+  printc "Note: SSH key is NOT deleted: ${KEY_FILE}" "36"
+
+  # Step-by-step optional remote restore
+  maybe_remote_reset_prompt
+
+  pause
 }
 
-status_tunnel() {
-  local name="${1:-$DEFAULT_SERVICE_NAME}"
+status_flow() {
+  local name
+  name="$(pick_service_name)"
+
   if ! service_exists "$name"; then
-    die "Service '${name}' not found."
+    printc "Service not found: ${name}.service" "31"
+    pause
+    return 0
   fi
-  systemctl --no-pager status "${name}.service"
+
+  systemctl --no-pager status "${name}.service" || true
+  pause
 }
 
-list_tunnels() {
-  printc "Managed services (matching prefix: ${SERVICE_PREFIX}):" "36"
-  systemctl list-unit-files --type=service | awk '{print $1}' | grep -E "^${SERVICE_PREFIX}.*\.service$" || true
+list_flow() {
+  echo
+  printc "Managed services:" "36"
+  list_services || true
+  pause
 }
 
-usage() {
-  cat <<EOF
-Usage:
-  $0 install [service_name]
-  $0 remove  [service_name]
-  $0 status  [service_name]
-  $0 list
+logs_flow() {
+  local name
+  name="$(pick_service_name)"
 
-Examples:
-  $0 install ocserv_443_tunnel
-  $0 remove  ocserv_443_tunnel
-  $0 status  ocserv_443_tunnel
-  $0 list
-EOF
+  if ! service_exists "$name"; then
+    printc "Service not found: ${name}.service" "31"
+    pause
+    return 0
+  fi
+
+  echo
+  printc "Showing logs (last 200 lines). Press q to exit." "36"
+  journalctl -u "${name}.service" -n 200 --no-pager || true
+
+  echo
+  if ask_yes_no "Follow logs live?" "N"; then
+    journalctl -u "${name}.service" -f
+  fi
+  pause
 }
 
-main() {
-  require_root
+edit_flow() {
+  ensure_deps
+  ensure_key
 
-  local cmd="${1:-}"
-  local name="${2:-$DEFAULT_SERVICE_NAME}"
+  local name
+  name="$(pick_service_name)"
 
-  case "$cmd" in
-    install|add)
-      install_tunnel "$name"
-      ;;
-    remove|delete|uninstall)
-      remove_tunnel "$name"
-      ;;
-    status)
-      status_tunnel "$name"
-      ;;
-    list|ls)
-      list_tunnels
-      ;;
-    ""|-h|--help|help)
-      usage
-      ;;
-    *)
-      die "Unknown command: $cmd (use --help)"
-      ;;
-  esac
+  if ! service_exists "$name"; then
+    printc "Service not found: ${name}.service" "31"
+    pause
+    return 0
+  fi
+
+  echo
+  printc "Reconfigure existing service: ${name}.service" "36"
+  printc "This will overwrite the unit file and restart the service." "33"
+  echo
+
+  local tunnel_ip tunnel_ssh_port remote_listen_port local_forward_port
+  tunnel_ip="$(read_nonempty "Enter NEW tunnel VPS IP/Host: ")"
+  tunnel_ssh_port="$(read_nonempty "Enter NEW tunnel VPS SSH port: ")"
+
+  printc "Copying SSH key to remote (ssh-copy-id)..." "32"
+  ssh-copy-id -p "$tunnel_ssh_port" -o StrictHostKeyChecking=accept-new root@"$tunnel_ip"
+
+  printc "Configuring remote sshd parameters (keepalive + GatewayPorts) + creating backup..." "32"
+  remote_harden_sshd "$tunnel_ip" "$tunnel_ssh_port"
+
+  remote_listen_port="$(read_nonempty "Enter NEW tunnel VPS listening port (remote port): ")"
+  local_forward_port="$(read_nonempty "Enter NEW local port to forward to (this server): ")"
+
+  write_unit "$name" "$tunnel_ip" "$tunnel_ssh_port" "$remote_listen_port" "$local_forward_port"
+
+  systemctl daemon-reload
+  systemctl restart "${name}.service" >/dev/null 2>&1 || true
+
+  printc "Updated & restarted: ${name}.service" "32"
+  systemctl --no-pager status "${name}.service" || true
+  pause
 }
 
-main "$@"
+uninstall_everything_flow() {
+  echo
+  printc "UNINSTALL EVERYTHING (local machine)" "31"
+  printc "This will remove services created by this script and optionally uninstall packages and SSH keys." "33"
+  echo
+
+  local services
+  services="$(list_services || true)"
+
+  if [[ -z "${services// }" ]]; then
+    printc "No managed services found to remove." "33"
+  else
+    printc "Found these managed services:" "36"
+    echo "$services"
+    echo
+
+    if ask_yes_no "Remove ALL above services (stop/disable/delete unit)?" "N"; then
+      while read -r svc; do
+        [[ -z "$svc" ]] && continue
+        local name="${svc%.service}"
+        systemctl stop "${name}.service" >/dev/null 2>&1 || true
+        systemctl disable "${name}.service" >/dev/null 2>&1 || true
+        rm -f "$(unit_path "$name")"
+        systemctl reset-failed "${name}.service" >/dev/null 2>&1 || true
+      done <<< "$services"
+
+      systemctl daemon-reload
+      printc "All managed services removed." "32"
+    else
+      printc "Skipping service removal." "33"
+    fi
+  fi
+
+  echo
+  printc "Remote restore is OPTIONAL. You can do it for one or multiple tunnel VPS servers." "36"
+  while true; do
+    if ask_yes_no "Do you want to restore remote sshd_config from /etc/ssh/sshd_config.back now?" "N"; then
+      maybe_remote_reset_prompt
+    else
+      break
+    fi
+  done
+
+  echo
+  if ask_yes_no "Purge autossh package?" "N"; then
+    apt-get purge -y autossh >/dev/null 2>&1 || true
+    apt-get autoremove -y >/dev/null 2>&1 || true
+    printc "autossh purged." "32"
+  else
+    printc "Keeping autossh installed." "33"
+  fi
+
+  echo
+  if ask_yes_no "Purge openssh-client package? (WARNING: you may need SSH later)" "N"; then
+    apt-get purge -y openssh-client >/dev/null 2>&1 || true
+    apt-get autoremove -y >/dev/null 2>&1 || true
+    printc "openssh-client purged." "32"
+  else
+    printc "Keeping openssh-client installed." "33"
+  fi
+
+  echo
+  printc "SSH Key removal is OPTIONAL and risky if you use this key for other SSH access." "33"
+  if [[ -f "$KEY_FILE" || -f "$KEY_PUB" ]]; then
+    if ask_yes_no "Delete SSH key files (${KEY_FILE}, ${KEY_PUB})?" "N"; then
+      rm -f "$KEY_FILE" "$KEY_PUB"
+      printc "SSH key files deleted." "32"
+    else
+      printc "Keeping SSH key files." "33"
+    fi
+  else
+    printc "No SSH key files found at default path." "33"
+  fi
+
+  echo
+  printc "Uninstall completed (local)." "32"
+  pause
+}
+
+main_menu() {
+  while true; do
+    clear || true
+    printc "Reverse SSH Tunnel Manager (Menu)" "31"
+    echo
+    echo "1) Create/Install new tunnel"
+    echo "2) Remove tunnel (service only + optional remote restore)"
+    echo "3) Status"
+    echo "4) List tunnels"
+    echo "5) View logs"
+    echo "6) Edit/Reconfigure existing tunnel"
+    echo "7) Uninstall everything (local + optional remote restore)"
+    echo "0) Exit"
+    echo
+    read -rp "Choose an option: " choice
+
+    case "${choice:-}" in
+      1) create_install_flow ;;
+      2) remove_flow ;;
+      3) status_flow ;;
+      4) list_flow ;;
+      5) logs_flow ;;
+      6) edit_flow ;;
+      7) uninstall_everything_flow ;;
+      0) exit 0 ;;
+      *) echo "Invalid option."; pause ;;
+    esac
+  done
+}
+
+require_root
+main_menu
