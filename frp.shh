@@ -61,7 +61,7 @@ install_frp(){
   log "Downloading latest FRP..."
   local url pkg tmpdir
 #   url=$(latest_frp_url) || { err "Could not resolve download URL"; return 1; }
-  url="https://github.com/alirezabytes/scripts/frp_v0.63.0_linux_$(arch).tar.gz" || { err "Could not resolve download URL"; return 1; }
+  url="https://github.com/alirezabytes/scripts/raw/refs/heads/main/frp_0.63.0_linux_$(arch).tar.gz" || { err "Could not resolve download URL"; return 1; }
 #  url="https://github.com/fatedier/frp/releases/download/v0.67.0/frp_0.67.0_linux_amd64.tar.gz"
   [[ -z $url ]] && { err "Empty URL"; return 1; }
   log "URL: $url"
