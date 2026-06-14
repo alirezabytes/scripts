@@ -20,6 +20,11 @@ CONNECT_WRAPPER="/usr/local/sbin/ocserv-central-connect.sh"
 DISCONNECT_WRAPPER="/usr/local/sbin/ocserv-central-disconnect.sh"
 AGENT_SCRIPT="/usr/local/sbin/ocserv-central-agent.py"
 
+CLEANUP_SCRIPT="/usr/local/sbin/ocserv-central-cleanup-usage.sh"
+CLEANUP_ENV="/etc/ocserv-central/cleanup.env"
+CLEANUP_SERVICE="/etc/systemd/system/ocserv-central-cleanup.service"
+CLEANUP_TIMER="/etc/systemd/system/ocserv-central-cleanup.timer"
+
 C_RESET="\033[0m"
 C_RED="\033[31m"
 C_GREEN="\033[32m"
@@ -299,6 +304,55 @@ def save_limits(data):
         json.dump(data, f, indent=2, ensure_ascii=False)
     os.replace(tmp, LIMITS_PATH)
 
+def known_groups_from_db_and_limits():
+    groups = set()
+    limits = load_limits()
+    for g in limits.get("groups", {}).keys():
+        if g:
+            groups.add(g)
+    try:
+        with db() as con:
+            rows = con.execute("SELECT DISTINCT groupname FROM users WHERE groupname IS NOT NULL AND groupname != ''").fetchall()
+            for r in rows:
+                if r["groupname"]:
+                    groups.add(r["groupname"])
+    except Exception:
+        pass
+    if not groups:
+        groups.add("group1")
+    return sorted(groups)
+
+def set_quota_for_all_known_groups(gb: float):
+    sync_ocpasswd_to_db()
+    quota = float(gb)
+    limits = load_limits()
+    limits.setdefault("features", {})["quota"] = True
+    limits["default_quota_gb"] = quota
+    limits.setdefault("groups", {})
+    groups = known_groups_from_db_and_limits()
+    for g in groups:
+        old = limits["groups"].get(g, {}) or {}
+        old.setdefault("max_sessions", group_number(g))
+        old["quota_gb"] = quota
+        limits["groups"][g] = old
+    save_limits(limits)
+    return groups
+
+def clear_quota_for_all_known_groups():
+    sync_ocpasswd_to_db()
+    limits = load_limits()
+    limits.setdefault("features", {})["quota"] = True
+    limits["default_quota_gb"] = 0
+    limits.setdefault("groups", {})
+    groups = known_groups_from_db_and_limits()
+    for g in groups:
+        old = limits["groups"].get(g, {}) or {}
+        old.setdefault("max_sessions", group_number(g))
+        old["quota_gb"] = 0
+        limits["groups"][g] = old
+    save_limits(limits)
+    return groups
+
 def pick_primary_group(group_field: str | None) -> str:
     if not group_field:
         return "group1"
@@ -539,6 +593,13 @@ class AddTimeReq(BaseModel):
     days: int = 0
     hours: int = 0
     minutes: int = 0
+
+class BulkQuotaReq(BaseModel):
+    gb: float
+
+class BulkTrafficReq(BaseModel):
+    gb: float = 0
+    clear_exhausted: bool = True
 
 @app.on_event("startup")
 def startup():
@@ -849,6 +910,69 @@ def clear_expiry(req: UsageResetReq, x_api_token: str | None = Header(default=No
         con.execute("UPDATE users SET expires_at=0, updated_at=? WHERE username=?", (now(), req.username))
     return {"ok": True, "username": req.username, "expires_at": 0}
 
+@app.post("/bulk/set-all-group-quota")
+def bulk_set_all_group_quota(req: BulkQuotaReq, x_api_token: str | None = Header(default=None)):
+    auth(x_api_token)
+    groups = set_quota_for_all_known_groups(req.gb)
+    return {"ok": True, "quota_gb": req.gb, "groups_updated": groups, "count": len(groups)}
+
+@app.post("/bulk/remove-all-group-quota")
+def bulk_remove_all_group_quota(x_api_token: str | None = Header(default=None)):
+    auth(x_api_token)
+    groups = clear_quota_for_all_known_groups()
+    return {"ok": True, "quota_gb": 0, "groups_updated": groups, "count": len(groups), "meaning": "unlimited"}
+
+@app.post("/bulk/add-traffic-all-users")
+def bulk_add_traffic_all_users(req: BulkTrafficReq, x_api_token: str | None = Header(default=None)):
+    auth(x_api_token)
+    sync_ocpasswd_to_db()
+    add_bytes = int(float(req.gb) * GIB)
+    t = now()
+    with db() as con:
+        con.execute("UPDATE users SET quota_extra_bytes = quota_extra_bytes + ?, updated_at=?", (add_bytes, t))
+        count = con.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+    if req.clear_exhausted:
+        path = exhausted_log_path()
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        open(path, "w", encoding="utf-8").close()
+    return {"ok": True, "users_updated": count, "added_gb": req.gb, "added_bytes": add_bytes, "exhausted_file_reset": bool(req.clear_exhausted)}
+
+@app.post("/bulk/set-extra-traffic-all-users")
+def bulk_set_extra_traffic_all_users(req: BulkTrafficReq, x_api_token: str | None = Header(default=None)):
+    auth(x_api_token)
+    sync_ocpasswd_to_db()
+    set_bytes = int(float(req.gb) * GIB)
+    t = now()
+    with db() as con:
+        con.execute("UPDATE users SET quota_extra_bytes = ?, updated_at=?", (set_bytes, t))
+        count = con.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+    if req.clear_exhausted:
+        path = exhausted_log_path()
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        open(path, "w", encoding="utf-8").close()
+    return {"ok": True, "users_updated": count, "extra_traffic_gb": req.gb, "extra_traffic_bytes": set_bytes, "exhausted_file_reset": bool(req.clear_exhausted)}
+
+@app.post("/bulk/clear-extra-traffic-all-users")
+def bulk_clear_extra_traffic_all_users(x_api_token: str | None = Header(default=None)):
+    auth(x_api_token)
+    sync_ocpasswd_to_db()
+    with db() as con:
+        con.execute("UPDATE users SET quota_extra_bytes = 0, updated_at=?", (now(),))
+        count = con.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+    return {"ok": True, "users_updated": count, "quota_extra_bytes": 0}
+
+@app.post("/bulk/reset-usage-all-users")
+def bulk_reset_usage_all_users(x_api_token: str | None = Header(default=None)):
+    auth(x_api_token)
+    sync_ocpasswd_to_db()
+    with db() as con:
+        con.execute("UPDATE users SET used_bytes = 0, updated_at=?", (now(),))
+        count = con.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+    path = exhausted_log_path()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    open(path, "w", encoding="utf-8").close()
+    return {"ok": True, "users_updated": count, "used_bytes": 0, "exhausted_file_reset": True}
+
 @app.get("/quota-exhausted")
 def quota_exhausted(x_api_token: str | None = Header(default=None)):
     auth(x_api_token)
@@ -992,7 +1116,8 @@ configure_groups_from_ocpasswd() {
 
     local ocpasswd="${1:-}"
     if [[ -z "$ocpasswd" ]]; then
-        ocpasswd="$(systemctl show ocserv-central -p Environment --value 2>/dev/null | tr ' ' '\n' | sed -n 's/^OCPASSWD_PATH=//p' | tail -n1 || true)"
+        ocpasswd="$(systemctl show ocserv-central -p Environment --value 2>/dev/null | tr ' ' '
+' | sed -n 's/^OCPASSWD_PATH=//p' | tail -n1 || true)"
         ocpasswd="${ocpasswd:-/etc/ocserv/ocpasswd}"
     fi
 
@@ -1009,22 +1134,35 @@ configure_groups_from_ocpasswd() {
     fi
 
     print_info "Groups found:"
-    printf ' - %s\n' "${groups[@]}"
+    printf ' - %s
+' "${groups[@]}"
+
+    local use_same_quota="no" same_quota="" tmp
+    if ask_yes_no "Apply ONE traffic quota to ALL found groups now?" "y"; then
+        use_same_quota="yes"
+        same_quota="$(ask_number "Traffic quota for ALL groups in GB, 0 = unlimited" "100")"
+        tmp="$(mktemp)"
+        jq --argjson q "$same_quota" '.features.quota=true | .default_quota_gb=$q' "$MASTER_ETC/limits.json" > "$tmp"
+        mv "$tmp" "$MASTER_ETC/limits.json"
+    fi
 
     for g in "${groups[@]}"; do
         echo
         print_info "Configure group: $g"
-        local def_sessions max_sessions quota_gb tmp current_quota
+        local def_sessions max_sessions quota_gb current_quota
         def_sessions="$(group_default_sessions "$g")"
         max_sessions="$(ask_number "Max concurrent sessions for $g" "$def_sessions")"
 
-        current_quota="$(jq -r --arg g "$g" '.groups[$g].quota_gb // 0' "$MASTER_ETC/limits.json")"
-        quota_gb="$(ask_number "Quota for $g in GB, 0 = unlimited" "$current_quota")"
+        if [[ "$use_same_quota" == "yes" ]]; then
+            quota_gb="$same_quota"
+            print_info "Quota for $g will be set to ${quota_gb} GB because global group quota was selected."
+        else
+            current_quota="$(jq -r --arg g "$g" '.groups[$g].quota_gb // .default_quota_gb // 0' "$MASTER_ETC/limits.json")"
+            quota_gb="$(ask_number "Quota for $g in GB, 0 = unlimited" "$current_quota")"
+        fi
 
         tmp="$(mktemp)"
-        jq --arg g "$g" --argjson ms "$max_sessions" --argjson q "$quota_gb" \
-           '.groups[$g] = {"max_sessions": $ms, "quota_gb": $q}' \
-           "$MASTER_ETC/limits.json" > "$tmp"
+        jq --arg g "$g" --argjson ms "$max_sessions" --argjson q "$quota_gb"            '.groups[$g] = {"max_sessions": $ms, "quota_gb": $q}'            "$MASTER_ETC/limits.json" > "$tmp"
         mv "$tmp" "$MASTER_ETC/limits.json"
     done
 
@@ -1725,14 +1863,271 @@ delete_quota_exhausted_file() {
     master_curl "POST" "/quota-exhausted/delete" "{}"
 }
 
-backup_master_data() {
+human_size() {
+    local target="$1"
+    if [[ -e "$target" ]]; then
+        du -sh "$target" 2>/dev/null | awk '{print $1}'
+    else
+        echo "0"
+    fi
+}
+
+db_path() {
+    echo "$DB_DIR/central.db"
+}
+
+usage_log_stats() {
+    local db
+    db="$(db_path)"
+
+    if [[ ! -f "$db" ]]; then
+        print_warn "Database not found: $db"
+        return 0
+    fi
+
+    echo
+    print_info "Database file:"
+    ls -lh "$db" 2>/dev/null || true
+    echo
+
+    print_info "Tables overview:"
+    sqlite3 "$db" <<'SQL' || true
+.headers on
+.mode column
+SELECT 'users' AS table_name, COUNT(*) AS rows FROM users
+UNION ALL
+SELECT 'sessions', COUNT(*) FROM sessions
+UNION ALL
+SELECT 'usage_log', COUNT(*) FROM usage_log
+UNION ALL
+SELECT 'nodes', COUNT(*) FROM nodes;
+SQL
+
+    echo
+    print_info "usage_log date range:"
+    sqlite3 "$db" <<'SQL' || true
+.headers on
+.mode column
+SELECT
+  COUNT(*) AS usage_rows,
+  datetime(MIN(created_at), 'unixepoch', 'localtime') AS oldest,
+  datetime(MAX(created_at), 'unixepoch', 'localtime') AS newest
+FROM usage_log;
+SQL
+
+    echo
+    print_info "Approx directory sizes:"
+    echo "APP_DIR=$APP_DIR -> $(human_size "$APP_DIR")"
+    echo "MASTER_ETC=$MASTER_ETC -> $(human_size "$MASTER_ETC")"
+    echo "DB_DIR=$DB_DIR -> $(human_size "$DB_DIR")"
+}
+
+backup_paths_tar() {
+    local out="$1"
+    shift
+    mkdir -p "$(dirname "$out")"
+
+    tar -czf "$out" --ignore-failed-read -C / "$@" 2>/dev/null
+    print_ok "Backup saved: $out"
+    ls -lh "$out" 2>/dev/null || true
+}
+
+backup_master_full() {
     need_root
     local out
-    out="$(ask_value "Backup output file" "/root/ocserv-central-backup-$(date +%Y%m%d-%H%M%S).tar.gz")"
-    tar -czf "$out" \
-        --ignore-failed-read \
-        "$APP_DIR" "$MASTER_ETC" "$DB_DIR" "$MASTER_SERVICE" 2>/dev/null
-    print_ok "Backup saved: $out"
+    out="$(ask_value "Full backup output file" "/root/ocserv-central-full-$(date +%Y%m%d-%H%M%S).tar.gz")"
+
+    backup_paths_tar "$out" \
+        "opt/ocserv-central" \
+        "etc/ocserv-central" \
+        "var/lib/ocserv-central" \
+        "etc/systemd/system/ocserv-central.service"
+}
+
+make_temp_backup_root() {
+    mktemp -d /tmp/ocserv-central-backup.XXXXXX
+}
+
+copy_master_common_to_tmp() {
+    local tmp="$1"
+
+    mkdir -p "$tmp/opt" "$tmp/etc/systemd/system" "$tmp/var/lib/ocserv-central"
+
+    if [[ -d "$APP_DIR" ]]; then
+        cp -a "$APP_DIR" "$tmp/opt/"
+    fi
+
+    if [[ -d "$MASTER_ETC" ]]; then
+        mkdir -p "$tmp/etc"
+        cp -a "$MASTER_ETC" "$tmp/etc/"
+    fi
+
+    if [[ -f "$MASTER_SERVICE" ]]; then
+        cp -a "$MASTER_SERVICE" "$tmp/etc/systemd/system/"
+    fi
+
+    if [[ -d "$DB_DIR" ]]; then
+        find "$DB_DIR" -maxdepth 1 -type f ! -name 'central.db' ! -name 'central.db-wal' ! -name 'central.db-shm' -exec cp -a {} "$tmp/var/lib/ocserv-central/" \; 2>/dev/null || true
+        find "$DB_DIR" -maxdepth 1 -type d ! -path "$DB_DIR" -exec cp -a {} "$tmp/var/lib/ocserv-central/" \; 2>/dev/null || true
+    fi
+}
+
+sqlite_backup_to_tmp() {
+    local tmp="$1"
+    local mode="${2:-full}"
+    local include_sessions="${3:-yes}"
+    local db
+    db="$(db_path)"
+
+    mkdir -p "$tmp/var/lib/ocserv-central"
+
+    if [[ ! -f "$db" ]]; then
+        print_warn "Database not found, skipping DB backup: $db"
+        return 0
+    fi
+
+    sqlite3 "$db" ".backup '$tmp/var/lib/ocserv-central/central.db'"
+
+    if [[ "$mode" == "light" ]]; then
+        sqlite3 "$tmp/var/lib/ocserv-central/central.db" "DELETE FROM usage_log; VACUUM;" || true
+    fi
+
+    if [[ "$include_sessions" == "no" ]]; then
+        sqlite3 "$tmp/var/lib/ocserv-central/central.db" "DELETE FROM sessions; VACUUM;" || true
+    fi
+}
+
+write_backup_metadata() {
+    local tmp="$1"
+    local btype="$2"
+
+    cat > "$tmp/OCSERV_CENTRAL_BACKUP_INFO.txt" <<EOF
+Backup type: $btype
+Created at: $(date -Is)
+Hostname: $(hostname -f 2>/dev/null || hostname)
+Includes:
+- /opt/ocserv-central
+- /etc/ocserv-central
+- /var/lib/ocserv-central
+- /etc/systemd/system/ocserv-central.service
+
+Notes:
+- Full backup includes usage_log history.
+- Lightweight backup keeps users, quotas, extra traffic, expiry dates, disabled status, limits, nodes and settings, but removes usage_log history to reduce size.
+- Active sessions can be included or excluded depending on the selected backup option.
+EOF
+}
+
+backup_master_lightweight() {
+    need_root
+    local out tmp include_sessions
+    out="$(ask_value "Lightweight backup output file" "/root/ocserv-central-light-$(date +%Y%m%d-%H%M%S).tar.gz")"
+
+    if ask_yes_no "Include current active sessions in backup?" "n"; then
+        include_sessions="yes"
+    else
+        include_sessions="no"
+    fi
+
+    tmp="$(make_temp_backup_root)"
+    copy_master_common_to_tmp "$tmp"
+    sqlite_backup_to_tmp "$tmp" "light" "$include_sessions"
+    write_backup_metadata "$tmp" "lightweight"
+
+    mkdir -p "$(dirname "$out")"
+    tar -czf "$out" -C "$tmp" .
+    rm -rf "$tmp"
+
+    print_ok "Lightweight backup saved: $out"
+    print_info "This backup does NOT include usage_log history."
+    print_info "It DOES include used_bytes, extra traffic, account expiry, disabled status, limits and node info."
+    ls -lh "$out" 2>/dev/null || true
+}
+
+backup_master_config_only() {
+    need_root
+    local out
+    out="$(ask_value "Config-only backup output file" "/root/ocserv-central-config-$(date +%Y%m%d-%H%M%S).tar.gz")"
+
+    backup_paths_tar "$out" \
+        "etc/ocserv-central" \
+        "etc/systemd/system/ocserv-central.service"
+}
+
+backup_master_db_only() {
+    need_root
+    local out tmp mode include_sessions
+    out="$(ask_value "DB-only backup output file" "/root/ocserv-central-db-$(date +%Y%m%d-%H%M%S).tar.gz")"
+
+    if ask_yes_no "Make DB backup lightweight by excluding usage_log history?" "y"; then
+        mode="light"
+    else
+        mode="full"
+    fi
+
+    if ask_yes_no "Include current active sessions in DB backup?" "n"; then
+        include_sessions="yes"
+    else
+        include_sessions="no"
+    fi
+
+    tmp="$(make_temp_backup_root)"
+    mkdir -p "$tmp/var/lib/ocserv-central"
+    sqlite_backup_to_tmp "$tmp" "$mode" "$include_sessions"
+    write_backup_metadata "$tmp" "db-only-$mode"
+
+    mkdir -p "$(dirname "$out")"
+    tar -czf "$out" -C "$tmp" .
+    rm -rf "$tmp"
+
+    print_ok "DB-only backup saved: $out"
+    ls -lh "$out" 2>/dev/null || true
+}
+
+backup_master_custom() {
+    need_root
+    local out tmp db_mode include_sessions include_app include_config include_service include_exhausted
+    out="$(ask_value "Custom backup output file" "/root/ocserv-central-custom-$(date +%Y%m%d-%H%M%S).tar.gz")"
+
+    if ask_yes_no "Include app files /opt/ocserv-central ?" "y"; then include_app="yes"; else include_app="no"; fi
+    if ask_yes_no "Include config /etc/ocserv-central ?" "y"; then include_config="yes"; else include_config="no"; fi
+    if ask_yes_no "Include systemd service file ?" "y"; then include_service="yes"; else include_service="no"; fi
+    if ask_yes_no "Include usage_log history? This can make backup very large." "n"; then db_mode="full"; else db_mode="light"; fi
+    if ask_yes_no "Include active sessions?" "n"; then include_sessions="yes"; else include_sessions="no"; fi
+    if ask_yes_no "Include exhausted-quota file if present?" "y"; then include_exhausted="yes"; else include_exhausted="no"; fi
+
+    tmp="$(make_temp_backup_root)"
+    mkdir -p "$tmp/opt" "$tmp/etc/systemd/system" "$tmp/var/lib/ocserv-central"
+
+    if [[ "$include_app" == "yes" && -d "$APP_DIR" ]]; then
+        cp -a "$APP_DIR" "$tmp/opt/"
+    fi
+
+    if [[ "$include_config" == "yes" && -d "$MASTER_ETC" ]]; then
+        mkdir -p "$tmp/etc"
+        cp -a "$MASTER_ETC" "$tmp/etc/"
+    fi
+
+    if [[ "$include_service" == "yes" && -f "$MASTER_SERVICE" ]]; then
+        cp -a "$MASTER_SERVICE" "$tmp/etc/systemd/system/"
+    fi
+
+    sqlite_backup_to_tmp "$tmp" "$db_mode" "$include_sessions"
+
+    if [[ "$include_exhausted" == "yes" && -f "$DB_DIR/quota_exhausted_users.jsonl" ]]; then
+        cp -a "$DB_DIR/quota_exhausted_users.jsonl" "$tmp/var/lib/ocserv-central/"
+    elif [[ "$include_exhausted" == "no" ]]; then
+        rm -f "$tmp/var/lib/ocserv-central/quota_exhausted_users.jsonl"
+    fi
+
+    write_backup_metadata "$tmp" "custom-db-$db_mode"
+
+    mkdir -p "$(dirname "$out")"
+    tar -czf "$out" -C "$tmp" .
+    rm -rf "$tmp"
+
+    print_ok "Custom backup saved: $out"
+    ls -lh "$out" 2>/dev/null || true
 }
 
 restore_master_data() {
@@ -1740,19 +2135,311 @@ restore_master_data() {
     local in
     in="$(ask_value "Backup tar.gz path to restore" "")"
     [[ -z "$in" ]] && return 0
+
     if [[ ! -f "$in" ]]; then
         print_err "Backup file not found: $in"
         return 1
     fi
+
     print_warn "This will overwrite ocserv-central app/config/database files from backup."
+    print_warn "Recommended: take a full backup before restore."
+
+    if ask_yes_no "Take a safety full backup before restore?" "y"; then
+        local safety
+        safety="/root/ocserv-central-before-restore-$(date +%Y%m%d-%H%M%S).tar.gz"
+        backup_paths_tar "$safety" \
+            "opt/ocserv-central" \
+            "etc/ocserv-central" \
+            "var/lib/ocserv-central" \
+            "etc/systemd/system/ocserv-central.service"
+    fi
+
     if ! ask_yes_no "Continue restore?" "n"; then
         return 0
     fi
+
     systemctl stop ocserv-central >/dev/null 2>&1 || true
     tar -xzf "$in" -C /
     systemctl daemon-reload
     systemctl enable --now ocserv-central >/dev/null 2>&1 || true
+
     print_ok "Restore completed."
+    print_info "Check status with: systemctl status ocserv-central --no-pager"
+}
+
+cleanup_usage_logs() {
+    need_root
+    local db days cutoff before after stop_api do_vacuum
+    db="$(db_path)"
+
+    if [[ ! -f "$db" ]]; then
+        print_err "Database not found: $db"
+        return 1
+    fi
+
+    usage_log_stats
+    echo
+
+    days="$(ask_number "Delete usage_log records older than how many days? Use 0 to delete ALL usage_log history" "30")"
+
+    if ask_yes_no "Take lightweight backup before cleanup?" "y"; then
+        backup_master_lightweight
+    fi
+
+    if ask_yes_no "Stop ocserv-central API during cleanup? Safer for large DB." "y"; then
+        stop_api="yes"
+    else
+        stop_api="no"
+    fi
+
+    if ask_yes_no "Run VACUUM after cleanup to shrink database file? Can take time on large DB." "y"; then
+        do_vacuum="yes"
+    else
+        do_vacuum="no"
+    fi
+
+    if ! ask_yes_no "Continue cleanup?" "n"; then
+        return 0
+    fi
+
+    before="$(sqlite3 "$db" "SELECT COUNT(*) FROM usage_log;" 2>/dev/null || echo 0)"
+
+    if [[ "$stop_api" == "yes" ]]; then
+        systemctl stop ocserv-central >/dev/null 2>&1 || true
+    fi
+
+    if [[ "$days" == "0" || "$days" == "0.0" ]]; then
+        sqlite3 "$db" "DELETE FROM usage_log;"
+    else
+        cutoff="$(date -d "$days days ago" +%s)"
+        sqlite3 "$db" "DELETE FROM usage_log WHERE created_at < $cutoff;"
+    fi
+
+    if [[ "$do_vacuum" == "yes" ]]; then
+        sqlite3 "$db" "VACUUM;"
+    fi
+
+    if [[ "$stop_api" == "yes" ]]; then
+        systemctl start ocserv-central >/dev/null 2>&1 || true
+    fi
+
+    after="$(sqlite3 "$db" "SELECT COUNT(*) FROM usage_log;" 2>/dev/null || echo 0)"
+
+    print_ok "Cleanup done. usage_log rows: before=$before after=$after"
+    usage_log_stats
+}
+
+vacuum_database() {
+    need_root
+    local db
+    db="$(db_path)"
+
+    if [[ ! -f "$db" ]]; then
+        print_err "Database not found: $db"
+        return 1
+    fi
+
+    print_warn "VACUUM compacts the SQLite DB file. It may take time and lock the database."
+    if ask_yes_no "Stop ocserv-central during VACUUM?" "y"; then
+        systemctl stop ocserv-central >/dev/null 2>&1 || true
+        sqlite3 "$db" "VACUUM;"
+        systemctl start ocserv-central >/dev/null 2>&1 || true
+    else
+        sqlite3 "$db" "VACUUM;"
+    fi
+
+    print_ok "VACUUM completed."
+    ls -lh "$db" 2>/dev/null || true
+}
+
+write_cleanup_script() {
+    mkdir -p "$MASTER_ETC"
+
+    cat > "$CLEANUP_SCRIPT" <<'CLEAN'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ENV_FILE="/etc/ocserv-central/cleanup.env"
+if [[ -f "$ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+fi
+
+DB_PATH="${DB_PATH:-/var/lib/ocserv-central/central.db}"
+RETENTION_DAYS="${RETENTION_DAYS:-30}"
+VACUUM_AFTER="${VACUUM_AFTER:-0}"
+STOP_API="${STOP_API:-0}"
+BACKUP_BEFORE="${BACKUP_BEFORE:-0}"
+BACKUP_DIR="${BACKUP_DIR:-/root}"
+
+log() {
+    logger -t ocserv-central-cleanup "$*"
+    echo "$*"
+}
+
+if [[ ! -f "$DB_PATH" ]]; then
+    log "Database not found: $DB_PATH"
+    exit 0
+fi
+
+if [[ "$BACKUP_BEFORE" == "1" ]]; then
+    out="$BACKUP_DIR/ocserv-central-auto-before-cleanup-$(date +%Y%m%d-%H%M%S).db"
+    mkdir -p "$BACKUP_DIR"
+    sqlite3 "$DB_PATH" ".backup '$out'"
+    log "DB safety backup saved: $out"
+fi
+
+if [[ "$STOP_API" == "1" ]]; then
+    systemctl stop ocserv-central >/dev/null 2>&1 || true
+fi
+
+before="$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM usage_log;" 2>/dev/null || echo 0)"
+
+if [[ "$RETENTION_DAYS" == "0" || "$RETENTION_DAYS" == "0.0" ]]; then
+    sqlite3 "$DB_PATH" "DELETE FROM usage_log;"
+else
+    cutoff="$(date -d "$RETENTION_DAYS days ago" +%s)"
+    sqlite3 "$DB_PATH" "DELETE FROM usage_log WHERE created_at < $cutoff;"
+fi
+
+if [[ "$VACUUM_AFTER" == "1" ]]; then
+    sqlite3 "$DB_PATH" "VACUUM;"
+fi
+
+after="$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM usage_log;" 2>/dev/null || echo 0)"
+
+if [[ "$STOP_API" == "1" ]]; then
+    systemctl start ocserv-central >/dev/null 2>&1 || true
+fi
+
+log "usage_log cleanup complete. retention_days=$RETENTION_DAYS before=$before after=$after vacuum=$VACUUM_AFTER"
+CLEAN
+
+    chmod +x "$CLEANUP_SCRIPT"
+}
+
+configure_auto_cleanup_timer() {
+    need_root
+    local days hour minute vacuum stop_api backup_before backup_dir
+
+    days="$(ask_number "Keep usage_log history for how many days? 0 = delete all history each run" "30")"
+    hour="$(ask_number "Run cleanup daily at hour 0-23" "3")"
+    minute="$(ask_number "Run cleanup daily at minute 0-59" "15")"
+
+    if ask_yes_no "Run VACUUM after automatic cleanup? This can take time." "n"; then vacuum="1"; else vacuum="0"; fi
+    if ask_yes_no "Stop ocserv-central API during automatic cleanup? Safer, but brief downtime." "n"; then stop_api="1"; else stop_api="0"; fi
+    if ask_yes_no "Take DB safety backup before automatic cleanup?" "n"; then backup_before="1"; else backup_before="0"; fi
+
+    backup_dir="$(ask_value "Directory for automatic safety DB backups" "/root")"
+
+    mkdir -p "$MASTER_ETC"
+
+    cat > "$CLEANUP_ENV" <<EOF
+DB_PATH="$DB_DIR/central.db"
+RETENTION_DAYS="$days"
+VACUUM_AFTER="$vacuum"
+STOP_API="$stop_api"
+BACKUP_BEFORE="$backup_before"
+BACKUP_DIR="$backup_dir"
+EOF
+    chmod 600 "$CLEANUP_ENV"
+
+    write_cleanup_script
+
+    cat > "$CLEANUP_SERVICE" <<EOF
+[Unit]
+Description=Ocserv Central usage_log cleanup
+
+[Service]
+Type=oneshot
+ExecStart=$CLEANUP_SCRIPT
+EOF
+
+    cat > "$CLEANUP_TIMER" <<EOF
+[Unit]
+Description=Run Ocserv Central usage_log cleanup daily
+
+[Timer]
+OnCalendar=*-*-* $(printf "%02d" "$hour"):$(printf "%02d" "$minute"):00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable --now ocserv-central-cleanup.timer
+
+    print_ok "Automatic cleanup timer configured."
+    systemctl list-timers ocserv-central-cleanup.timer --no-pager || true
+}
+
+disable_auto_cleanup_timer() {
+    systemctl disable --now ocserv-central-cleanup.timer >/dev/null 2>&1 || true
+    rm -f "$CLEANUP_TIMER" "$CLEANUP_SERVICE"
+    systemctl daemon-reload
+    print_ok "Automatic cleanup timer disabled and removed."
+}
+
+show_cleanup_timer_status() {
+    echo
+    print_info "Cleanup env:"
+    if [[ -f "$CLEANUP_ENV" ]]; then
+        cat "$CLEANUP_ENV"
+    else
+        print_warn "No cleanup env found: $CLEANUP_ENV"
+    fi
+
+    echo
+    print_info "Timer status:"
+    systemctl status ocserv-central-cleanup.timer --no-pager || true
+
+    echo
+    print_info "Recent cleanup logs:"
+    journalctl -t ocserv-central-cleanup -n 80 --no-pager || true
+}
+
+backup_cleanup_menu() {
+    while true; do
+        clear
+        echo "==== Ocserv Central - Backup / Restore / Cleanup Menu ===="
+        echo "1) Show database and usage_log statistics"
+        echo "2) Full backup: app + config + full database + full usage history"
+        echo "3) Lightweight backup: app + config + database without usage_log history"
+        echo "4) Config-only backup"
+        echo "5) DB-only backup"
+        echo "6) Custom backup"
+        echo "7) Restore backup"
+        echo "8) Cleanup old usage_log records manually"
+        echo "9) VACUUM / compact database"
+        echo "10) Configure automatic usage_log cleanup timer"
+        echo "11) Disable automatic cleanup timer"
+        echo "12) Show automatic cleanup timer status/logs"
+        echo "0) Back"
+        echo
+        read -rp "Select: " choice
+        case "$choice" in
+            1) usage_log_stats; pause ;;
+            2) backup_master_full; pause ;;
+            3) backup_master_lightweight; pause ;;
+            4) backup_master_config_only; pause ;;
+            5) backup_master_db_only; pause ;;
+            6) backup_master_custom; pause ;;
+            7) restore_master_data; pause ;;
+            8) cleanup_usage_logs; pause ;;
+            9) vacuum_database; pause ;;
+            10) configure_auto_cleanup_timer; pause ;;
+            11) disable_auto_cleanup_timer; pause ;;
+            12) show_cleanup_timer_status; pause ;;
+            0) return 0 ;;
+            *) echo "Invalid choice"; sleep 1 ;;
+        esac
+    done
+}
+
+# Backward-compatible wrappers used by older menu/readme wording.
+backup_master_data() {
+    backup_cleanup_menu
 }
 
 remove_helper_packages() {
@@ -1762,6 +2449,80 @@ remove_helper_packages() {
         apt purge -y jq sqlite3 gawk python3-venv python3-pip || true
         apt autoremove -y || true
     fi
+}
+
+bulk_set_all_group_quota() {
+    local gb
+    gb="$(ask_number "Set traffic quota for ALL groups in GB, 0 = unlimited" "100")"
+    master_curl "POST" "/bulk/set-all-group-quota" "{\"gb\":$gb}"
+}
+
+bulk_remove_all_group_quota() {
+    print_warn "This makes all group quotas unlimited by setting quota_gb=0 for all known groups and default_quota_gb=0."
+    if ! ask_yes_no "Continue?" "n"; then
+        return 0
+    fi
+    master_curl "POST" "/bulk/remove-all-group-quota" "{}"
+}
+
+bulk_add_traffic_all_users() {
+    local gb clear
+    gb="$(ask_number "Traffic to ADD to ALL users in GB" "10")"
+    if ask_yes_no "Reset exhausted-quota file after adding traffic to all users?" "y"; then clear="true"; else clear="false"; fi
+    master_curl "POST" "/bulk/add-traffic-all-users" "{\"gb\":$gb,\"clear_exhausted\":$clear}"
+}
+
+bulk_set_extra_traffic_all_users() {
+    local gb clear
+    gb="$(ask_number "Set exact EXTRA traffic for ALL users in GB" "0")"
+    if ask_yes_no "Reset exhausted-quota file after changing extra traffic?" "y"; then clear="true"; else clear="false"; fi
+    master_curl "POST" "/bulk/set-extra-traffic-all-users" "{\"gb\":$gb,\"clear_exhausted\":$clear}"
+}
+
+bulk_clear_extra_traffic_all_users() {
+    print_warn "This removes all previously added EXTRA traffic from every user. Base group quota remains unchanged."
+    if ! ask_yes_no "Continue?" "n"; then
+        return 0
+    fi
+    master_curl "POST" "/bulk/clear-extra-traffic-all-users" "{}"
+}
+
+bulk_reset_usage_all_users() {
+    print_warn "This resets used traffic for ALL users to zero and resets the exhausted-quota file."
+    if ! ask_yes_no "Continue?" "n"; then
+        return 0
+    fi
+    master_curl "POST" "/bulk/reset-usage-all-users" "{}"
+}
+
+bulk_traffic_menu() {
+    while true; do
+        clear
+        echo "==== Ocserv Central - Bulk Traffic / Quota Menu ===="
+        echo "1) Set one traffic quota for ALL groups"
+        echo "2) Remove traffic quota from ALL groups, make unlimited"
+        echo "3) Add extra traffic to ALL users"
+        echo "4) Set exact extra traffic for ALL users"
+        echo "5) Clear extra traffic from ALL users"
+        echo "6) Reset used traffic for ALL users"
+        echo "7) Show users"
+        echo "8) Show current limits.json"
+        echo "0) Back"
+        echo
+        read -rp "Select: " choice
+        case "$choice" in
+            1) bulk_set_all_group_quota; pause ;;
+            2) bulk_remove_all_group_quota; pause ;;
+            3) bulk_add_traffic_all_users; pause ;;
+            4) bulk_set_extra_traffic_all_users; pause ;;
+            5) bulk_clear_extra_traffic_all_users; pause ;;
+            6) bulk_reset_usage_all_users; pause ;;
+            7) list_users; pause ;;
+            8) ensure_limits_file; jq . "$MASTER_ETC/limits.json"; pause ;;
+            0) return 0 ;;
+            *) echo "Invalid choice"; sleep 1 ;;
+        esac
+    done
 }
 
 edit_node_settings() {
@@ -1906,9 +2667,10 @@ master_menu() {
         echo "19) Delete exhausted-quota file"
         echo "20) Status"
         echo "21) Show current limits.json"
-        echo "22) Backup program data"
-        echo "23) Restore program data"
+        echo "22) Backup / restore / cleanup menu"
+        echo "23) Restore program data directly"
         echo "24) Uninstall master"
+        echo "25) Bulk traffic / quota menu"
         echo "0) Back"
         echo
         read -rp "Select: " choice
@@ -1939,9 +2701,10 @@ master_menu() {
             19) delete_quota_exhausted_file; pause ;;
             20) master_status; pause ;;
             21) ensure_limits_file; jq . "$MASTER_ETC/limits.json"; pause ;;
-            22) backup_master_data; pause ;;
+            22) backup_cleanup_menu ;;
             23) restore_master_data; pause ;;
             24) uninstall_master; pause ;;
+            25) bulk_traffic_menu ;;
             0) return 0 ;;
             *) echo "Invalid choice"; sleep 1 ;;
         esac
