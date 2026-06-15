@@ -17,7 +17,7 @@ set -Euo pipefail
 : "${FRP_DEBUG:=0}"
 trap 's=$?; if [[ "${FRP_DEBUG}" == 1 ]]; then echo "[ERROR] line $LINENO: $BASH_COMMAND -> exit $s"; fi' ERR
 
-SCRIPT_VERSION="2.5.0-multiversion-multitunnel"
+SCRIPT_VERSION="2.5.1-multiversion-multitunnel-fix"
 BASE_DIR="${FRP_BASE_DIR:-$(pwd)/frp}"
 BIN_FRPS="/usr/local/bin/frps"
 BIN_FRPC="/usr/local/bin/frpc"
@@ -72,7 +72,7 @@ ask_port(){
   while :; do
     if [[ -n $default ]]; then read -rp "$prompt [$default]: " p || true; p=${p:-$default}; else read -rp "$prompt: " p || true; fi
     validate_port "$p" && { echo "$p"; return 0; }
-    echo "Invalid port. Use 1-65535."
+    echo "Invalid port. Use 1-65535." >&2
   done
 }
 
@@ -81,7 +81,7 @@ ask_num(){
   while :; do
     read -rp "$prompt [$default]: " n || true; n=${n:-$default}
     validate_num "$n" && { echo "$n"; return 0; }
-    echo "Invalid number."
+    echo "Invalid number." >&2
   done
 }
 
@@ -90,7 +90,7 @@ ask_host(){
   while :; do
     read -rp "$prompt: " h || true
     validate_host "$h" && { echo "$h"; return 0; }
-    echo "Invalid IP/host."
+    echo "Invalid IP/host." >&2
   done
 }
 
@@ -141,74 +141,106 @@ fetch_release_json(){
   else
     url="${GITHUB_API}/releases/tags/$(normalize_tag "$tag")"
   fi
-  curl -fsSL "$url"
+  curl -fsSL --connect-timeout 15 --retry 2 --retry-delay 1 "$url"
+}
+
+direct_release_download_url(){
+  local tag="$1" arch ver
+  arch=$(arch_tag) || return 1
+  tag=$(normalize_tag "$tag")
+  ver="${tag#v}"
+  printf 'https://github.com/%s/releases/download/%s/frp_%s_%s.tar.gz\n' "$GITHUB_REPO" "$tag" "$ver" "$arch"
 }
 
 release_download_url(){
-  local tag="$1" arch json
+  local tag="$1" arch json url real_tag
   arch=$(arch_tag) || return 1
   json=$(fetch_release_json "$tag") || return 1
-  echo "$json" | grep 'browser_download_url' | grep -E "${arch}\.tar\.gz" | cut -d '"' -f 4 | head -n1
+
+  url=$(printf '%s\n' "$json"     | grep 'browser_download_url'     | grep -E "${arch}\.tar\.gz"     | cut -d '"' -f 4     | head -n1 || true)
+
+  if [[ -n "$url" ]]; then
+    printf '%s\n' "$url"
+    return 0
+  fi
+
+  # Fallback: construct the official release asset URL from the tag name.
+  if [[ "$tag" == "latest" ]]; then
+    real_tag=$(printf '%s\n' "$json" | grep '"tag_name"' | cut -d '"' -f 4 | head -n1 || true)
+    [[ -n "$real_tag" ]] || return 1
+    direct_release_download_url "$real_tag"
+  else
+    direct_release_download_url "$tag"
+  fi
 }
 
 list_recent_tags(){
-  curl -fsSL "${GITHUB_API}/releases?per_page=20" \
+  curl -fsSL --connect-timeout 15 --retry 2 --retry-delay 1 "${GITHUB_API}/releases?per_page=20" \
     | grep '"tag_name"' \
     | cut -d '"' -f 4
 }
 
 choose_frp_version(){
   local c tag idx
-  echo "Install / Update FRP binaries"
-  echo "1) Latest release (default)"
-  echo "2) Choose from recent releases"
-  echo "3) Enter version manually (example: 0.63.0 or v0.63.0)"
+  {
+    echo "Install / Update FRP binaries"
+    echo "1) Latest release (default)"
+    echo "2) Choose from recent releases"
+    echo "3) Enter version manually (example: 0.63.0 or v0.63.0)"
+  } >&2
   read -rp "Choice [1]: " c || true
   case ${c:-1} in
     2)
       mapfile -t tags < <(list_recent_tags || true)
       if (( ${#tags[@]} == 0 )); then
-        warn "Could not list releases. Falling back to latest."
-        echo "latest"; return 0
+        warn "Could not list releases. Falling back to latest." >&2
+        printf 'latest\n'; return 0
       fi
-      echo "Recent releases:"
-      local i=1
-      for tag in "${tags[@]}"; do echo "  $i) $tag"; ((i++)); done
-      echo "  0) Latest"
+      {
+        echo "Recent releases:"
+        local i=1
+        for tag in "${tags[@]}"; do echo "  $i) $tag"; ((i++)); done
+        echo "  0) Latest"
+      } >&2
       read -rp "Choose release [0]: " idx || true
       idx=${idx:-0}
       if [[ $idx =~ ^[0-9]+$ ]] && (( idx>=1 && idx<=${#tags[@]} )); then
-        echo "${tags[$((idx-1))]}"
+        printf '%s\n' "${tags[$((idx-1))]}"
       else
-        echo "latest"
+        printf 'latest\n'
       fi
       ;;
     3)
       while :; do
         read -rp "Version/tag: " tag || true
-        [[ -n ${tag:-} ]] && { normalize_tag "$tag"; return 0; }
-        echo "Version cannot be empty."
+        if [[ -n ${tag:-} ]]; then normalize_tag "$tag"; return 0; fi
+        echo "Version cannot be empty." >&2
       done
       ;;
-    *) echo "latest" ;;
+    *) printf 'latest\n' ;;
   esac
 }
 
 install_frp(){
   local selected url pkg tmpdir extracted old
-  selected=$(choose_frp_version)
+  selected=$(choose_frp_version | tail -n1 | tr -d '\r[:space:]')
+  [[ -n "$selected" ]] || selected="latest"
+  if [[ "$selected" != "latest" && ! "$selected" =~ ^v?[0-9]+(\.[0-9]+){1,3}([-_A-Za-z0-9.]*)?$ ]]; then
+    err "Invalid release value generated: '$selected'"
+    return 1
+  fi
   old="$(current_frp_versions)"
   log "Selected release: $selected"
   log "Resolving download URL..."
-  url=$(release_download_url "$selected") || { err "Could not resolve download URL from GitHub API."; return 1; }
-  [[ -n $url ]] || { err "Empty download URL. Check version and architecture."; return 1; }
+  url=$(release_download_url "$selected" | tail -n1 | tr -d '\r') || { err "Could not resolve download URL from GitHub API."; return 1; }
+  [[ -n $url && "$url" =~ ^https://github.com/.+\.tar\.gz$ ]] || { err "Invalid or empty download URL: ${url:-empty}"; return 1; }
 
   log "URL: $url"
   pkg="/tmp/$(basename "$url")"
   tmpdir="/tmp/frp-extract.$$"
   rm -rf "$tmpdir" "$pkg"
   mkdir -p "$tmpdir"
-  curl -fL -o "$pkg" "$url"
+  curl -fL --connect-timeout 20 --retry 2 --retry-delay 1 -o "$pkg" "$url"
   tar -xzf "$pkg" -C "$tmpdir" --strip-components=1
 
   [[ -x "$tmpdir/frps" && -x "$tmpdir/frpc" ]] || { err "Archive does not contain executable frps/frpc."; rm -rf "$tmpdir" "$pkg"; return 1; }
@@ -428,7 +460,12 @@ EOC
 }
 
 service_exists(){ systemctl list-unit-files --type=service --no-pager 2>/dev/null | grep -q "^$1\.service"; }
-list_services(){ systemctl list-units --type=service --all --no-pager 2>/dev/null | awk '{print $1}' | grep -E '^(frp-server|frp-client)-.*\.service$' | sed 's/\.service$//' || true; }
+list_services(){
+  {
+    systemctl list-units --type=service --all --no-pager 2>/dev/null | awk '{print $1}'
+    systemctl list-unit-files --type=service --no-pager 2>/dev/null | awk '{print $1}'
+  } | grep -E '^(frp-server|frp-client)-.*\.service$' | sed 's/\.service$//' | sort -u || true
+}
 list_server_services(){ list_services | grep '^frp-server-' || true; }
 list_client_services(){ list_services | grep '^frp-client-' || true; }
 
@@ -461,7 +498,7 @@ service_control_menu(){
     1) systemctl start "$unit"; ok "Started $unit"; pause ;;
     2) systemctl stop "$unit"; ok "Stopped $unit"; pause ;;
     3) systemctl restart "$unit"; ok "Restarted $unit"; pause ;;
-    4) systemctl status "$unit" --no-pager; pause ;;
+    4) systemctl status "$unit" --no-pager || true; pause ;;
     5) show_logs "$unit" ;;
     *) : ;;
   esac
@@ -470,19 +507,21 @@ service_control_menu(){
 # ----------------------------- interactive flows ----------------------------
 choose_transport_for_client(){
   local choice
-  echo "Transport protocol from frpc to frps:"
-  echo "1) tcp        - TCP transport"
-  echo "2) kcp        - UDP/KCP transport; frps must have kcpBindPort open"
-  echo "3) quic       - UDP/QUIC transport; frps must have quicBindPort open"
-  echo "4) websocket  - plain WebSocket over TCP"
-  echo "5) wss        - WebSocket over TLS"
+  {
+    echo "Transport protocol from frpc to frps:"
+    echo "1) tcp        - TCP transport"
+    echo "2) kcp        - UDP/KCP transport; frps must have kcpBindPort open"
+    echo "3) quic       - UDP/QUIC transport; frps must have quicBindPort open"
+    echo "4) websocket  - plain WebSocket over TCP"
+    echo "5) wss        - WebSocket over TLS"
+  } >&2
   read -rp "Choose [1]: " choice || true
   case ${choice:-1} in
-    2) echo kcp ;;
-    3) echo quic ;;
-    4) echo websocket ;;
-    5) echo wss ;;
-    *) echo tcp ;;
+    2) printf 'kcp\n' ;;
+    3) printf 'quic\n' ;;
+    4) printf 'websocket\n' ;;
+    5) printf 'wss\n' ;;
+    *) printf 'tcp\n' ;;
   esac
 }
 
@@ -545,7 +584,7 @@ action_add_server(){
   if service_exists "$service"; then err "Service already exists: $service"; pause; return; fi
 
   bind=$(ask_port "Main TCP bind port" "7000")
-  while :; do read -rp "Auth token: " token || true; [[ -n "$token" ]] && break || echo "Token cannot be empty."; done
+  while :; do read -rp "Auth token: " token || true; [[ -n "$token" ]] && break || echo "Token cannot be empty." >&2; done
 
   local kcp_port="" quic_port="" udp_sz=1500 qk=10 qi=30 qs=100000
   if ask_yes_no "Enable KCP transport on frps?" "N"; then
@@ -631,25 +670,39 @@ action_add_client(){
   if service_exists "$service"; then err "Service already exists: $service"; pause; return; fi
 
   saddr=$(ask_host "Server address (IP/host)")
-  sport=$(ask_port "Server main bind port" "7000")
-  while :; do read -rp "Auth token: " token || true; [[ -n "$token" ]] && break || echo "Token cannot be empty."; done
+  while :; do read -rp "Auth token: " token || true; [[ -n "$token" ]] && break || echo "Token cannot be empty." >&2; done
 
-  proto=$(choose_transport_for_client)
+  proto=$(choose_transport_for_client | tail -n1 | tr -d '\r[:space:]')
   case "$proto" in
     tcp)
+      sport=$(ask_port "Server TCP bindPort" "7000")
       if ask_yes_no "Use TLS to server?" "Y"; then tls_enable=true; else tls_enable=false; fi
       ;;
     websocket)
+      sport=$(ask_port "Server TCP bindPort for plain WebSocket" "7000")
       tls_enable=false
       warn "websocket = plain WS. For TLS WebSocket choose wss."
       ;;
     wss)
+      sport=$(ask_port "Server TCP bindPort for WSS" "7000")
       tls_enable=true
       ;;
-    kcp|quic)
+    kcp)
+      sport=$(ask_port "Server KCP UDP bind port" "7000")
       tls_enable=false
       udp_sz=$(ask_num "udpPacketSize (must match server if changed)" "1500")
-      warn "For $proto, the server port you entered must be the UDP ${proto^^} bind port."
+      warn "For kcp, open this UDP port on the server firewall/security group."
+      ;;
+    quic)
+      sport=$(ask_port "Server QUIC UDP bind port" "7000")
+      tls_enable=false
+      udp_sz=$(ask_num "udpPacketSize (must match server if changed)" "1500")
+      warn "For quic, open this UDP port on the server firewall/security group."
+      ;;
+    *)
+      err "Invalid protocol generated: '$proto'"
+      pause
+      return
       ;;
   esac
   if [[ "$tls_enable" == "true" ]]; then
@@ -781,7 +834,7 @@ manage_client_ports(){
         print_proxy_list
         read -rp "Select proxy to delete: " j || true
         [[ $j =~ ^[0-9]+$ ]] && (( j>=1 && j<=${#PROXIES[@]} )) || { echo "Invalid"; pause; continue; }
-        unset 'PROXIES[$((j-1))]'
+        unset "PROXIES[$((j-1))]"
         PROXIES=("${PROXIES[@]}")
         write_frpc_with_blocks "$cfg"
         systemctl restart "$unit" || true
