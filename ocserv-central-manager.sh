@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# ocserv-central-manager v8
+# Adds native support for ocpasswd group '*' as unlimited sessions.
+# Convention: group max_sessions=0 means unlimited. User override max_sessions=-1 means unlimited; 0 means use group default.
 # ocserv-central-manager.sh
 # Central concurrent-session and quota controller for multiple ocserv nodes.
 # Target OS: Ubuntu 24.x
@@ -92,7 +95,7 @@ ask_number() {
             echo "$ans"
             return 0
         fi
-        echo "Enter a number."
+        echo "Enter a number." >&2
     done
 }
 
@@ -412,7 +415,10 @@ def sync_ocpasswd_to_db():
 def group_number(groupname: str | None) -> int:
     if not groupname:
         return 1
-    m = re.search(r"(\d+)", groupname)
+    g = str(groupname).strip().lower()
+    if g in ("*", "unlimited", "unlimit", "nolimit", "no-limit", "no_limit", "all"):
+        return 999999
+    m = re.search(r"(\d+)", str(groupname))
     return int(m.group(1)) if m else 1
 
 def get_user_from_db(username: str):
@@ -438,13 +444,22 @@ def effective_limits(username: str, groupname: str | None):
 
     group_cfg = limits.get("groups", {}).get(groupname or "", {})
     if session_feature and "max_sessions" in group_cfg:
-        max_sessions = int(group_cfg["max_sessions"])
+        group_ms = int(group_cfg["max_sessions"])
+        max_sessions = 999999 if group_ms <= 0 else group_ms
     if quota_feature and "quota_gb" in group_cfg:
         quota_gb = float(group_cfg["quota_gb"])
 
     user_cfg = limits.get("users", {}).get(username, {})
     if session_feature and "max_sessions" in user_cfg:
-        max_sessions = int(user_cfg["max_sessions"])
+        user_ms = int(user_cfg["max_sessions"])
+        # User override convention:
+        #   max_sessions = 0  => use group default; this value is normally omitted by the menu.
+        #   max_sessions < 0  => unlimited for this user.
+        #   max_sessions > 0  => exact user limit.
+        if user_ms < 0:
+            max_sessions = 999999
+        elif user_ms > 0:
+            max_sessions = user_ms
     if quota_feature and "quota_gb" in user_cfg:
         quota_gb = float(user_cfg["quota_gb"])
 
@@ -1102,7 +1117,15 @@ extract_groups_from_ocpasswd() {
 
 group_default_sessions() {
     local group="$1"
-    local num
+    local lower num
+    lower="$(echo "$group" | tr '[:upper:]' '[:lower:]' | xargs)"
+    case "$lower" in
+        "*"|"unlimited"|"unlimit"|"nolimit"|"no-limit"|"no_limit"|"all")
+            echo "0"
+            return 0
+            ;;
+    esac
+
     num="$(echo "$group" | grep -Eo '[0-9]+' | head -n1 || true)"
     if [[ -n "$num" ]]; then
         echo "$num"
@@ -1759,11 +1782,11 @@ edit_user_override() {
     current_ms="$(jq -r --arg u "$u" '.users[$u].max_sessions // 0' "$MASTER_ETC/limits.json")"
     current_q="$(jq -r --arg u "$u" '.users[$u].quota_gb // 0' "$MASTER_ETC/limits.json")"
 
-    max_sessions="$(ask_number "User max sessions, 0 = use group default" "$current_ms")"
+    max_sessions="$(ask_number "User max sessions, 0 = use group default, -1 = unlimited" "$current_ms")"
     quota="$(ask_number "User quota GB, 0 = unlimited or group default depending your policy" "$current_q")"
 
     tmp="$(mktemp)"
-    if [[ "$max_sessions" == "0" ]]; then
+    if [[ "$max_sessions" == "0" || "$max_sessions" == "0.0" ]]; then
         jq --arg u "$u" --argjson q "$quota" \
            '.users[$u] = {"quota_gb": $q}' \
            "$MASTER_ETC/limits.json" > "$tmp"
@@ -2790,6 +2813,9 @@ if os.path.exists(db_path):
         con.close()
 
 def group_num(g):
+    s = (g or "").strip().lower()
+    if s in ("*", "unlimited", "unlimit", "nolimit", "no-limit", "no_limit", "all"):
+        return 0
     m = re.search(r"(\d+)", g or "")
     return int(m.group(1)) if m else 1
 
@@ -2837,7 +2863,7 @@ sync_new_groups_from_ocpasswd_only() {
         echo
         print_info "New group found: $g"
         def_sessions="$(group_default_sessions "$g")"
-        max_sessions="$(ask_number "Max concurrent sessions for NEW group $g" "$def_sessions")"
+        max_sessions="$(ask_number "Max concurrent sessions for NEW group $g, 0 = unlimited" "$def_sessions")"
         quota_gb="$(ask_number "Quota for NEW group $g in GB, 0 = unlimited" "$current_default")"
 
         tmp="$(mktemp)"
@@ -2874,7 +2900,7 @@ edit_one_group_quota() {
     print_info "Current max_sessions: $current_ms"
     print_info "Current quota_gb: $current_q"
 
-    max_sessions="$(ask_number "New max concurrent sessions for $group" "$current_ms")"
+    max_sessions="$(ask_number "New max concurrent sessions for $group, 0 = unlimited" "$current_ms")"
     quota_gb="$(ask_number "New quota for $group in GB, 0 = unlimited" "$current_q")"
 
     tmp="$(mktemp)"
@@ -3008,11 +3034,11 @@ edit_user_override() {
 
     echo
     print_info "Editing user override: $u"
-    echo "If max sessions is 0, the user uses group default."
+    echo "If max sessions is 0, the user uses group default. Use -1 for unlimited sessions."
     echo "If quota is 0 in user override, it means unlimited for this user override."
     echo
 
-    max_sessions="$(ask_number "User max sessions, 0 = use group default" "$current_ms")"
+    max_sessions="$(ask_number "User max sessions, 0 = use group default, -1 = unlimited" "$current_ms")"
     quota="$(ask_number "User quota GB, 0 = unlimited for this user override" "$current_q")"
 
     tmp="$(mktemp)"
