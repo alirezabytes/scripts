@@ -2642,6 +2642,418 @@ uninstall_master() {
     remove_helper_packages
 }
 
+
+# =========================
+# v6: group/user quota editing helpers
+# =========================
+
+get_master_ocpasswd_path() {
+    local ocp
+    ocp="$(systemctl show ocserv-central -p Environment --value 2>/dev/null | tr ' ' '\n' | sed -n 's/^OCPASSWD_PATH=//p' | tail -n1 || true)"
+    echo "${ocp:-/etc/ocserv/ocpasswd}"
+}
+
+reset_exhausted_file_optional() {
+    if ask_yes_no "Reset exhausted-quota file after this change?" "y"; then
+        mkdir -p "$DB_DIR"
+        : > "$DB_DIR/quota_exhausted_users.jsonl"
+        print_ok "Exhausted-quota file reset."
+    fi
+}
+
+reset_usage_for_group_sqlite() {
+    local group="$1"
+    local db="$DB_DIR/central.db"
+
+    if [[ ! -f "$db" ]]; then
+        print_warn "Database not found: $db"
+        return 0
+    fi
+
+    python3 - "$db" "$group" <<'PYRESETGROUP'
+import sqlite3
+import sys
+import time
+
+db_path = sys.argv[1]
+groupname = sys.argv[2]
+
+con = sqlite3.connect(db_path, timeout=20)
+try:
+    cur = con.execute(
+        "UPDATE users SET used_bytes=0, updated_at=? WHERE groupname=?",
+        (int(time.time()), groupname),
+    )
+    con.commit()
+    print(cur.rowcount)
+finally:
+    con.close()
+PYRESETGROUP
+}
+
+reset_usage_for_user_sqlite() {
+    local username="$1"
+    local db="$DB_DIR/central.db"
+
+    if [[ ! -f "$db" ]]; then
+        print_warn "Database not found: $db"
+        return 0
+    fi
+
+    python3 - "$db" "$username" <<'PYRESETUSER'
+import sqlite3
+import sys
+import time
+
+db_path = sys.argv[1]
+username = sys.argv[2]
+
+con = sqlite3.connect(db_path, timeout=20)
+try:
+    cur = con.execute(
+        "UPDATE users SET used_bytes=0, updated_at=? WHERE username=?",
+        (int(time.time()), username),
+    )
+    con.commit()
+    print(cur.rowcount)
+finally:
+    con.close()
+PYRESETUSER
+}
+
+count_users_in_group() {
+    local group="$1"
+    local db="$DB_DIR/central.db"
+    if [[ ! -f "$db" ]]; then
+        echo "0"
+        return 0
+    fi
+
+    python3 - "$db" "$group" <<'PYCOUNTGROUP'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+try:
+    row = con.execute("SELECT COUNT(*) FROM users WHERE groupname=?", (sys.argv[2],)).fetchone()
+    print(row[0] if row else 0)
+finally:
+    con.close()
+PYCOUNTGROUP
+}
+
+list_group_limits() {
+    ensure_limits_file
+
+    local ocp
+    ocp="$(get_master_ocpasswd_path)"
+
+    echo
+    print_info "Groups found in ocpasswd and limits.json:"
+    python3 - "$MASTER_ETC/limits.json" "$ocp" "$DB_DIR/central.db" <<'PYLISTGROUPS'
+import json
+import os
+import re
+import sqlite3
+import sys
+
+limits_path, ocp_path, db_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+try:
+    with open(limits_path, "r", encoding="utf-8") as f:
+        limits = json.load(f)
+except Exception:
+    limits = {"default_quota_gb": 0, "groups": {}}
+
+groups = set(limits.get("groups", {}).keys())
+
+if os.path.exists(ocp_path):
+    with open(ocp_path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(":", 2)
+            if len(parts) >= 2:
+                for g in parts[1].split(","):
+                    g = g.strip()
+                    if g:
+                        groups.add(g)
+
+counts = {}
+if os.path.exists(db_path):
+    con = sqlite3.connect(db_path)
+    try:
+        for g, c in con.execute("SELECT groupname, COUNT(*) FROM users GROUP BY groupname"):
+            counts[g or ""] = c
+    except Exception:
+        pass
+    finally:
+        con.close()
+
+def group_num(g):
+    m = re.search(r"(\d+)", g or "")
+    return int(m.group(1)) if m else 1
+
+print(f"{'GROUP':<24} {'MAX_SESS':<10} {'QUOTA_GB':<12} {'USERS':<8} SOURCE")
+print("-" * 72)
+
+for g in sorted(groups):
+    cfg = limits.get("groups", {}).get(g, {})
+    max_sess = cfg.get("max_sessions", group_num(g))
+    quota = cfg.get("quota_gb", limits.get("default_quota_gb", 0))
+    source = "limits.json" if g in limits.get("groups", {}) else "ocpasswd/default"
+    print(f"{g:<24} {str(max_sess):<10} {str(quota):<12} {str(counts.get(g, 0)):<8} {source}")
+PYLISTGROUPS
+}
+
+sync_new_groups_from_ocpasswd_only() {
+    ensure_limits_file
+
+    local ocp
+    ocp="$(ask_value "ocpasswd path" "$(get_master_ocpasswd_path)")"
+
+    if [[ ! -f "$ocp" ]]; then
+        print_err "ocpasswd not found: $ocp"
+        return 1
+    fi
+
+    mapfile -t groups < <(extract_groups_from_ocpasswd "$ocp")
+
+    if [[ "${#groups[@]}" -eq 0 ]]; then
+        print_warn "No groups found in $ocp"
+        return 0
+    fi
+
+    local added=0 skipped=0 g exists def_sessions max_sessions quota_gb current_default tmp
+
+    current_default="$(jq -r '.default_quota_gb // 0' "$MASTER_ETC/limits.json")"
+
+    for g in "${groups[@]}"; do
+        if jq -e --arg g "$g" '.groups | has($g)' "$MASTER_ETC/limits.json" >/dev/null; then
+            print_info "Skipping existing group without changing settings: $g"
+            skipped=$((skipped + 1))
+            continue
+        fi
+
+        echo
+        print_info "New group found: $g"
+        def_sessions="$(group_default_sessions "$g")"
+        max_sessions="$(ask_number "Max concurrent sessions for NEW group $g" "$def_sessions")"
+        quota_gb="$(ask_number "Quota for NEW group $g in GB, 0 = unlimited" "$current_default")"
+
+        tmp="$(mktemp)"
+        jq --arg g "$g" --argjson ms "$max_sessions" --argjson q "$quota_gb" \
+            '.groups[$g] = {"max_sessions": $ms, "quota_gb": $q}' \
+            "$MASTER_ETC/limits.json" > "$tmp"
+        mv "$tmp" "$MASTER_ETC/limits.json"
+
+        added=$((added + 1))
+        print_ok "Added new group: $g"
+    done
+
+    print_ok "New group sync completed. added=$added skipped_existing=$skipped"
+    print_info "Existing group settings were not changed."
+}
+
+edit_one_group_quota() {
+    ensure_limits_file
+
+    local group max_sessions quota_gb current_ms current_q def_ms tmp reset_choice users_count
+
+    list_group_limits
+    echo
+    group="$(ask_value "Group name to edit, example group2" "")"
+    [[ -z "$group" ]] && return 0
+
+    def_ms="$(group_default_sessions "$group")"
+    current_ms="$(jq -r --arg g "$group" '.groups[$g].max_sessions // empty' "$MASTER_ETC/limits.json")"
+    current_q="$(jq -r --arg g "$group" '.groups[$g].quota_gb // .default_quota_gb // 0' "$MASTER_ETC/limits.json")"
+    current_ms="${current_ms:-$def_ms}"
+
+    echo
+    print_info "Editing group: $group"
+    print_info "Current max_sessions: $current_ms"
+    print_info "Current quota_gb: $current_q"
+
+    max_sessions="$(ask_number "New max concurrent sessions for $group" "$current_ms")"
+    quota_gb="$(ask_number "New quota for $group in GB, 0 = unlimited" "$current_q")"
+
+    tmp="$(mktemp)"
+    jq --arg g "$group" --argjson ms "$max_sessions" --argjson q "$quota_gb" \
+        '.groups[$g] = {"max_sessions": $ms, "quota_gb": $q}' \
+        "$MASTER_ETC/limits.json" > "$tmp"
+    mv "$tmp" "$MASTER_ETC/limits.json"
+
+    users_count="$(count_users_in_group "$group")"
+
+    echo
+    print_warn "This group has $users_count synced users in central DB."
+    echo "How should existing used traffic be handled?"
+    echo "1) Keep used traffic and apply the new quota immediately"
+    echo "   Example: user used 80GB, new quota 100GB => remaining 20GB"
+    echo "2) Reset used traffic for users in this group to 0"
+    echo "   Example: user used 80GB, new quota 100GB => remaining 100GB"
+    read -rp "Select [1]: " reset_choice
+    reset_choice="${reset_choice:-1}"
+
+    case "$reset_choice" in
+        2)
+            local changed
+            changed="$(reset_usage_for_group_sqlite "$group" | tail -n1)"
+            print_ok "Used traffic reset to 0 for users in $group. rows_changed=${changed:-0}"
+            reset_exhausted_file_optional
+            ;;
+        *)
+            print_ok "Existing used traffic kept. New quota applies against already-used traffic."
+            print_warn "If a user already used more than the new quota, they may be denied or disconnected on next check."
+            reset_exhausted_file_optional
+            ;;
+    esac
+
+    print_ok "Group quota/settings updated for $group."
+    print_info "No restart is usually required because the API reads limits.json on each check."
+}
+
+remove_one_group_quota() {
+    ensure_limits_file
+
+    local group current_ms tmp choice
+    list_group_limits
+    echo
+    group="$(ask_value "Group name to make unlimited, example group2" "")"
+    [[ -z "$group" ]] && return 0
+
+    current_ms="$(jq -r --arg g "$group" '.groups[$g].max_sessions // empty' "$MASTER_ETC/limits.json")"
+    current_ms="${current_ms:-$(group_default_sessions "$group")}"
+
+    print_warn "This will set quota_gb=0 for $group, meaning unlimited traffic for this group."
+    if ! ask_yes_no "Continue?" "n"; then
+        return 0
+    fi
+
+    tmp="$(mktemp)"
+    jq --arg g "$group" --argjson ms "$current_ms" \
+        '.groups[$g] = {"max_sessions": $ms, "quota_gb": 0}' \
+        "$MASTER_ETC/limits.json" > "$tmp"
+    mv "$tmp" "$MASTER_ETC/limits.json"
+
+    if ask_yes_no "Reset used traffic for users in this group too?" "n"; then
+        reset_usage_for_group_sqlite "$group" >/dev/null
+        print_ok "Used traffic reset for users in $group."
+    fi
+
+    reset_exhausted_file_optional
+    print_ok "Group $group is now unlimited."
+}
+
+reset_usage_for_one_group_menu() {
+    local group changed
+    list_group_limits
+    echo
+    group="$(ask_value "Group name to reset used traffic for, example group2" "")"
+    [[ -z "$group" ]] && return 0
+
+    print_warn "This will reset used traffic to 0 for all synced users in group: $group"
+    if ! ask_yes_no "Continue?" "n"; then
+        return 0
+    fi
+
+    changed="$(reset_usage_for_group_sqlite "$group" | tail -n1)"
+    print_ok "Used traffic reset for group $group. rows_changed=${changed:-0}"
+    reset_exhausted_file_optional
+}
+
+group_quota_menu() {
+    while true; do
+        clear
+        echo "==== Ocserv Central - Group Quota / New Group Menu ===="
+        echo "1) List group limits and user counts"
+        echo "2) Add/sync NEW groups from ocpasswd only, keep old group settings"
+        echo "3) Edit ONE group quota/sessions and choose used-traffic handling"
+        echo "4) Make ONE group unlimited, keep sessions"
+        echo "5) Reset used traffic for ONE group"
+        echo "6) Configure ALL groups from ocpasswd, may edit existing groups too"
+        echo "7) Show current limits.json"
+        echo "0) Back"
+        echo
+        read -rp "Select: " choice
+        case "$choice" in
+            1) list_group_limits; pause ;;
+            2) sync_new_groups_from_ocpasswd_only; pause ;;
+            3) edit_one_group_quota; pause ;;
+            4) remove_one_group_quota; pause ;;
+            5) reset_usage_for_one_group_menu; pause ;;
+            6)
+                local ocp
+                ocp="$(ask_value "ocpasswd path" "$(get_master_ocpasswd_path)")"
+                configure_groups_from_ocpasswd "$ocp"
+                pause
+                ;;
+            7) ensure_limits_file; jq . "$MASTER_ETC/limits.json"; pause ;;
+            0) return 0 ;;
+            *) echo "Invalid choice"; sleep 1 ;;
+        esac
+    done
+}
+
+# v6 override: adds used-traffic handling after editing a user's quota.
+edit_user_override() {
+    ensure_limits_file
+    local u max_sessions quota tmp
+    u="$(ask_value "Username" "")"
+    [[ -z "$u" ]] && return 0
+
+    local current_ms current_q
+    current_ms="$(jq -r --arg u "$u" '.users[$u].max_sessions // 0' "$MASTER_ETC/limits.json")"
+    current_q="$(jq -r --arg u "$u" '.users[$u].quota_gb // 0' "$MASTER_ETC/limits.json")"
+
+    echo
+    print_info "Editing user override: $u"
+    echo "If max sessions is 0, the user uses group default."
+    echo "If quota is 0 in user override, it means unlimited for this user override."
+    echo
+
+    max_sessions="$(ask_number "User max sessions, 0 = use group default" "$current_ms")"
+    quota="$(ask_number "User quota GB, 0 = unlimited for this user override" "$current_q")"
+
+    tmp="$(mktemp)"
+    if [[ "$max_sessions" == "0" || "$max_sessions" == "0.0" ]]; then
+        jq --arg u "$u" --argjson q "$quota" \
+           '.users[$u] = {"quota_gb": $q}' \
+           "$MASTER_ETC/limits.json" > "$tmp"
+    else
+        jq --arg u "$u" --argjson ms "$max_sessions" --argjson q "$quota" \
+           '.users[$u] = {"max_sessions": $ms, "quota_gb": $q}' \
+           "$MASTER_ETC/limits.json" > "$tmp"
+    fi
+    mv "$tmp" "$MASTER_ETC/limits.json"
+    print_ok "User override saved."
+
+    echo
+    echo "How should this user's already-used traffic be handled?"
+    echo "1) Keep used traffic and apply the new user quota immediately"
+    echo "   Example: user used 80GB, new quota 100GB => remaining 20GB"
+    echo "2) Reset used traffic for this user to 0"
+    echo "   Example: user used 80GB, new quota 100GB => remaining 100GB"
+    read -rp "Select [1]: " reset_choice
+    reset_choice="${reset_choice:-1}"
+
+    case "$reset_choice" in
+        2)
+            reset_usage_for_user_sqlite "$u" >/dev/null
+            print_ok "Used traffic reset to 0 for user: $u"
+            reset_exhausted_file_optional
+            ;;
+        *)
+            print_ok "Existing used traffic kept. New user quota applies against already-used traffic."
+            print_warn "If this user already used more than the new quota, they may be denied or disconnected on next check."
+            reset_exhausted_file_optional
+            ;;
+    esac
+
+    print_info "No restart is usually required because the API reads limits.json on each check."
+}
+
+
 master_menu() {
     while true; do
         clear
@@ -2671,6 +3083,7 @@ master_menu() {
         echo "23) Restore program data directly"
         echo "24) Uninstall master"
         echo "25) Bulk traffic / quota menu"
+        echo "26) Group quota / new group menu"
         echo "0) Back"
         echo
         read -rp "Select: " choice
@@ -2705,6 +3118,7 @@ master_menu() {
             23) restore_master_data; pause ;;
             24) uninstall_master; pause ;;
             25) bulk_traffic_menu ;;
+            26) group_quota_menu ;;
             0) return 0 ;;
             *) echo "Invalid choice"; sleep 1 ;;
         esac
