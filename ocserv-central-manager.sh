@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# ocserv-central-manager v8
-# Adds native support for ocpasswd group '*' as unlimited sessions.
-# Convention: group max_sessions=0 means unlimited. User override max_sessions=-1 means unlimited; 0 means use group default.
+# ocserv-central-manager v9
+# Adds DB user cleanup/prune menu: compare DB users with ocpasswd, delete stale users safely, and cleanup inactive users.
+# Keeps v8 support for ocpasswd group '*' as unlimited sessions.
 # ocserv-central-manager.sh
 # Central concurrent-session and quota controller for multiple ocserv nodes.
 # Target OS: Ubuntu 24.x
@@ -3080,6 +3080,367 @@ edit_user_override() {
 }
 
 
+
+# =========================
+# v9: database user cleanup / ocpasswd prune
+# =========================
+
+db_user_cleanup_python() {
+    local mode="$1"
+    local days="${2:-90}"
+    local include_ocpasswd="${3:-0}"
+    local apply="${4:-0}"
+    local ocp="${5:-}"
+    local db="$DB_DIR/central.db"
+
+    if [[ -z "$ocp" ]]; then
+        ocp="$(get_master_ocpasswd_path)"
+    fi
+
+    if [[ ! -f "$db" ]]; then
+        print_err "Database not found: $db"
+        return 1
+    fi
+
+    python3 - "$db" "$ocp" "$mode" "$days" "$include_ocpasswd" "$apply" <<'PYCLEANDB'
+import os
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+db_path, ocp_path, mode, days_s, include_ocpasswd_s, apply_s = sys.argv[1:7]
+days = int(float(days_s))
+include_ocpasswd = include_ocpasswd_s == "1"
+apply = apply_s == "1"
+now = int(time.time())
+cutoff = now - days * 86400
+
+def read_ocpasswd_users(path):
+    users = set()
+    if not path or not os.path.exists(path):
+        return users
+    with open(path, "r", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(":", 2)
+            if len(parts) >= 1 and parts[0].strip():
+                users.add(parts[0].strip())
+    return users
+
+def table_exists(con, table):
+    return con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (table,),
+    ).fetchone() is not None
+
+def columns(con, table):
+    try:
+        return [r[1] for r in con.execute(f'PRAGMA table_info("{table}")')]
+    except Exception:
+        return []
+
+def max_col(con, table, username, col):
+    try:
+        r = con.execute(
+            f'SELECT MAX("{col}") FROM "{table}" WHERE username=?',
+            (username,),
+        ).fetchone()
+        if r and r[0] is not None:
+            try:
+                return int(float(r[0]))
+            except Exception:
+                return None
+    except Exception:
+        return None
+    return None
+
+def last_activity(con, username):
+    candidates = []
+
+    if table_exists(con, "sessions"):
+        cols = columns(con, "sessions")
+        if "username" in cols:
+            for col in ("last_seen", "ended_at", "disconnected_at", "updated_at", "started_at", "created_at"):
+                if col in cols:
+                    v = max_col(con, "sessions", username, col)
+                    if v:
+                        candidates.append(v)
+
+    if table_exists(con, "usage_log"):
+        cols = columns(con, "usage_log")
+        if "username" in cols:
+            for col in ("created_at", "updated_at", "ts", "time"):
+                if col in cols:
+                    v = max_col(con, "usage_log", username, col)
+                    if v:
+                        candidates.append(v)
+
+    # users.updated_at is intentionally NOT used as primary activity because sync_ocpasswd may update it.
+    # It is only useful for display if the user never had sessions/usage.
+    return max(candidates) if candidates else 0
+
+def fmt_ts(ts):
+    if not ts:
+        return "never"
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+    except Exception:
+        return str(ts)
+
+def get_db_users(con):
+    if not table_exists(con, "users"):
+        return []
+    cols = columns(con, "users")
+    extra = []
+    for col in ("groupname", "used_bytes", "quota_extra_bytes", "expires_at", "disabled", "updated_at"):
+        if col in cols:
+            extra.append(col)
+    select_cols = ["username"] + extra
+    q = 'SELECT ' + ', '.join(f'"{c}"' for c in select_cols) + ' FROM users ORDER BY username'
+    rows = con.execute(q).fetchall()
+    return select_cols, rows
+
+def delete_username_everywhere(con, username):
+    deleted = {}
+    tables = [r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+    for table in tables:
+        cols = columns(con, table)
+        col = None
+        if "username" in cols:
+            col = "username"
+        elif "user" in cols:
+            col = "user"
+        if not col:
+            continue
+        cur = con.execute(f'DELETE FROM "{table}" WHERE "{col}"=?', (username,))
+        deleted[table] = cur.rowcount
+    return deleted
+
+ocp_users = read_ocpasswd_users(ocp_path)
+con = sqlite3.connect(db_path, timeout=30)
+con.row_factory = sqlite3.Row
+
+try:
+    if not table_exists(con, "users"):
+        print("ERROR: users table not found.")
+        sys.exit(1)
+
+    select_cols, rows = get_db_users(con)
+    db_usernames = [r["username"] for r in rows]
+    missing = sorted([u for u in db_usernames if u not in ocp_users])
+
+    if mode == "stats":
+        print("Database user cleanup statistics")
+        print("--------------------------------")
+        print(f"DB users: {len(db_usernames)}")
+        print(f"ocpasswd users: {len(ocp_users)}")
+        print(f"DB users missing from ocpasswd: {len(missing)}")
+        print(f"ocpasswd path: {ocp_path}")
+        print()
+        print("Important:")
+        print("- Users missing from ocpasswd are stale/orphan DB users.")
+        print("- If a user still exists in ocpasswd and you delete them only from DB, next sync can recreate them.")
+        sys.exit(0)
+
+    if mode in ("list_missing", "delete_missing"):
+        target = missing
+        title = "DB users missing from ocpasswd"
+    elif mode in ("list_inactive", "delete_inactive_missing", "delete_inactive_all"):
+        inactive = []
+        ocp_set = ocp_users
+        for u in db_usernames:
+            la = last_activity(con, u)
+            is_inactive = (la == 0) or (la < cutoff)
+            if not is_inactive:
+                continue
+            in_ocp = u in ocp_set
+            if mode == "delete_inactive_missing" and in_ocp:
+                continue
+            if mode == "delete_inactive_all":
+                # include_ocpasswd controls whether users still in ocpasswd can be deleted.
+                if in_ocp and not include_ocpasswd:
+                    continue
+            inactive.append((u, la, in_ocp))
+        target = [x[0] for x in inactive]
+        title = f"Inactive DB users older than {days} days"
+    else:
+        print(f"ERROR: unknown mode: {mode}")
+        sys.exit(1)
+
+    if mode.startswith("list"):
+        print(title)
+        print("-" * 90)
+        if not target:
+            print("No matching users found.")
+            sys.exit(0)
+
+        print(f"{'USERNAME':<28} {'IN_OCPASSWD':<12} {'LAST_ACTIVITY':<20} {'AGE_DAYS':<10}")
+        print("-" * 90)
+        for u in target[:500]:
+            la = last_activity(con, u)
+            age = "never" if not la else str(int((now - la) / 86400))
+            print(f"{u:<28} {str(u in ocp_users):<12} {fmt_ts(la):<20} {age:<10}")
+        if len(target) > 500:
+            print(f"... truncated. total={len(target)}")
+        sys.exit(0)
+
+    if mode.startswith("delete"):
+        if not target:
+            print("No matching users to delete.")
+            sys.exit(0)
+
+        print(f"Users selected for deletion: {len(target)}")
+        for u in target[:100]:
+            la = last_activity(con, u)
+            print(f"- {u} | in_ocpasswd={u in ocp_users} | last_activity={fmt_ts(la)}")
+        if len(target) > 100:
+            print(f"... and {len(target) - 100} more")
+
+        if not apply:
+            print()
+            print("DRY-RUN only. Nothing was deleted.")
+            sys.exit(0)
+
+        totals = {}
+        for u in target:
+            deleted = delete_username_everywhere(con, u)
+            for table, count in deleted.items():
+                totals[table] = totals.get(table, 0) + count
+        con.commit()
+
+        print()
+        print("Deletion completed.")
+        for table, count in sorted(totals.items()):
+            print(f"{table}: {count}")
+finally:
+    con.close()
+PYCLEANDB
+}
+
+safety_backup_db_before_cleanup() {
+    local db="$DB_DIR/central.db"
+    local out="/root/ocserv-central-before-user-cleanup-$(date +%Y%m%d-%H%M%S).db"
+
+    if [[ ! -f "$db" ]]; then
+        print_warn "Database not found, skipping safety backup: $db"
+        return 0
+    fi
+
+    sqlite3 "$db" ".backup '$out'"
+    print_ok "Safety DB backup saved: $out"
+    ls -lh "$out" 2>/dev/null || true
+}
+
+db_user_cleanup_menu() {
+    local ocp days include apply
+
+    while true; do
+        clear
+        echo "==== Ocserv Central - Database User Cleanup / ocpasswd Prune Menu ===="
+        echo "1) Show DB vs ocpasswd user statistics"
+        echo "2) List DB users missing from ocpasswd"
+        echo "3) Delete DB users missing from ocpasswd"
+        echo "4) List inactive DB users older than N days"
+        echo "5) Delete inactive users older than N days ONLY if missing from ocpasswd"
+        echo "6) DANGER: Delete inactive users older than N days even if still in ocpasswd"
+        echo "7) VACUUM / compact database"
+        echo "0) Back"
+        echo
+        read -rp "Select: " choice
+
+        case "$choice" in
+            1)
+                ocp="$(ask_value "ocpasswd path" "$(get_master_ocpasswd_path)")"
+                db_user_cleanup_python "stats" 90 0 0 "$ocp"
+                pause
+                ;;
+            2)
+                ocp="$(ask_value "ocpasswd path" "$(get_master_ocpasswd_path)")"
+                db_user_cleanup_python "list_missing" 90 0 0 "$ocp"
+                pause
+                ;;
+            3)
+                ocp="$(ask_value "ocpasswd path" "$(get_master_ocpasswd_path)")"
+                print_warn "This deletes users from central DB if they are NOT present in ocpasswd."
+                print_info "It will also delete their rows from sessions/usage_log and similar DB tables."
+                print_info "It does NOT edit ocpasswd itself."
+                print_info "If a deleted user still exists in ocpasswd later, sync can recreate them."
+                if ask_yes_no "Take safety DB backup before deletion?" "y"; then
+                    safety_backup_db_before_cleanup
+                fi
+                echo
+                print_info "Dry-run preview:"
+                db_user_cleanup_python "delete_missing" 90 0 0 "$ocp"
+                echo
+                if ask_yes_no "Apply deletion now?" "n"; then
+                    db_user_cleanup_python "delete_missing" 90 0 1 "$ocp"
+                fi
+                pause
+                ;;
+            4)
+                ocp="$(ask_value "ocpasswd path" "$(get_master_ocpasswd_path)")"
+                days="$(ask_number "Inactive threshold in days" "90")"
+                db_user_cleanup_python "list_inactive" "$days" 0 0 "$ocp"
+                pause
+                ;;
+            5)
+                ocp="$(ask_value "ocpasswd path" "$(get_master_ocpasswd_path)")"
+                days="$(ask_number "Inactive threshold in days" "90")"
+                print_warn "This deletes inactive users ONLY if they are also missing from ocpasswd."
+                print_info "This is the safer cleanup mode."
+                if ask_yes_no "Take safety DB backup before deletion?" "y"; then
+                    safety_backup_db_before_cleanup
+                fi
+                echo
+                print_info "Dry-run preview:"
+                db_user_cleanup_python "delete_inactive_missing" "$days" 0 0 "$ocp"
+                echo
+                if ask_yes_no "Apply deletion now?" "n"; then
+                    db_user_cleanup_python "delete_inactive_missing" "$days" 0 1 "$ocp"
+                fi
+                pause
+                ;;
+            6)
+                ocp="$(ask_value "ocpasswd path" "$(get_master_ocpasswd_path)")"
+                days="$(ask_number "Inactive threshold in days" "180")"
+                print_warn "DANGER: This can delete users from central DB even if they still exist in ocpasswd."
+                print_warn "If those users remain in ocpasswd, future sync/connect may recreate them."
+                print_warn "Recommended workflow: remove users from ocpasswd first, rsync to nodes, then use option 3 or 5."
+                if ! ask_yes_no "I understand the risk. Continue?" "n"; then
+                    pause
+                    continue
+                fi
+                if ask_yes_no "Take safety DB backup before deletion?" "y"; then
+                    safety_backup_db_before_cleanup
+                fi
+                echo
+                print_info "Dry-run preview:"
+                db_user_cleanup_python "delete_inactive_all" "$days" 1 0 "$ocp"
+                echo
+                if ask_yes_no "Apply deletion now?" "n"; then
+                    db_user_cleanup_python "delete_inactive_all" "$days" 1 1 "$ocp"
+                fi
+                pause
+                ;;
+            7)
+                vacuum_database
+                pause
+                ;;
+            0)
+                return 0
+                ;;
+            *)
+                echo "Invalid choice"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+
 master_menu() {
     while true; do
         clear
@@ -3110,6 +3471,7 @@ master_menu() {
         echo "24) Uninstall master"
         echo "25) Bulk traffic / quota menu"
         echo "26) Group quota / new group menu"
+        echo "27) Database user cleanup / ocpasswd prune menu"
         echo "0) Back"
         echo
         read -rp "Select: " choice
@@ -3145,6 +3507,7 @@ master_menu() {
             24) uninstall_master; pause ;;
             25) bulk_traffic_menu ;;
             26) group_quota_menu ;;
+            27) db_user_cleanup_menu ;;
             0) return 0 ;;
             *) echo "Invalid choice"; sleep 1 ;;
         esac
