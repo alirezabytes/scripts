@@ -17,7 +17,7 @@ set -Euo pipefail
 : "${FRP_DEBUG:=0}"
 trap 's=$?; if [[ "${FRP_DEBUG}" == 1 ]]; then echo "[ERROR] line $LINENO: $BASH_COMMAND -> exit $s"; fi' ERR
 
-SCRIPT_VERSION="2.5.1-multiversion-multitunnel-fix"
+SCRIPT_VERSION="2.5.2-multiversion-multitunnel-awk-fix"
 BASE_DIR="${FRP_BASE_DIR:-$(pwd)/frp}"
 BIN_FRPS="/usr/local/bin/frps"
 BIN_FRPC="/usr/local/bin/frpc"
@@ -776,7 +776,25 @@ write_frpc_with_blocks(){
 
 field_from_block(){
   local blk="$1" key="$2"
-  echo "$blk" | awk -F'=' -v k="$key" '$1 ~ "^"k"[[:space:]]*$" {gsub(/[ \"\[\]]/,"",$2); print $2; exit}'
+  # Parse simple TOML key/value lines without invalid awk regex escapes.
+  # This removes awk warnings like: regexp escape sequence `\"` is not a known regexp operator.
+  echo "$blk" | awk -F'=' -v k="$key" '
+    {
+      lhs = $1
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", lhs)
+      if (lhs == k) {
+        val = $0
+        sub(/^[^=]*=/, "", val)
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", val)
+        gsub(/^\[/, "", val)
+        gsub(/\]$/, "", val)
+        gsub(/^"/, "", val)
+        gsub(/"$/, "", val)
+        gsub(/"/, "", val)
+        print val
+        exit
+      }
+    }'
 }
 
 print_proxy_list(){
