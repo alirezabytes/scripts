@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# ocserv-central-manager v9
-# Adds DB user cleanup/prune menu: compare DB users with ocpasswd, delete stale users safely, and cleanup inactive users.
-# Keeps v8 support for ocpasswd group '*' as unlimited sessions.
+# ocserv-central-manager v12
+# Adds safer remaining_bytes calculation, recommended backup, default usage_log cleanup, and API restart menu.
+# Keeps v10 exhausted-quota tools, v9 DB cleanup/prune, and v8 unlimited group support.
 # ocserv-central-manager.sh
 # Central concurrent-session and quota controller for multiple ocserv nodes.
 # Target OS: Ubuntu 24.x
@@ -488,28 +488,8 @@ def account_is_expired(username: str) -> bool:
 def exhausted_log_path():
     return load_limits().get("exhausted_log_path") or EXHAUSTED_LOG_DEFAULT
 
-def log_quota_exhausted(username: str, groupname: str | None, used_bytes: int, quota_bytes: int, reason: str):
-    limits = load_limits()
-    if not bool(limits.get("features", {}).get("exhausted_log_enabled", True)):
-        return
-    path = exhausted_log_path()
-    Path(path).parent.mkdir(parents=True, exist_ok=True)
-
-    # Avoid endless duplicate spam. If username already exists in the file, do not add again.
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as f:
-                for line in f:
-                    try:
-                        obj = json.loads(line)
-                        if obj.get("username") == username:
-                            return
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-
-    item = {
+def make_exhausted_item(username: str, groupname: str | None, used_bytes: int, quota_bytes: int, reason: str):
+    return {
         "time": now(),
         "username": username,
         "groupname": groupname,
@@ -517,28 +497,145 @@ def log_quota_exhausted(username: str, groupname: str | None, used_bytes: int, q
         "quota_bytes": int(quota_bytes or 0),
         "reason": reason,
     }
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+def read_exhausted_items_dedup(path: str):
+    """
+    Read exhausted log and return one item per username.
+    If a username appears multiple times, keep the newest record by time.
+    Invalid/raw lines are preserved only if they do not look like JSON user rows.
+    """
+    by_user: dict[str, dict] = {}
+    raw_items: list[dict] = []
+
+    if not os.path.exists(path):
+        return [], {"read": 0, "valid": 0, "raw": 0, "duplicates_removed": 0}
+
+    read_count = 0
+    valid_count = 0
+    raw_count = 0
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                read_count += 1
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    username = obj.get("username")
+                    if username:
+                        valid_count += 1
+                        prev = by_user.get(username)
+                        if not prev or int(obj.get("time") or 0) >= int(prev.get("time") or 0):
+                            by_user[username] = obj
+                    else:
+                        raw_count += 1
+                        raw_items.append({"raw": line})
+                except Exception:
+                    raw_count += 1
+                    raw_items.append({"raw": line})
+    except Exception:
+        return [], {"read": read_count, "valid": valid_count, "raw": raw_count, "duplicates_removed": 0}
+
+    items = list(by_user.values()) + raw_items
+    items.sort(key=lambda x: (str(x.get("username") or x.get("raw") or ""), int(x.get("time") or 0)))
+    duplicates_removed = max(0, valid_count - len(by_user))
+    return items, {"read": read_count, "valid": valid_count, "raw": raw_count, "duplicates_removed": duplicates_removed}
+
+def write_exhausted_items(path: str, items: list[dict]):
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        for item in items:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+
+def user_is_quota_exhausted(username: str, groupname: str | None = None):
+    row = get_user_from_db(username)
+    if not row:
+        return False, None
+    g = groupname or row["groupname"]
+    _, quota_bytes = effective_limits(username, g)
+    used = int(row["used_bytes"] or 0)
+    exhausted = quota_bytes > 0 and used >= quota_bytes
+    return exhausted, make_exhausted_item(username, g, used, quota_bytes, "rebuild quota exceeded")
+
+def log_quota_exhausted(username: str, groupname: str | None, used_bytes: int, quota_bytes: int, reason: str):
+    limits = load_limits()
+    if not bool(limits.get("features", {}).get("exhausted_log_enabled", True)):
+        return
+
+    path = exhausted_log_path()
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+
+    item = make_exhausted_item(username, groupname, used_bytes, quota_bytes, reason)
+
+    # Upsert, not append-spam:
+    # - If username already exists, update the existing record.
+    # - If the file has duplicates, dedupe it automatically.
+    items, _stats = read_exhausted_items_dedup(path)
+    by_user = {}
+    raw_items = []
+    for old in items:
+        if old.get("username"):
+            by_user[old["username"]] = old
+        else:
+            raw_items.append(old)
+
+    by_user[username] = item
+
+    final_items = list(by_user.values()) + raw_items
+    final_items.sort(key=lambda x: (str(x.get("username") or x.get("raw") or ""), int(x.get("time") or 0)))
+    write_exhausted_items(path, final_items)
 
 def remove_from_exhausted_log(username: str):
     path = exhausted_log_path()
     if not os.path.exists(path):
         return
-    kept = []
+
     try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                try:
-                    obj = json.loads(line)
-                    if obj.get("username") == username:
-                        continue
-                except Exception:
-                    pass
-                kept.append(line)
-        with open(path, "w", encoding="utf-8") as f:
-            f.writelines(kept)
+        items, _stats = read_exhausted_items_dedup(path)
+        kept = [item for item in items if item.get("username") != username]
+        write_exhausted_items(path, kept)
     except Exception:
         return
+
+def rebuild_exhausted_log_from_db():
+    path = exhausted_log_path()
+    items = []
+    with db() as con:
+        rows = con.execute("SELECT username, groupname, used_bytes FROM users ORDER BY username").fetchall()
+
+    for row in rows:
+        username = row["username"]
+        exhausted, item = user_is_quota_exhausted(username, row["groupname"])
+        if exhausted and item:
+            item["reason"] = "rebuild current quota exceeded"
+            items.append(item)
+
+    write_exhausted_items(path, items)
+    return {"ok": True, "path": path, "count": len(items), "action": "rebuild_from_db"}
+
+def prune_resolved_exhausted_log():
+    path = exhausted_log_path()
+    items, stats = read_exhausted_items_dedup(path)
+    kept = []
+    removed = 0
+
+    for item in items:
+        username = item.get("username")
+        if not username:
+            kept.append(item)
+            continue
+        exhausted, new_item = user_is_quota_exhausted(username, item.get("groupname"))
+        if exhausted and new_item:
+            # Keep fresh used/quota values.
+            new_item["reason"] = item.get("reason") or "quota exceeded"
+            kept.append(new_item)
+        else:
+            removed += 1
+
+    write_exhausted_items(path, kept)
+    return {"ok": True, "path": path, "kept": len(kept), "removed_resolved": removed, "dedupe_stats": stats, "action": "prune_resolved"}
 
 def update_node(node_id: str, request: Request | None = None, sessions_count: int = 0):
     ip = None
@@ -813,10 +910,28 @@ def user_status(username: str, x_api_token: str | None = Header(default=None)):
         sessions = con.execute("SELECT node_id, ocserv_id, groupname, ip_real, ip_remote, started_at, last_seen, active FROM sessions WHERE username=? AND active=1", (username,)).fetchall()
 
     max_sessions, quota_bytes = effective_limits(username, user["groupname"] if user else None)
-    used = int(user["used_bytes"] or 0) if user else 0
+    used = max(0, int(user["used_bytes"] or 0)) if user else 0
+    quota_unlimited = quota_bytes <= 0
+    remaining_bytes = None if quota_unlimited else max(0, int(quota_bytes) - used)
+    exhausted = False if quota_unlimited else used >= int(quota_bytes)
+
+    # Backward compatibility:
+    # - remaining_bytes used to be 0 for unlimited quota. That was ambiguous.
+    # - v11 returns null for unlimited and also adds remaining_bytes_compat=0.
     return {
         "user": dict(user) if user else None,
-        "limits": {"max_sessions": max_sessions, "quota_bytes": quota_bytes, "remaining_bytes": (quota_bytes - used if quota_bytes > 0 else 0)},
+        "limits": {
+            "max_sessions": max_sessions,
+            "quota_bytes": int(quota_bytes),
+            "used_bytes": used,
+            "remaining_bytes": remaining_bytes,
+            "remaining_bytes_compat": 0 if remaining_bytes is None else remaining_bytes,
+            "quota_unlimited": quota_unlimited,
+            "exhausted": exhausted,
+            "quota_gib": (round(int(quota_bytes) / GIB, 6) if quota_bytes > 0 else None),
+            "used_gib": round(used / GIB, 6),
+            "remaining_gib": (round(remaining_bytes / GIB, 6) if remaining_bytes is not None else None),
+        },
         "expired": account_is_expired(username),
         "active_sessions": [dict(x) for x in sessions]
     }
@@ -992,18 +1107,13 @@ def bulk_reset_usage_all_users(x_api_token: str | None = Header(default=None)):
 def quota_exhausted(x_api_token: str | None = Header(default=None)):
     auth(x_api_token)
     path = exhausted_log_path()
-    items = []
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    items.append(json.loads(line))
-                except Exception:
-                    items.append({"raw": line})
-    return {"path": path, "count": len(items), "items": items}
+    items, stats = read_exhausted_items_dedup(path)
+
+    # If duplicates exist, clean them immediately so list output and file match.
+    if stats.get("duplicates_removed", 0) > 0:
+        write_exhausted_items(path, items)
+
+    return {"path": path, "count": len(items), "dedupe_stats": stats, "items": items}
 
 @app.post("/quota-exhausted/reset")
 def quota_exhausted_reset(x_api_token: str | None = Header(default=None)):
@@ -1011,7 +1121,30 @@ def quota_exhausted_reset(x_api_token: str | None = Header(default=None)):
     path = exhausted_log_path()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     open(path, "w", encoding="utf-8").close()
-    return {"ok": True, "path": path, "action": "reset"}
+    return {
+        "ok": True,
+        "path": path,
+        "action": "reset_empty",
+        "note": "This only clears the file. Users that are still over quota can be logged again on the next connect/heartbeat."
+    }
+
+@app.post("/quota-exhausted/dedupe")
+def quota_exhausted_dedupe(x_api_token: str | None = Header(default=None)):
+    auth(x_api_token)
+    path = exhausted_log_path()
+    items, stats = read_exhausted_items_dedup(path)
+    write_exhausted_items(path, items)
+    return {"ok": True, "path": path, "count": len(items), "dedupe_stats": stats, "action": "dedupe"}
+
+@app.post("/quota-exhausted/rebuild")
+def quota_exhausted_rebuild(x_api_token: str | None = Header(default=None)):
+    auth(x_api_token)
+    return rebuild_exhausted_log_from_db()
+
+@app.post("/quota-exhausted/prune-resolved")
+def quota_exhausted_prune_resolved(x_api_token: str | None = Header(default=None)):
+    auth(x_api_token)
+    return prune_resolved_exhausted_log()
 
 @app.post("/quota-exhausted/delete")
 def quota_exhausted_delete(x_api_token: str | None = Header(default=None)):
@@ -1731,6 +1864,17 @@ master_status() {
     curl -sS http://127.0.0.1:8088/health 2>/dev/null | jq . || print_warn "API not responding."
 }
 
+restart_master_api() {
+    need_root
+    print_info "Restarting ocserv-central API..."
+    systemctl restart ocserv-central
+    sleep 1
+    systemctl status ocserv-central --no-pager || true
+    echo
+    print_info "Health:"
+    curl -sS http://127.0.0.1:8088/health 2>/dev/null | jq . || print_warn "API not responding after restart. Check: journalctl -u ocserv-central -n 100 --no-pager"
+}
+
 node_status() {
     echo
     print_info "Node config:"
@@ -1882,8 +2026,62 @@ reset_quota_exhausted_file() {
     master_curl "POST" "/quota-exhausted/reset" "{}"
 }
 
+dedupe_quota_exhausted_file() {
+    master_curl "POST" "/quota-exhausted/dedupe" "{}"
+}
+
+rebuild_quota_exhausted_file() {
+    master_curl "POST" "/quota-exhausted/rebuild" "{}"
+}
+
+prune_resolved_quota_exhausted_file() {
+    master_curl "POST" "/quota-exhausted/prune-resolved" "{}"
+}
+
 delete_quota_exhausted_file() {
     master_curl "POST" "/quota-exhausted/delete" "{}"
+}
+
+exhausted_quota_file_menu() {
+    while true; do
+        clear
+        echo "==== Ocserv Central - Exhausted Quota File Tools ===="
+        echo "1) List exhausted-quota users, auto-dedupe if duplicates exist"
+        echo "2) Reset file only, empty it"
+        echo "3) Dedupe file only, keep one row per username"
+        echo "4) Rebuild file from current DB state, only users still really over quota"
+        echo "5) Prune resolved users, remove users that are no longer over quota"
+        echo "6) Delete exhausted-quota file"
+        echo "0) Back"
+        echo
+        echo "Important:"
+        echo "- Reset only clears the report file."
+        echo "- If a user is still over quota, they can be logged again on next connect/heartbeat."
+        echo "- Rebuild is usually the cleanest option after changing quotas or adding traffic."
+        echo
+        read -rp "Select: " choice
+        case "$choice" in
+            1) list_quota_exhausted; pause ;;
+            2)
+                print_warn "This only empties the file. It does not reset user usage or add traffic."
+                if ask_yes_no "Continue reset-empty?" "n"; then
+                    reset_quota_exhausted_file
+                fi
+                pause
+                ;;
+            3) dedupe_quota_exhausted_file; pause ;;
+            4) rebuild_quota_exhausted_file; pause ;;
+            5) prune_resolved_quota_exhausted_file; pause ;;
+            6)
+                if ask_yes_no "Delete exhausted-quota file?" "n"; then
+                    delete_quota_exhausted_file
+                fi
+                pause
+                ;;
+            0) return 0 ;;
+            *) echo "Invalid choice"; sleep 1 ;;
+        esac
+    done
 }
 
 human_size() {
@@ -2064,6 +2262,29 @@ backup_master_lightweight() {
     print_ok "Lightweight backup saved: $out"
     print_info "This backup does NOT include usage_log history."
     print_info "It DOES include used_bytes, extra traffic, account expiry, disabled status, limits and node info."
+    ls -lh "$out" 2>/dev/null || true
+}
+
+backup_master_recommended_default() {
+    need_root
+    local out tmp
+    out="/root/ocserv-central-recommended-light-$(date +%Y%m%d-%H%M%S).tar.gz"
+
+    print_info "Recommended default backup selected."
+    print_info "This is a lightweight backup with NO usage_log history and NO active sessions."
+    print_info "It DOES keep users.used_bytes, quota_extra_bytes, expires_at, disabled, limits.json, groups and user overrides."
+    print_info "So if a user had 100GB quota and used 40GB, the restored DB still knows used_bytes=40GB."
+
+    tmp="$(make_temp_backup_root)"
+    copy_master_common_to_tmp "$tmp"
+    sqlite_backup_to_tmp "$tmp" "light" "no"
+    write_backup_metadata "$tmp" "recommended-lightweight-no-usage-log-no-sessions"
+
+    mkdir -p "$(dirname "$out")"
+    tar -czf "$out" -C "$tmp" .
+    rm -rf "$tmp"
+
+    print_ok "Recommended backup saved: $out"
     ls -lh "$out" 2>/dev/null || true
 }
 
@@ -2252,6 +2473,40 @@ cleanup_usage_logs() {
     usage_log_stats
 }
 
+cleanup_usage_log_default_now() {
+    need_root
+    local db before after cutoff
+    db="$(db_path)"
+
+    if [[ ! -f "$db" ]]; then
+        print_err "Database not found: $db"
+        return 1
+    fi
+
+    usage_log_stats
+    echo
+    print_warn "Default immediate cleanup + VACUUM will delete ALL usage_log rows from now and before."
+    print_warn "It will NOT reset users.used_bytes, quota_extra_bytes, expires_at, disabled, limits.json or group/user quotas."
+    print_info "This is useful when you only need current total usage, not detailed history."
+
+    if ! ask_yes_no "Continue with default immediate usage_log cleanup?" "n"; then
+        return 0
+    fi
+
+    if ask_yes_no "Take recommended lightweight backup first?" "y"; then
+        backup_master_recommended_default
+    fi
+
+    before="$(sqlite3 "$db" "SELECT COUNT(*) FROM usage_log;" 2>/dev/null || echo 0)"
+    cutoff="$(date +%s)"
+    sqlite3 "$db" "DELETE FROM usage_log WHERE created_at <= $cutoff;"
+    after="$(sqlite3 "$db" "SELECT COUNT(*) FROM usage_log;" 2>/dev/null || echo 0)"
+
+    print_ok "Default cleanup done. usage_log rows: before=$before after=$after"
+    print_info "Database file size may not shrink until you run VACUUM. For large cleanup, run option 9 later."
+    print_info "Current user usage remains stored in users.used_bytes."
+}
+
 vacuum_database() {
     need_root
     local db
@@ -2422,6 +2677,52 @@ show_cleanup_timer_status() {
     journalctl -t ocserv-central-cleanup -n 80 --no-pager || true
 }
 
+
+default_cleanup_usage_log_with_vacuum() {
+    need_root
+    local db="$DB_DIR/central.db"
+    if [[ ! -f "$db" ]]; then
+        print_err "Database not found: $db"
+        return 1
+    fi
+
+    print_warn "This default cleanup will delete ALL usage_log history and then run VACUUM."
+    print_info "It does NOT reset users.used_bytes."
+    print_info "It does NOT delete account expiry, extra traffic, disabled status, users, groups, or limits."
+    print_info "Only detailed usage_log history is removed. Final user usage remains in users.used_bytes."
+    echo
+
+    if ! ask_yes_no "Take lightweight backup before default cleanup + VACUUM?" "y"; then
+        print_warn "Continuing without backup."
+    else
+        backup_master_lightweight
+    fi
+
+    if ! ask_yes_no "Continue default cleanup now?" "n"; then
+        return 0
+    fi
+
+    print_info "Stopping ocserv-central API for safer cleanup and VACUUM..."
+    systemctl stop ocserv-central >/dev/null 2>&1 || true
+
+    local before after
+    before="$(sqlite3 "$db" "SELECT COUNT(*) FROM usage_log;" 2>/dev/null || echo 0)"
+
+    print_info "Deleting usage_log rows..."
+    sqlite3 "$db" "DELETE FROM usage_log;" || true
+
+    after="$(sqlite3 "$db" "SELECT COUNT(*) FROM usage_log;" 2>/dev/null || echo 0)"
+
+    print_info "Running VACUUM to compact database file..."
+    sqlite3 "$db" "VACUUM;" || true
+
+    print_info "Starting ocserv-central API..."
+    systemctl start ocserv-central >/dev/null 2>&1 || true
+
+    print_ok "Default cleanup + VACUUM completed. usage_log rows: before=$before after=$after"
+    ls -lh "$db" 2>/dev/null || true
+}
+
 backup_cleanup_menu() {
     while true; do
         clear
@@ -2434,10 +2735,13 @@ backup_cleanup_menu() {
         echo "6) Custom backup"
         echo "7) Restore backup"
         echo "8) Cleanup old usage_log records manually"
+        echo "13) Default cleanup now: delete usage_log + VACUUM"
         echo "9) VACUUM / compact database"
         echo "10) Configure automatic usage_log cleanup timer"
         echo "11) Disable automatic cleanup timer"
         echo "12) Show automatic cleanup timer status/logs"
+        echo "13) RECOMMENDED default backup: lightweight, keeps current usage, removes usage_log history"
+        echo "14) DEFAULT cleanup now: delete all usage_log history up to now"
         echo "0) Back"
         echo
         read -rp "Select: " choice
@@ -2450,10 +2754,13 @@ backup_cleanup_menu() {
             6) backup_master_custom; pause ;;
             7) restore_master_data; pause ;;
             8) cleanup_usage_logs; pause ;;
+            13) default_cleanup_usage_log_with_vacuum; pause ;;
             9) vacuum_database; pause ;;
             10) configure_auto_cleanup_timer; pause ;;
             11) disable_auto_cleanup_timer; pause ;;
             12) show_cleanup_timer_status; pause ;;
+            13) backup_master_recommended_default; pause ;;
+            14) cleanup_usage_log_default_now; pause ;;
             0) return 0 ;;
             *) echo "Invalid choice"; sleep 1 ;;
         esac
@@ -3462,7 +3769,7 @@ master_menu() {
         echo "15) Enable/disable user"
         echo "16) List connected nodes / API servers"
         echo "17) List exhausted-quota users"
-        echo "18) Reset exhausted-quota file"
+        echo "18) Exhausted-quota file tools: reset / dedupe / rebuild"
         echo "19) Delete exhausted-quota file"
         echo "20) Status"
         echo "21) Show current limits.json"
@@ -3472,6 +3779,7 @@ master_menu() {
         echo "25) Bulk traffic / quota menu"
         echo "26) Group quota / new group menu"
         echo "27) Database user cleanup / ocpasswd prune menu"
+        echo "28) Restart ocserv-central API"
         echo "0) Back"
         echo
         read -rp "Select: " choice
@@ -3498,7 +3806,7 @@ master_menu() {
             15) toggle_user_disabled; pause ;;
             16) list_nodes; pause ;;
             17) list_quota_exhausted; pause ;;
-            18) reset_quota_exhausted_file; pause ;;
+            18) exhausted_quota_file_menu ;;
             19) delete_quota_exhausted_file; pause ;;
             20) master_status; pause ;;
             21) ensure_limits_file; jq . "$MASTER_ETC/limits.json"; pause ;;
@@ -3508,6 +3816,7 @@ master_menu() {
             25) bulk_traffic_menu ;;
             26) group_quota_menu ;;
             27) db_user_cleanup_menu ;;
+            28) restart_master_api; pause ;;
             0) return 0 ;;
             *) echo "Invalid choice"; sleep 1 ;;
         esac
