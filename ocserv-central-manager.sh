@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ocserv-central-manager v12
+# ocserv-central-manager v13
 # Adds safer remaining_bytes calculation, recommended backup, default usage_log cleanup, and API restart menu.
 # Keeps v10 exhausted-quota tools, v9 DB cleanup/prune, and v8 unlimited group support.
 # ocserv-central-manager.sh
@@ -430,6 +430,21 @@ def get_user_group_from_db(username: str) -> str | None:
     row = get_user_from_db(username)
     return row["groupname"] if row else None
 
+def authoritative_group_for_user(username: str, fallback_group: str | None = None) -> str | None:
+    """
+    Always prefer the group stored in central DB after sync_ocpasswd_to_db().
+
+    Why: ocserv/occtl can keep reporting the group that existed when a session started.
+    If the admin changes a user from group1 to group2 in ocpasswd, quota/session
+    checks must use the new ocpasswd-backed group immediately, not the stale session group.
+    """
+    db_group = get_user_group_from_db(username)
+    if db_group:
+        return db_group
+    if fallback_group:
+        return pick_primary_group(fallback_group)
+    return None
+
 def effective_limits(username: str, groupname: str | None):
     if not groupname:
         groupname = get_user_group_from_db(username)
@@ -732,6 +747,12 @@ def sync_ocpasswd(x_api_token: str | None = Header(default=None)):
     auth(x_api_token)
     return sync_ocpasswd_to_db()
 
+@app.post("/refresh-now")
+def refresh_now(x_api_token: str | None = Header(default=None)):
+    auth(x_api_token)
+    result = sync_ocpasswd_to_db()
+    return {"ok": True, "action": "sync_ocpasswd_and_reload_limits", "sync": result, "note": "limits.json is read on every quota/session check; API restart is not required for group/quota edits."}
+
 @app.post("/connect")
 def connect(req: ConnectReq, request: Request, x_api_token: str | None = Header(default=None)):
     auth(x_api_token)
@@ -739,8 +760,9 @@ def connect(req: ConnectReq, request: Request, x_api_token: str | None = Header(
     sync_ocpasswd_to_db()
     update_node(req.node_id, request, 0)
 
-    if not req.groupname:
-        req.groupname = get_user_group_from_db(req.username)
+    # v13: ocpasswd/central DB is authoritative for group changes.
+    # Do not trust a stale GROUPNAME coming from ocserv/session state.
+    req.groupname = authoritative_group_for_user(req.username, req.groupname)
 
     max_sessions, quota_bytes = effective_limits(req.username, req.groupname)
 
@@ -803,6 +825,8 @@ def disconnect(req: DisconnectReq, request: Request, x_api_token: str | None = H
     auth(x_api_token)
     t = now()
     total = max(0, int(req.bytes_in) + int(req.bytes_out))
+    # v13: refresh ocpasswd-backed group before final quota/exhausted checks.
+    sync_ocpasswd_to_db()
     update_node(req.node_id, request, 0)
 
     with db() as con:
@@ -841,8 +865,9 @@ def heartbeat(req: HeartbeatReq, request: Request, x_api_token: str | None = Hea
 
         for s in req.sessions:
             seen_ids.add(s.ocserv_id)
-            if not s.groupname:
-                s.groupname = get_user_group_from_db(s.username)
+            # v13: always use ocpasswd-backed DB group if available.
+            # This makes group changes apply on the next heartbeat without deleting/re-adding user.
+            s.groupname = authoritative_group_for_user(s.username, s.groupname)
 
             con.execute(
                 """
@@ -851,6 +876,8 @@ def heartbeat(req: HeartbeatReq, request: Request, x_api_token: str | None = Hea
                 """,
                 (s.username, s.groupname, t)
             )
+            if s.groupname:
+                con.execute("UPDATE users SET groupname=?, updated_at=? WHERE username=?", (s.groupname, t, s.username))
 
             old = con.execute("SELECT last_total_bytes FROM sessions WHERE node_id=? AND ocserv_id=?", (req.node_id, s.ocserv_id)).fetchone()
             old_total = old["last_total_bytes"] if old else 0
@@ -933,6 +960,7 @@ def user_status(username: str, x_api_token: str | None = Header(default=None)):
             "remaining_gib": (round(remaining_bytes / GIB, 6) if remaining_bytes is not None else None),
         },
         "expired": account_is_expired(username),
+        "current_group_authoritative": user["groupname"] if user else None,
         "active_sessions": [dict(x) for x in sessions]
     }
 
@@ -1899,6 +1927,10 @@ node_status() {
 
 sync_ocpasswd_now() {
     master_curl "POST" "/sync-ocpasswd" "{}"
+}
+
+refresh_now_menu() {
+    master_curl "POST" "/refresh-now" "{}"
 }
 
 list_users() {
@@ -3780,6 +3812,7 @@ master_menu() {
         echo "26) Group quota / new group menu"
         echo "27) Database user cleanup / ocpasswd prune menu"
         echo "28) Restart ocserv-central API"
+        echo "29) Refresh ocpasswd groups / apply current limits now"
         echo "0) Back"
         echo
         read -rp "Select: " choice
@@ -3817,6 +3850,7 @@ master_menu() {
             26) group_quota_menu ;;
             27) db_user_cleanup_menu ;;
             28) restart_master_api; pause ;;
+            29) refresh_now_menu; pause ;;
             0) return 0 ;;
             *) echo "Invalid choice"; sleep 1 ;;
         esac
