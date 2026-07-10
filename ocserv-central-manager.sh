@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# ocserv-central-manager v13
-# Adds safer remaining_bytes calculation, recommended backup, default usage_log cleanup, and API restart menu.
-# Keeps v10 exhausted-quota tools, v9 DB cleanup/prune, and v8 unlimited group support.
+# ocserv-central-manager v15
+# Adds exact pre-reset usage snapshots, usage_log recovery tools, and group-aware user quota override handling.
+# Keeps v13 authoritative group refresh, v12 cleanup+VACUUM, v10 exhausted tools, v9 DB prune, and v8 unlimited groups.
 # ocserv-central-manager.sh
 # Central concurrent-session and quota controller for multiple ocserv nodes.
 # Target OS: Ubuntu 24.x
@@ -180,6 +180,7 @@ import os
 import re
 import sqlite3
 import time
+import uuid
 from pathlib import Path
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
@@ -193,7 +194,7 @@ DISABLE_MISSING_USERS = os.getenv("DISABLE_MISSING_USERS", "0") == "1"
 EXHAUSTED_LOG_DEFAULT = os.getenv("EXHAUSTED_LOG_PATH", "/var/lib/ocserv-central/quota_exhausted_users.jsonl")
 GIB = 1024 * 1024 * 1024
 
-app = FastAPI(title="ocserv-central", version="1.1")
+app = FastAPI(title="ocserv-central", version="1.5")
 
 def now() -> int:
     return int(time.time())
@@ -268,6 +269,145 @@ def init_db():
             updated_at INTEGER NOT NULL
         )
         """)
+
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS usage_reset_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            target TEXT,
+            username TEXT NOT NULL,
+            old_used_bytes INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            note TEXT
+        )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_usage_reset_snapshots_batch ON usage_reset_snapshots(batch_id)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_usage_reset_snapshots_created ON usage_reset_snapshots(created_at)")
+
+        con.execute("""
+        CREATE TABLE IF NOT EXISTS extra_traffic_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            target TEXT,
+            username TEXT NOT NULL,
+            old_extra_bytes INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            operation TEXT NOT NULL,
+            note TEXT
+        )
+        """)
+        con.execute("CREATE INDEX IF NOT EXISTS idx_extra_traffic_snapshots_batch ON extra_traffic_snapshots(batch_id)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_extra_traffic_snapshots_created ON extra_traffic_snapshots(created_at)")
+
+
+def create_usage_reset_snapshot(con, scope: str, target: str | None = None, usernames: list[str] | None = None, note: str = ""):
+    """Save exact used_bytes values before a destructive reset."""
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS usage_reset_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            target TEXT,
+            username TEXT NOT NULL,
+            old_used_bytes INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            note TEXT
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_usage_reset_snapshots_batch ON usage_reset_snapshots(batch_id)")
+    t = now()
+    batch_id = f"reset-{t}-{uuid.uuid4().hex[:10]}"
+
+    if usernames is None:
+        rows = con.execute("SELECT username, used_bytes FROM users ORDER BY username").fetchall()
+    elif not usernames:
+        rows = []
+    else:
+        placeholders = ",".join("?" for _ in usernames)
+        rows = con.execute(
+            f"SELECT username, used_bytes FROM users WHERE username IN ({placeholders}) ORDER BY username",
+            usernames,
+        ).fetchall()
+
+    con.executemany(
+        """
+        INSERT INTO usage_reset_snapshots(batch_id, scope, target, username, old_used_bytes, created_at, note)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (batch_id, scope, target, row["username"], int(row["used_bytes"] or 0), t, note)
+            for row in rows
+        ],
+    )
+    return batch_id, len(rows)
+
+
+def create_extra_traffic_snapshot(
+    con,
+    scope: str,
+    target: str | None = None,
+    usernames: list[str] | None = None,
+    operation: str = "change",
+    note: str = "",
+):
+    """Save exact quota_extra_bytes values before add/decrease/set/clear operations."""
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS extra_traffic_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            target TEXT,
+            username TEXT NOT NULL,
+            old_extra_bytes INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            operation TEXT NOT NULL,
+            note TEXT
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_extra_traffic_snapshots_batch ON extra_traffic_snapshots(batch_id)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_extra_traffic_snapshots_created ON extra_traffic_snapshots(created_at)")
+
+    t = now()
+    batch_id = f"extra-{t}-{uuid.uuid4().hex[:10]}"
+
+    if usernames is None:
+        rows = con.execute(
+            "SELECT username, quota_extra_bytes FROM users ORDER BY username"
+        ).fetchall()
+    elif not usernames:
+        rows = []
+    else:
+        placeholders = ",".join("?" for _ in usernames)
+        rows = con.execute(
+            f"SELECT username, quota_extra_bytes FROM users WHERE username IN ({placeholders}) ORDER BY username",
+            usernames,
+        ).fetchall()
+
+    con.executemany(
+        """
+        INSERT INTO extra_traffic_snapshots(
+            batch_id, scope, target, username, old_extra_bytes, created_at, operation, note
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (
+                batch_id,
+                scope,
+                target,
+                row["username"],
+                int(row["quota_extra_bytes"] or 0),
+                t,
+                operation,
+                note,
+            )
+            for row in rows
+        ],
+    )
+    return batch_id, len(rows)
+
 
 def default_limits():
     return {
@@ -999,9 +1139,18 @@ def list_nodes(x_api_token: str | None = Header(default=None)):
 def reset_usage(req: UsageResetReq, x_api_token: str | None = Header(default=None)):
     auth(x_api_token)
     with db() as con:
+        batch_id, snap_count = create_usage_reset_snapshot(
+            con, "user", req.username, [req.username], "API single-user usage reset"
+        )
         con.execute("UPDATE users SET used_bytes=0, updated_at=? WHERE username=?", (now(), req.username))
     remove_from_exhausted_log(req.username)
-    return {"ok": True, "username": req.username, "used_bytes": 0}
+    return {
+        "ok": True,
+        "username": req.username,
+        "used_bytes": 0,
+        "snapshot_batch_id": batch_id,
+        "snapshot_users": snap_count,
+    }
 
 @app.post("/toggle-user")
 def toggle_user(req: UserToggleReq, x_api_token: str | None = Header(default=None)):
@@ -1017,18 +1166,134 @@ def toggle_user(req: UserToggleReq, x_api_token: str | None = Header(default=Non
 @app.post("/add-traffic")
 def add_traffic(req: AddTrafficReq, x_api_token: str | None = Header(default=None)):
     auth(x_api_token)
+    if float(req.gb) <= 0:
+        raise HTTPException(status_code=400, detail="gb must be greater than zero")
+
+    sync_ocpasswd_to_db()
     add_bytes = int(float(req.gb) * GIB)
+    t = now()
+
     with db() as con:
         con.execute("""
-            INSERT INTO users(username, used_bytes, disabled, updated_at, quota_extra_bytes, expires_at)
-            VALUES (?, 0, 0, ?, ?, 0)
-            ON CONFLICT(username) DO UPDATE SET
-                quota_extra_bytes = quota_extra_bytes + excluded.quota_extra_bytes,
-                updated_at = excluded.updated_at
-        """, (req.username, now(), add_bytes))
-        row = con.execute("SELECT username, quota_extra_bytes FROM users WHERE username=?", (req.username,)).fetchone()
-    remove_from_exhausted_log(req.username)
-    return {"ok": True, "username": req.username, "added_gb": req.gb, "quota_extra_bytes": row["quota_extra_bytes"]}
+            INSERT OR IGNORE INTO users(
+                username, used_bytes, disabled, updated_at, quota_extra_bytes, expires_at
+            )
+            VALUES (?, 0, 0, ?, 0, 0)
+        """, (req.username, t))
+
+        before = con.execute(
+            "SELECT quota_extra_bytes FROM users WHERE username=?",
+            (req.username,),
+        ).fetchone()
+        old_extra = int(before["quota_extra_bytes"] or 0)
+
+        batch_id, snap_count = create_extra_traffic_snapshot(
+            con,
+            "user",
+            req.username,
+            [req.username],
+            "add",
+            f"Add {req.gb} GiB extra traffic",
+        )
+
+        new_extra = old_extra + add_bytes
+        con.execute(
+            "UPDATE users SET quota_extra_bytes=?, updated_at=? WHERE username=?",
+            (new_extra, t, req.username),
+        )
+
+    exhausted, item = user_is_quota_exhausted(req.username)
+    if exhausted and item:
+        log_quota_exhausted(
+            req.username,
+            item.get("groupname"),
+            item.get("used_bytes", 0),
+            item.get("quota_bytes", 0),
+            "quota still exceeded after adding extra traffic",
+        )
+    else:
+        remove_from_exhausted_log(req.username)
+
+    return {
+        "ok": True,
+        "username": req.username,
+        "requested_add_gb": float(req.gb),
+        "actual_added_bytes": add_bytes,
+        "old_extra_bytes": old_extra,
+        "new_extra_bytes": new_extra,
+        "old_extra_gib": round(old_extra / GIB, 6),
+        "new_extra_gib": round(new_extra / GIB, 6),
+        "snapshot_batch_id": batch_id,
+        "snapshot_users": snap_count,
+    }
+
+@app.post("/decrease-traffic")
+def decrease_traffic(req: AddTrafficReq, x_api_token: str | None = Header(default=None)):
+    auth(x_api_token)
+    if float(req.gb) <= 0:
+        raise HTTPException(status_code=400, detail="gb must be greater than zero")
+
+    sync_ocpasswd_to_db()
+    requested_bytes = int(float(req.gb) * GIB)
+    t = now()
+
+    with db() as con:
+        con.execute("""
+            INSERT OR IGNORE INTO users(
+                username, used_bytes, disabled, updated_at, quota_extra_bytes, expires_at
+            )
+            VALUES (?, 0, 0, ?, 0, 0)
+        """, (req.username, t))
+
+        before = con.execute(
+            "SELECT quota_extra_bytes FROM users WHERE username=?",
+            (req.username,),
+        ).fetchone()
+        old_extra = int(before["quota_extra_bytes"] or 0)
+
+        batch_id, snap_count = create_extra_traffic_snapshot(
+            con,
+            "user",
+            req.username,
+            [req.username],
+            "decrease",
+            f"Decrease {req.gb} GiB extra traffic",
+        )
+
+        actual_decreased = min(old_extra, requested_bytes)
+        new_extra = max(0, old_extra - requested_bytes)
+        con.execute(
+            "UPDATE users SET quota_extra_bytes=?, updated_at=? WHERE username=?",
+            (new_extra, t, req.username),
+        )
+
+    exhausted, item = user_is_quota_exhausted(req.username)
+    if exhausted and item:
+        log_quota_exhausted(
+            req.username,
+            item.get("groupname"),
+            item.get("used_bytes", 0),
+            item.get("quota_bytes", 0),
+            "quota exceeded after decreasing extra traffic",
+        )
+    else:
+        remove_from_exhausted_log(req.username)
+
+    return {
+        "ok": True,
+        "username": req.username,
+        "requested_decrease_gb": float(req.gb),
+        "requested_decrease_bytes": requested_bytes,
+        "actual_decreased_bytes": actual_decreased,
+        "actual_decreased_gib": round(actual_decreased / GIB, 6),
+        "old_extra_bytes": old_extra,
+        "new_extra_bytes": new_extra,
+        "old_extra_gib": round(old_extra / GIB, 6),
+        "new_extra_gib": round(new_extra / GIB, 6),
+        "clamped_at_zero": requested_bytes > old_extra,
+        "snapshot_batch_id": batch_id,
+        "snapshot_users": snap_count,
+    }
 
 @app.post("/set-expiry")
 def set_expiry(req: SetExpiryReq, x_api_token: str | None = Header(default=None)):
@@ -1083,53 +1348,167 @@ def bulk_remove_all_group_quota(x_api_token: str | None = Header(default=None)):
 @app.post("/bulk/add-traffic-all-users")
 def bulk_add_traffic_all_users(req: BulkTrafficReq, x_api_token: str | None = Header(default=None)):
     auth(x_api_token)
+    if float(req.gb) <= 0:
+        raise HTTPException(status_code=400, detail="gb must be greater than zero")
+
     sync_ocpasswd_to_db()
     add_bytes = int(float(req.gb) * GIB)
     t = now()
     with db() as con:
-        con.execute("UPDATE users SET quota_extra_bytes = quota_extra_bytes + ?, updated_at=?", (add_bytes, t))
-        count = con.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
-    if req.clear_exhausted:
-        path = exhausted_log_path()
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        open(path, "w", encoding="utf-8").close()
-    return {"ok": True, "users_updated": count, "added_gb": req.gb, "added_bytes": add_bytes, "exhausted_file_reset": bool(req.clear_exhausted)}
+        batch_id, snap_count = create_extra_traffic_snapshot(
+            con, "all", "all-users", None, "bulk-add", f"Add {req.gb} GiB to all users"
+        )
+        before_total = int(con.execute(
+            "SELECT COALESCE(SUM(quota_extra_bytes),0) AS total FROM users"
+        ).fetchone()["total"] or 0)
+        con.execute(
+            "UPDATE users SET quota_extra_bytes = quota_extra_bytes + ?, updated_at=?",
+            (add_bytes, t),
+        )
+        count = int(con.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"])
+        after_total = int(con.execute(
+            "SELECT COALESCE(SUM(quota_extra_bytes),0) AS total FROM users"
+        ).fetchone()["total"] or 0)
+
+    rebuild_result = rebuild_exhausted_log_from_db() if req.clear_exhausted else None
+    return {
+        "ok": True,
+        "users_updated": count,
+        "requested_add_gb": float(req.gb),
+        "added_bytes_per_user": add_bytes,
+        "before_total_extra_bytes": before_total,
+        "after_total_extra_bytes": after_total,
+        "snapshot_batch_id": batch_id,
+        "snapshot_users": snap_count,
+        "exhausted_rebuild": rebuild_result,
+    }
+
+@app.post("/bulk/decrease-traffic-all-users")
+def bulk_decrease_traffic_all_users(req: BulkTrafficReq, x_api_token: str | None = Header(default=None)):
+    auth(x_api_token)
+    if float(req.gb) <= 0:
+        raise HTTPException(status_code=400, detail="gb must be greater than zero")
+
+    sync_ocpasswd_to_db()
+    requested_bytes = int(float(req.gb) * GIB)
+    t = now()
+    with db() as con:
+        batch_id, snap_count = create_extra_traffic_snapshot(
+            con,
+            "all",
+            "all-users",
+            None,
+            "bulk-decrease",
+            f"Decrease {req.gb} GiB from all users",
+        )
+        before_total = int(con.execute(
+            "SELECT COALESCE(SUM(quota_extra_bytes),0) AS total FROM users"
+        ).fetchone()["total"] or 0)
+        affected = int(con.execute(
+            "SELECT COUNT(*) AS c FROM users WHERE quota_extra_bytes > 0"
+        ).fetchone()["c"])
+        con.execute(
+            """
+            UPDATE users
+            SET quota_extra_bytes =
+                CASE
+                    WHEN quota_extra_bytes > ? THEN quota_extra_bytes - ?
+                    ELSE 0
+                END,
+                updated_at=?
+            """,
+            (requested_bytes, requested_bytes, t),
+        )
+        count = int(con.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"])
+        after_total = int(con.execute(
+            "SELECT COALESCE(SUM(quota_extra_bytes),0) AS total FROM users"
+        ).fetchone()["total"] or 0)
+
+    rebuild_result = rebuild_exhausted_log_from_db()
+    return {
+        "ok": True,
+        "users_checked": count,
+        "users_with_extra_before_change": affected,
+        "requested_decrease_gb_per_user": float(req.gb),
+        "requested_decrease_bytes_per_user": requested_bytes,
+        "actual_total_decreased_bytes": max(0, before_total - after_total),
+        "actual_total_decreased_gib": round(max(0, before_total - after_total) / GIB, 6),
+        "before_total_extra_bytes": before_total,
+        "after_total_extra_bytes": after_total,
+        "snapshot_batch_id": batch_id,
+        "snapshot_users": snap_count,
+        "exhausted_rebuild": rebuild_result,
+    }
 
 @app.post("/bulk/set-extra-traffic-all-users")
 def bulk_set_extra_traffic_all_users(req: BulkTrafficReq, x_api_token: str | None = Header(default=None)):
     auth(x_api_token)
+    if float(req.gb) < 0:
+        raise HTTPException(status_code=400, detail="gb cannot be negative")
+
     sync_ocpasswd_to_db()
     set_bytes = int(float(req.gb) * GIB)
     t = now()
     with db() as con:
+        batch_id, snap_count = create_extra_traffic_snapshot(
+            con, "all", "all-users", None, "bulk-set", f"Set all users extra traffic to {req.gb} GiB"
+        )
         con.execute("UPDATE users SET quota_extra_bytes = ?, updated_at=?", (set_bytes, t))
-        count = con.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
-    if req.clear_exhausted:
-        path = exhausted_log_path()
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        open(path, "w", encoding="utf-8").close()
-    return {"ok": True, "users_updated": count, "extra_traffic_gb": req.gb, "extra_traffic_bytes": set_bytes, "exhausted_file_reset": bool(req.clear_exhausted)}
+        count = int(con.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"])
+
+    rebuild_result = rebuild_exhausted_log_from_db() if req.clear_exhausted else None
+    return {
+        "ok": True,
+        "users_updated": count,
+        "extra_traffic_gb": float(req.gb),
+        "extra_traffic_bytes": set_bytes,
+        "snapshot_batch_id": batch_id,
+        "snapshot_users": snap_count,
+        "exhausted_rebuild": rebuild_result,
+    }
 
 @app.post("/bulk/clear-extra-traffic-all-users")
 def bulk_clear_extra_traffic_all_users(x_api_token: str | None = Header(default=None)):
     auth(x_api_token)
     sync_ocpasswd_to_db()
     with db() as con:
+        batch_id, snap_count = create_extra_traffic_snapshot(
+            con, "all", "all-users", None, "bulk-clear", "Clear all users extra traffic"
+        )
         con.execute("UPDATE users SET quota_extra_bytes = 0, updated_at=?", (now(),))
-        count = con.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
-    return {"ok": True, "users_updated": count, "quota_extra_bytes": 0}
+        count = int(con.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"])
+
+    rebuild_result = rebuild_exhausted_log_from_db()
+    return {
+        "ok": True,
+        "users_updated": count,
+        "quota_extra_bytes": 0,
+        "snapshot_batch_id": batch_id,
+        "snapshot_users": snap_count,
+        "exhausted_rebuild": rebuild_result,
+    }
 
 @app.post("/bulk/reset-usage-all-users")
 def bulk_reset_usage_all_users(x_api_token: str | None = Header(default=None)):
     auth(x_api_token)
     sync_ocpasswd_to_db()
     with db() as con:
+        batch_id, snap_count = create_usage_reset_snapshot(
+            con, "all", "all-users", None, "API bulk reset of all users"
+        )
         con.execute("UPDATE users SET used_bytes = 0, updated_at=?", (now(),))
         count = con.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
     path = exhausted_log_path()
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     open(path, "w", encoding="utf-8").close()
-    return {"ok": True, "users_updated": count, "used_bytes": 0, "exhausted_file_reset": True}
+    return {
+        "ok": True,
+        "users_updated": count,
+        "used_bytes": 0,
+        "exhausted_file_reset": True,
+        "snapshot_batch_id": batch_id,
+        "snapshot_users": snap_count,
+    }
 
 @app.get("/quota-exhausted")
 def quota_exhausted(x_api_token: str | None = Header(default=None)):
@@ -1348,6 +1727,7 @@ configure_groups_from_ocpasswd() {
         tmp="$(mktemp)"
         jq --arg g "$g" --argjson ms "$max_sessions" --argjson q "$quota_gb"            '.groups[$g] = {"max_sessions": $ms, "quota_gb": $q}'            "$MASTER_ETC/limits.json" > "$tmp"
         mv "$tmp" "$MASTER_ETC/limits.json"
+        handle_group_manual_quota_overrides "$g" "$quota_gb"
     done
 
     print_ok "Group limits updated."
@@ -2013,6 +2393,19 @@ add_user_traffic() {
     [[ -z "$u" ]] && return 0
     gb="$(ask_number "Traffic to add in GB" "10")"
     master_curl "POST" "/add-traffic" "{\"username\":\"$u\",\"gb\":$gb}"
+}
+
+decrease_user_traffic() {
+    local u gb
+    u="$(ask_value "Username" "")"
+    [[ -z "$u" ]] && return 0
+    gb="$(ask_number "EXTRA traffic to decrease in GB" "10")"
+    print_info "Only quota_extra_bytes is reduced. Group quota and manual limits.json quota are not changed."
+    print_info "The result cannot go below zero."
+    if ! ask_yes_no "Decrease this user's added traffic now?" "n"; then
+        return 0
+    fi
+    master_curl "POST" "/decrease-traffic" "{\"username\":\"$u\",\"gb\":$gb}"
 }
 
 add_user_time() {
@@ -2767,13 +3160,12 @@ backup_cleanup_menu() {
         echo "6) Custom backup"
         echo "7) Restore backup"
         echo "8) Cleanup old usage_log records manually"
-        echo "13) Default cleanup now: delete usage_log + VACUUM"
         echo "9) VACUUM / compact database"
         echo "10) Configure automatic usage_log cleanup timer"
         echo "11) Disable automatic cleanup timer"
         echo "12) Show automatic cleanup timer status/logs"
         echo "13) RECOMMENDED default backup: lightweight, keeps current usage, removes usage_log history"
-        echo "14) DEFAULT cleanup now: delete all usage_log history up to now"
+        echo "14) DEFAULT cleanup now: delete all usage_log history + VACUUM"
         echo "0) Back"
         echo
         read -rp "Select: " choice
@@ -2786,13 +3178,12 @@ backup_cleanup_menu() {
             6) backup_master_custom; pause ;;
             7) restore_master_data; pause ;;
             8) cleanup_usage_logs; pause ;;
-            13) default_cleanup_usage_log_with_vacuum; pause ;;
             9) vacuum_database; pause ;;
             10) configure_auto_cleanup_timer; pause ;;
             11) disable_auto_cleanup_timer; pause ;;
             12) show_cleanup_timer_status; pause ;;
             13) backup_master_recommended_default; pause ;;
-            14) cleanup_usage_log_default_now; pause ;;
+            14) default_cleanup_usage_log_with_vacuum; pause ;;
             0) return 0 ;;
             *) echo "Invalid choice"; sleep 1 ;;
         esac
@@ -2834,6 +3225,17 @@ bulk_add_traffic_all_users() {
     master_curl "POST" "/bulk/add-traffic-all-users" "{\"gb\":$gb,\"clear_exhausted\":$clear}"
 }
 
+bulk_decrease_traffic_all_users() {
+    local gb
+    gb="$(ask_number "EXTRA traffic to DECREASE from ALL users in GB" "10")"
+    print_warn "This decreases only quota_extra_bytes for all users and clamps every result at zero."
+    print_warn "Group quotas and manual user quota overrides are not changed."
+    if ! ask_yes_no "Continue bulk decrease?" "n"; then
+        return 0
+    fi
+    master_curl "POST" "/bulk/decrease-traffic-all-users" "{\"gb\":$gb,\"clear_exhausted\":true}"
+}
+
 bulk_set_extra_traffic_all_users() {
     local gb clear
     gb="$(ask_number "Set exact EXTRA traffic for ALL users in GB" "0")"
@@ -2869,6 +3271,7 @@ bulk_traffic_menu() {
         echo "6) Reset used traffic for ALL users"
         echo "7) Show users"
         echo "8) Show current limits.json"
+        echo "9) Decrease extra traffic from ALL users"
         echo "0) Back"
         echo
         read -rp "Select: " choice
@@ -2881,6 +3284,7 @@ bulk_traffic_menu() {
             6) bulk_reset_usage_all_users; pause ;;
             7) list_users; pause ;;
             8) ensure_limits_file; jq . "$MASTER_ETC/limits.json"; pause ;;
+            9) bulk_decrease_traffic_all_users; pause ;;
             0) return 0 ;;
             *) echo "Invalid choice"; sleep 1 ;;
         esac
@@ -3036,18 +3440,50 @@ reset_usage_for_group_sqlite() {
 import sqlite3
 import sys
 import time
+import uuid
 
 db_path = sys.argv[1]
 groupname = sys.argv[2]
+t = int(time.time())
+batch_id = f"reset-{t}-{uuid.uuid4().hex[:10]}"
 
-con = sqlite3.connect(db_path, timeout=20)
+con = sqlite3.connect(db_path, timeout=30)
 try:
+    con.execute("BEGIN IMMEDIATE")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS usage_reset_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            target TEXT,
+            username TEXT NOT NULL,
+            old_used_bytes INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            note TEXT
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_usage_reset_snapshots_batch ON usage_reset_snapshots(batch_id)")
+    rows = con.execute(
+        "SELECT username, used_bytes FROM users WHERE groupname=? ORDER BY username",
+        (groupname,),
+    ).fetchall()
+    con.executemany(
+        """
+        INSERT INTO usage_reset_snapshots(batch_id, scope, target, username, old_used_bytes, created_at, note)
+        VALUES (?, 'group', ?, ?, ?, ?, 'Group usage reset from manager')
+        """,
+        [(batch_id, groupname, r[0], int(r[1] or 0), t) for r in rows],
+    )
     cur = con.execute(
         "UPDATE users SET used_bytes=0, updated_at=? WHERE groupname=?",
-        (int(time.time()), groupname),
+        (t, groupname),
     )
     con.commit()
+    print(f"Recovery snapshot created: batch_id={batch_id} users={len(rows)}", file=sys.stderr)
     print(cur.rowcount)
+except Exception:
+    con.rollback()
+    raise
 finally:
     con.close()
 PYRESETGROUP
@@ -3066,18 +3502,51 @@ reset_usage_for_user_sqlite() {
 import sqlite3
 import sys
 import time
+import uuid
 
 db_path = sys.argv[1]
 username = sys.argv[2]
+t = int(time.time())
+batch_id = f"reset-{t}-{uuid.uuid4().hex[:10]}"
 
-con = sqlite3.connect(db_path, timeout=20)
+con = sqlite3.connect(db_path, timeout=30)
 try:
+    con.execute("BEGIN IMMEDIATE")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS usage_reset_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            target TEXT,
+            username TEXT NOT NULL,
+            old_used_bytes INTEGER NOT NULL,
+            created_at INTEGER NOT NULL,
+            note TEXT
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_usage_reset_snapshots_batch ON usage_reset_snapshots(batch_id)")
+    row = con.execute(
+        "SELECT username, used_bytes FROM users WHERE username=?",
+        (username,),
+    ).fetchone()
+    if row:
+        con.execute(
+            """
+            INSERT INTO usage_reset_snapshots(batch_id, scope, target, username, old_used_bytes, created_at, note)
+            VALUES (?, 'user', ?, ?, ?, ?, 'Single-user usage reset from manager')
+            """,
+            (batch_id, username, row[0], int(row[1] or 0), t),
+        )
     cur = con.execute(
         "UPDATE users SET used_bytes=0, updated_at=? WHERE username=?",
-        (int(time.time()), username),
+        (t, username),
     )
     con.commit()
+    print(f"Recovery snapshot created: batch_id={batch_id} users={1 if row else 0}", file=sys.stderr)
     print(cur.rowcount)
+except Exception:
+    con.rollback()
+    raise
 finally:
     con.close()
 PYRESETUSER
@@ -3219,6 +3688,115 @@ sync_new_groups_from_ocpasswd_only() {
     print_info "Existing group settings were not changed."
 }
 
+
+group_manual_quota_overrides_json() {
+    local group="$1"
+    local action="${2:-list}"
+    local db="$DB_DIR/central.db"
+    local limits="$MASTER_ETC/limits.json"
+
+    python3 - "$db" "$limits" "$group" "$action" <<'PYGROUPOVERRIDE'
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import tempfile
+import time
+
+DB, LIMITS, GROUP, ACTION = sys.argv[1:5]
+result = {"group": GROUP, "count": 0, "users": [], "action": ACTION}
+
+if not os.path.exists(DB) or not os.path.exists(LIMITS):
+    print(json.dumps(result, ensure_ascii=False))
+    raise SystemExit(0)
+
+with open(LIMITS, "r", encoding="utf-8") as f:
+    limits = json.load(f)
+
+with sqlite3.connect(DB, timeout=20) as con:
+    members = {r[0] for r in con.execute("SELECT username FROM users WHERE groupname=?", (GROUP,))}
+
+users_cfg = limits.setdefault("users", {})
+affected = []
+for username in sorted(members):
+    cfg = users_cfg.get(username)
+    if isinstance(cfg, dict) and "quota_gb" in cfg:
+        affected.append({
+            "username": username,
+            "quota_gb": cfg.get("quota_gb"),
+            "max_sessions": cfg.get("max_sessions"),
+        })
+
+result["count"] = len(affected)
+result["users"] = affected
+
+if ACTION == "remove-quota" and affected:
+    backup = LIMITS + ".before-group-override-change-" + time.strftime("%Y%m%d-%H%M%S")
+    shutil.copy2(LIMITS, backup)
+    for item in affected:
+        username = item["username"]
+        cfg = users_cfg.get(username, {})
+        cfg.pop("quota_gb", None)
+        if cfg:
+            users_cfg[username] = cfg
+        else:
+            users_cfg.pop(username, None)
+
+    parent = os.path.dirname(LIMITS) or "."
+    fd, tmp = tempfile.mkstemp(prefix="limits.", suffix=".json", dir=parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(limits, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.replace(tmp, LIMITS)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+    result["backup"] = backup
+    result["removed_quota_overrides"] = len(affected)
+
+print(json.dumps(result, ensure_ascii=False))
+PYGROUPOVERRIDE
+}
+
+handle_group_manual_quota_overrides() {
+    local group="$1"
+    local new_quota="$2"
+    local info count choice result
+
+    info="$(group_manual_quota_overrides_json "$group" "list")"
+    count="$(jq -r '.count // 0' <<<"$info")"
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    if (( count == 0 )); then
+        return 0
+    fi
+
+    echo
+    print_warn "$count user(s) in group $group have a manually configured quota override."
+    print_info "The new group quota is ${new_quota} GB, but manual user quotas take priority."
+    jq -r '.users[] | " - \(.username): manual_quota_gb=\(.quota_gb), max_sessions_override=\(.max_sessions // "none")"' <<<"$info"
+    echo
+    echo "How should these manually configured users be handled?"
+    echo "1) Keep their manual quota overrides; the group quota will NOT replace their manual volume"
+    echo "2) Apply the new group quota to them; remove only quota_gb override"
+    echo "   Any manual max_sessions override will be preserved"
+    read -rp "Select [1]: " choice
+    choice="${choice:-1}"
+
+    case "$choice" in
+        2)
+            result="$(group_manual_quota_overrides_json "$group" "remove-quota")"
+            print_ok "Removed manual quota override from $(jq -r '.removed_quota_overrides // 0' <<<"$result") user(s)."
+            print_info "New group quota now applies to those users immediately."
+            print_info "limits.json safety backup: $(jq -r '.backup // "not-created"' <<<"$result")"
+            ;;
+        *)
+            print_ok "Manual user quota overrides kept. Group quota applies only to users without manual quota override."
+            ;;
+    esac
+}
+
 edit_one_group_quota() {
     ensure_limits_file
 
@@ -3247,6 +3825,8 @@ edit_one_group_quota() {
         '.groups[$g] = {"max_sessions": $ms, "quota_gb": $q}' \
         "$MASTER_ETC/limits.json" > "$tmp"
     mv "$tmp" "$MASTER_ETC/limits.json"
+
+    handle_group_manual_quota_overrides "$group" "$quota_gb"
 
     users_count="$(count_users_in_group "$group")"
 
@@ -3300,6 +3880,8 @@ remove_one_group_quota() {
         '.groups[$g] = {"max_sessions": $ms, "quota_gb": 0}' \
         "$MASTER_ETC/limits.json" > "$tmp"
     mv "$tmp" "$MASTER_ETC/limits.json"
+
+    handle_group_manual_quota_overrides "$group" "0 (unlimited)"
 
     if ask_yes_no "Reset used traffic for users in this group too?" "n"; then
         reset_usage_for_group_sqlite "$group" >/dev/null
@@ -3780,6 +4362,530 @@ db_user_cleanup_menu() {
 }
 
 
+
+# =========================
+# v14: exact reset snapshots + usage_log fallback recovery
+# =========================
+
+ensure_usage_recovery_schema() {
+    local db="$DB_DIR/central.db"
+    [[ -f "$db" ]] || { print_err "Database not found: $db"; return 1; }
+    sqlite3 "$db" <<'SQLRECOVERYSCHEMA'
+CREATE TABLE IF NOT EXISTS usage_reset_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    target TEXT,
+    username TEXT NOT NULL,
+    old_used_bytes INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_usage_reset_snapshots_batch ON usage_reset_snapshots(batch_id);
+CREATE INDEX IF NOT EXISTS idx_usage_reset_snapshots_created ON usage_reset_snapshots(created_at);
+SQLRECOVERYSCHEMA
+}
+
+usage_recovery_stats() {
+    local db="$DB_DIR/central.db"
+    ensure_usage_recovery_schema || return 1
+    sqlite3 -header -column "$db" <<'SQLRECOVERYSTATS'
+SELECT 'users' AS item, COUNT(*) AS value FROM users
+UNION ALL
+SELECT 'usage_log_rows', COUNT(*) FROM usage_log
+UNION ALL
+SELECT 'reset_snapshot_rows', COUNT(*) FROM usage_reset_snapshots
+UNION ALL
+SELECT 'reset_snapshot_batches', COUNT(DISTINCT batch_id) FROM usage_reset_snapshots;
+
+SELECT
+    datetime(MIN(created_at), 'unixepoch', 'localtime') AS oldest_usage_log,
+    datetime(MAX(created_at), 'unixepoch', 'localtime') AS newest_usage_log,
+    ROUND(COALESCE(SUM(bytes),0) / 1073741824.0, 3) AS total_logged_gib
+FROM usage_log;
+SQLRECOVERYSTATS
+}
+
+list_usage_reset_snapshot_batches() {
+    local db="$DB_DIR/central.db"
+    ensure_usage_recovery_schema || return 1
+    sqlite3 -header -column "$db" <<'SQLLISTSNAPSHOTS'
+SELECT
+    batch_id,
+    scope,
+    COALESCE(target, '') AS target,
+    COUNT(*) AS users,
+    ROUND(SUM(old_used_bytes) / 1073741824.0, 3) AS old_used_total_gib,
+    datetime(MAX(created_at), 'unixepoch', 'localtime') AS created_local,
+    COALESCE(MAX(note), '') AS note
+FROM usage_reset_snapshots
+GROUP BY batch_id, scope, target
+ORDER BY MAX(created_at) DESC
+LIMIT 100;
+SQLLISTSNAPSHOTS
+}
+
+preview_usage_reset_snapshot() {
+    local batch db="$DB_DIR/central.db"
+    batch="$(ask_value "Snapshot batch_id" "")"
+    [[ -n "$batch" ]] || return 0
+    ensure_usage_recovery_schema || return 1
+    sqlite3 -header -column "$db" <<SQLPREVIEWSNAPSHOT
+SELECT
+    s.username,
+    ROUND(s.old_used_bytes / 1073741824.0, 3) AS before_reset_gib,
+    ROUND(COALESCE(u.used_bytes,0) / 1073741824.0, 3) AS current_after_reset_gib,
+    ROUND((s.old_used_bytes + COALESCE(u.used_bytes,0)) / 1073741824.0, 3) AS recommended_restore_gib,
+    u.groupname
+FROM usage_reset_snapshots AS s
+LEFT JOIN users AS u ON u.username=s.username
+WHERE s.batch_id='$batch'
+ORDER BY s.username;
+SQLPREVIEWSNAPSHOT
+}
+
+recovery_db_backup() {
+    local db="$DB_DIR/central.db"
+    local out="/root/ocserv-central-before-usage-recovery-$(date +%Y%m%d-%H%M%S).db"
+    sqlite3 "$db" ".backup '$out'"
+    print_ok "Safety DB backup created: $out"
+}
+
+restore_usage_reset_snapshot() {
+    local batch mode db="$DB_DIR/central.db" was_active=0 rc=0
+    batch="$(ask_value "Snapshot batch_id to restore" "")"
+    [[ -n "$batch" ]] || return 0
+
+    ensure_usage_recovery_schema || return 1
+    local count
+    count="$(sqlite3 "$db" "SELECT COUNT(*) FROM usage_reset_snapshots WHERE batch_id='$(printf "%s" "$batch" | sed "s/'/''/g")';")"
+    if [[ "${count:-0}" == "0" ]]; then
+        print_err "Snapshot batch not found: $batch"
+        return 1
+    fi
+
+    echo "1) Recommended: old value before reset + current usage accumulated after reset"
+    echo "2) Exact old value: overwrite current usage with the value before reset"
+    read -rp "Select [1]: " mode
+    mode="${mode:-1}"
+
+    recovery_db_backup
+    if ! ask_yes_no "Apply this snapshot recovery now?" "n"; then
+        return 0
+    fi
+
+    systemctl is-active --quiet ocserv-central 2>/dev/null && was_active=1 || true
+    (( was_active == 1 )) && systemctl stop ocserv-central || true
+
+    set +e
+    python3 - "$db" "$batch" "$mode" <<'PYRESTORESNAPSHOT'
+import sqlite3
+import sys
+import time
+
+db_path, batch_id, mode = sys.argv[1:4]
+con = sqlite3.connect(db_path, timeout=30)
+try:
+    con.execute("BEGIN IMMEDIATE")
+    rows = con.execute(
+        "SELECT username, old_used_bytes FROM usage_reset_snapshots WHERE batch_id=? ORDER BY username",
+        (batch_id,),
+    ).fetchall()
+    changed = 0
+    for username, old_used in rows:
+        current = con.execute("SELECT used_bytes FROM users WHERE username=?", (username,)).fetchone()
+        if not current:
+            continue
+        if mode == "2":
+            new_value = int(old_used or 0)
+        else:
+            new_value = int(old_used or 0) + int(current[0] or 0)
+        con.execute(
+            "UPDATE users SET used_bytes=?, updated_at=? WHERE username=?",
+            (new_value, int(time.time()), username),
+        )
+        changed += 1
+    con.commit()
+    print(f"Restored users: {changed}")
+except Exception:
+    con.rollback()
+    raise
+finally:
+    con.close()
+PYRESTORESNAPSHOT
+    rc=$?
+    set -e
+
+    : > "$DB_DIR/quota_exhausted_users.jsonl"
+    (( was_active == 1 )) && systemctl start ocserv-central || true
+    if (( rc == 0 )); then
+        print_ok "Snapshot recovery completed. Exhausted-quota report was cleared for fresh evaluation."
+    else
+        print_err "Snapshot recovery failed. API state restored; use the safety backup if needed."
+    fi
+    return "$rc"
+}
+
+usage_log_recovery_cutoff() {
+    local choice date_text
+    echo "1) Use ALL currently available usage_log records" >&2
+    echo "2) Use logs from a specific local date/time" >&2
+    read -rp "Select [1]: " choice
+    choice="${choice:-1}"
+    if [[ "$choice" == "2" ]]; then
+        date_text="$(ask_value "Start local date/time, example 2026-07-01 00:00:00" "")"
+        [[ -n "$date_text" ]] || { echo ""; return 0; }
+        date -d "$date_text" +%s
+    else
+        echo "0"
+    fi
+}
+
+preview_usage_log_recovery() {
+    local scope target cutoff db="$DB_DIR/central.db"
+    echo "1) One group"
+    echo "2) One user"
+    read -rp "Select: " scope
+    case "$scope" in
+        1) target="$(ask_value "Group name" "group2")" ;;
+        2) target="$(ask_value "Username" "")" ;;
+        *) return 0 ;;
+    esac
+    [[ -n "$target" ]] || return 0
+    cutoff="$(usage_log_recovery_cutoff)"
+    [[ "$cutoff" =~ ^[0-9]+$ ]] || { print_err "Invalid cutoff date/time."; return 1; }
+
+    python3 - "$db" "$scope" "$target" "$cutoff" <<'PYPREVIEWLOGRECOVERY'
+import sqlite3
+import sys
+import time
+
+db_path, scope, target, cutoff_s = sys.argv[1:5]
+cutoff = int(cutoff_s)
+con = sqlite3.connect(db_path, timeout=30)
+con.row_factory = sqlite3.Row
+try:
+    if scope == "1":
+        users = con.execute("SELECT username, groupname, used_bytes FROM users WHERE groupname=? ORDER BY username", (target,)).fetchall()
+    else:
+        users = con.execute("SELECT username, groupname, used_bytes FROM users WHERE username=?", (target,)).fetchall()
+
+    print(f"{'USERNAME':<28} {'GROUP':<14} {'CURRENT_GIB':>12} {'RECOVER_GIB':>12} {'LOG_ROWS':>10} {'OLDEST_LOG':<19}")
+    print("-" * 105)
+    for u in users:
+        row = con.execute(
+            "SELECT COALESCE(SUM(bytes),0), COUNT(*), MIN(created_at), MAX(created_at) FROM usage_log WHERE username=? AND created_at>=?",
+            (u['username'], cutoff),
+        ).fetchone()
+        recover, count, oldest, newest = row
+        oldest_text = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(oldest)) if oldest else 'none'
+        print(f"{u['username']:<28} {str(u['groupname'] or ''):<14} {int(u['used_bytes'] or 0)/1073741824:>12.3f} {int(recover or 0)/1073741824:>12.3f} {int(count):>10} {oldest_text:<19}")
+finally:
+    con.close()
+PYPREVIEWLOGRECOVERY
+}
+
+apply_usage_log_recovery() {
+    local scope target cutoff db="$DB_DIR/central.db" was_active=0 rc=0
+    echo "1) Recover one group"
+    echo "2) Recover one user"
+    read -rp "Select: " scope
+    case "$scope" in
+        1) target="$(ask_value "Group name" "group2")" ;;
+        2) target="$(ask_value "Username" "")" ;;
+        *) return 0 ;;
+    esac
+    [[ -n "$target" ]] || return 0
+    cutoff="$(usage_log_recovery_cutoff)"
+    [[ "$cutoff" =~ ^[0-9]+$ ]] || { print_err "Invalid cutoff date/time."; return 1; }
+
+    print_warn "Fallback recovery replaces users.used_bytes with SUM(usage_log.bytes) in the selected time range."
+    print_warn "If an older billing period is included, the recovered value can be too high."
+    print_warn "If cleanup deleted older logs, the recovered value can be too low."
+    recovery_db_backup
+    if ! ask_yes_no "Apply usage_log fallback recovery now?" "n"; then
+        return 0
+    fi
+
+    systemctl is-active --quiet ocserv-central 2>/dev/null && was_active=1 || true
+    (( was_active == 1 )) && systemctl stop ocserv-central || true
+
+    set +e
+    python3 - "$db" "$scope" "$target" "$cutoff" <<'PYAPPLYLOGRECOVERY'
+import sqlite3
+import sys
+import time
+
+db_path, scope, target, cutoff_s = sys.argv[1:5]
+cutoff = int(cutoff_s)
+con = sqlite3.connect(db_path, timeout=60)
+try:
+    con.execute("BEGIN IMMEDIATE")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_usage_log_username_created ON usage_log(username, created_at)")
+    if scope == "1":
+        users = [r[0] for r in con.execute("SELECT username FROM users WHERE groupname=?", (target,)).fetchall()]
+    else:
+        users = [r[0] for r in con.execute("SELECT username FROM users WHERE username=?", (target,)).fetchall()]
+    changed = 0
+    for username in users:
+        recovered = con.execute(
+            "SELECT COALESCE(SUM(bytes),0) FROM usage_log WHERE username=? AND created_at>=?",
+            (username, cutoff),
+        ).fetchone()[0]
+        con.execute(
+            "UPDATE users SET used_bytes=?, updated_at=? WHERE username=?",
+            (int(recovered or 0), int(time.time()), username),
+        )
+        changed += 1
+    con.commit()
+    print(f"Recovered users: {changed}")
+except Exception:
+    con.rollback()
+    raise
+finally:
+    con.close()
+PYAPPLYLOGRECOVERY
+    rc=$?
+    set -e
+
+    : > "$DB_DIR/quota_exhausted_users.jsonl"
+    (( was_active == 1 )) && systemctl start ocserv-central || true
+    if (( rc == 0 )); then
+        print_ok "usage_log recovery completed. Exhausted-quota report was cleared for fresh evaluation."
+    else
+        print_err "usage_log recovery failed. API state restored; use the safety backup if needed."
+    fi
+    return "$rc"
+}
+
+usage_recovery_menu() {
+    while true; do
+        clear
+        echo "==== Ocserv Central - Used Traffic Recovery / Undo Reset ===="
+        echo "1) Show recovery statistics"
+        echo "2) List exact pre-reset snapshot batches"
+        echo "3) Preview one snapshot batch"
+        echo "4) Restore one exact snapshot batch"
+        echo "5) Preview fallback recovery from usage_log"
+        echo "6) Apply fallback recovery from usage_log"
+        echo "0) Back"
+        echo
+        echo "v14 and newer create an exact snapshot automatically before user/group/all usage resets."
+        echo "For resets that happened before v14, use usage_log fallback recovery."
+        echo
+        read -rp "Select: " choice
+        case "$choice" in
+            1) usage_recovery_stats; pause ;;
+            2) list_usage_reset_snapshot_batches; pause ;;
+            3) preview_usage_reset_snapshot; pause ;;
+            4) restore_usage_reset_snapshot; pause ;;
+            5) preview_usage_log_recovery; pause ;;
+            6) apply_usage_log_recovery; pause ;;
+            0) return 0 ;;
+            *) echo "Invalid choice"; sleep 1 ;;
+        esac
+    done
+}
+
+
+# =========================
+# v15: extra traffic decrease + exact adjustment snapshots
+# =========================
+
+ensure_extra_traffic_recovery_schema() {
+    local db="$DB_DIR/central.db"
+    [[ -f "$db" ]] || { print_err "Database not found: $db"; return 1; }
+    sqlite3 "$db" <<'SQLEXTRASCHEMA'
+CREATE TABLE IF NOT EXISTS extra_traffic_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    target TEXT,
+    username TEXT NOT NULL,
+    old_extra_bytes INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    operation TEXT NOT NULL,
+    note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_extra_traffic_snapshots_batch ON extra_traffic_snapshots(batch_id);
+CREATE INDEX IF NOT EXISTS idx_extra_traffic_snapshots_created ON extra_traffic_snapshots(created_at);
+SQLEXTRASCHEMA
+}
+
+extra_traffic_recovery_stats() {
+    local db="$DB_DIR/central.db"
+    ensure_extra_traffic_recovery_schema || return 1
+    sqlite3 -header -column "$db" <<'SQLEXTRASTATS'
+SELECT
+    COUNT(*) AS users,
+    ROUND(COALESCE(SUM(quota_extra_bytes),0) / 1073741824.0, 3) AS current_total_extra_gib,
+    SUM(CASE WHEN quota_extra_bytes > 0 THEN 1 ELSE 0 END) AS users_with_extra
+FROM users;
+
+SELECT
+    COUNT(*) AS snapshot_rows,
+    COUNT(DISTINCT batch_id) AS snapshot_batches,
+    datetime(MIN(created_at), 'unixepoch', 'localtime') AS oldest_snapshot,
+    datetime(MAX(created_at), 'unixepoch', 'localtime') AS newest_snapshot
+FROM extra_traffic_snapshots;
+SQLEXTRASTATS
+}
+
+list_extra_traffic_snapshot_batches() {
+    local db="$DB_DIR/central.db"
+    ensure_extra_traffic_recovery_schema || return 1
+    sqlite3 -header -column "$db" <<'SQLLISTEXTRAS'
+SELECT
+    batch_id,
+    operation,
+    scope,
+    COALESCE(target, '') AS target,
+    COUNT(*) AS users,
+    ROUND(SUM(old_extra_bytes) / 1073741824.0, 3) AS old_extra_total_gib,
+    datetime(MAX(created_at), 'unixepoch', 'localtime') AS created_local,
+    COALESCE(MAX(note), '') AS note
+FROM extra_traffic_snapshots
+GROUP BY batch_id, operation, scope, target
+ORDER BY MAX(created_at) DESC
+LIMIT 100;
+SQLLISTEXTRAS
+}
+
+preview_extra_traffic_snapshot() {
+    local batch safe_batch db="$DB_DIR/central.db"
+    batch="$(ask_value "Extra traffic snapshot batch_id" "")"
+    [[ -n "$batch" ]] || return 0
+    ensure_extra_traffic_recovery_schema || return 1
+    safe_batch="$(printf "%s" "$batch" | sed "s/'/''/g")"
+    sqlite3 -header -column "$db" <<SQLPREVIEWEXTRA
+SELECT
+    s.username,
+    s.operation,
+    ROUND(s.old_extra_bytes / 1073741824.0, 3) AS before_change_gib,
+    ROUND(COALESCE(u.quota_extra_bytes,0) / 1073741824.0, 3) AS current_extra_gib,
+    ROUND((COALESCE(u.quota_extra_bytes,0) - s.old_extra_bytes) / 1073741824.0, 3) AS difference_gib,
+    u.groupname
+FROM extra_traffic_snapshots AS s
+LEFT JOIN users AS u ON u.username=s.username
+WHERE s.batch_id='$safe_batch'
+ORDER BY s.username;
+SQLPREVIEWEXTRA
+}
+
+extra_traffic_db_backup() {
+    local db="$DB_DIR/central.db"
+    local out="/root/ocserv-central-before-extra-traffic-restore-$(date +%Y%m%d-%H%M%S).db"
+    sqlite3 "$db" ".backup '$out'"
+    print_ok "Safety DB backup created: $out"
+}
+
+restore_extra_traffic_snapshot() {
+    local batch safe_batch db="$DB_DIR/central.db" was_active=0 rc=0 count
+    batch="$(ask_value "Extra traffic snapshot batch_id to restore" "")"
+    [[ -n "$batch" ]] || return 0
+    ensure_extra_traffic_recovery_schema || return 1
+
+    safe_batch="$(printf "%s" "$batch" | sed "s/'/''/g")"
+    count="$(sqlite3 "$db" "SELECT COUNT(*) FROM extra_traffic_snapshots WHERE batch_id='$safe_batch';")"
+    if [[ "${count:-0}" == "0" ]]; then
+        print_err "Extra traffic snapshot batch not found: $batch"
+        return 1
+    fi
+
+    print_warn "This restores the exact quota_extra_bytes value from before that operation."
+    print_warn "Any later extra-traffic changes for the same users will be overwritten."
+    sqlite3 -header -column "$db" <<SQLPREVIEWRESTOREEXTRA
+SELECT
+    s.username,
+    s.operation,
+    ROUND(s.old_extra_bytes / 1073741824.0, 3) AS before_change_gib,
+    ROUND(COALESCE(u.quota_extra_bytes,0) / 1073741824.0, 3) AS current_extra_gib,
+    u.groupname
+FROM extra_traffic_snapshots AS s
+LEFT JOIN users AS u ON u.username=s.username
+WHERE s.batch_id='$safe_batch'
+ORDER BY s.username;
+SQLPREVIEWRESTOREEXTRA
+    extra_traffic_db_backup
+
+    if ! ask_yes_no "Restore this extra-traffic snapshot now?" "n"; then
+        return 0
+    fi
+
+    systemctl is-active --quiet ocserv-central 2>/dev/null && was_active=1 || true
+    (( was_active == 1 )) && systemctl stop ocserv-central || true
+
+    set +e
+    python3 - "$db" "$batch" <<'PYRESTOREEXTRA'
+import sqlite3
+import sys
+import time
+
+db_path, batch_id = sys.argv[1:3]
+con = sqlite3.connect(db_path, timeout=30)
+try:
+    con.execute("BEGIN IMMEDIATE")
+    rows = con.execute(
+        "SELECT username, old_extra_bytes FROM extra_traffic_snapshots WHERE batch_id=? ORDER BY username",
+        (batch_id,),
+    ).fetchall()
+    changed = 0
+    for username, old_extra in rows:
+        current = con.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone()
+        if not current:
+            continue
+        con.execute(
+            "UPDATE users SET quota_extra_bytes=?, updated_at=? WHERE username=?",
+            (max(0, int(old_extra or 0)), int(time.time()), username),
+        )
+        changed += 1
+    con.commit()
+    print(f"Restored users: {changed}")
+except Exception:
+    con.rollback()
+    raise
+finally:
+    con.close()
+PYRESTOREEXTRA
+    rc=$?
+    set -e
+
+    (( was_active == 1 )) && systemctl start ocserv-central || true
+    if (( rc == 0 )); then
+        sleep 1
+        master_curl "POST" "/quota-exhausted/rebuild" "{}" || true
+        print_ok "Extra traffic snapshot restored and exhausted-quota report rebuilt."
+    else
+        print_err "Extra traffic restore failed. API state restored; use the safety backup if needed."
+    fi
+    return "$rc"
+}
+
+extra_traffic_recovery_menu() {
+    while true; do
+        clear
+        echo "==== Ocserv Central - Extra Traffic History / Recovery ===="
+        echo "1) Show extra traffic and snapshot statistics"
+        echo "2) List extra traffic snapshot batches"
+        echo "3) Preview one snapshot batch"
+        echo "4) Restore one exact snapshot batch"
+        echo "0) Back"
+        echo
+        echo "v15 records exact quota_extra_bytes values before add, decrease, set, and clear operations."
+        echo
+        read -rp "Select: " choice
+        case "$choice" in
+            1) extra_traffic_recovery_stats; pause ;;
+            2) list_extra_traffic_snapshot_batches; pause ;;
+            3) preview_extra_traffic_snapshot; pause ;;
+            4) restore_extra_traffic_snapshot; pause ;;
+            0) return 0 ;;
+            *) echo "Invalid choice"; sleep 1 ;;
+        esac
+    done
+}
+
+
 master_menu() {
     while true; do
         clear
@@ -3813,6 +4919,9 @@ master_menu() {
         echo "27) Database user cleanup / ocpasswd prune menu"
         echo "28) Restart ocserv-central API"
         echo "29) Refresh ocpasswd groups / apply current limits now"
+        echo "30) Used traffic recovery / undo accidental reset"
+        echo "31) Decrease added traffic from one user"
+        echo "32) Extra traffic change history / restore"
         echo "0) Back"
         echo
         read -rp "Select: " choice
@@ -3851,6 +4960,9 @@ master_menu() {
             27) db_user_cleanup_menu ;;
             28) restart_master_api; pause ;;
             29) refresh_now_menu; pause ;;
+            30) usage_recovery_menu ;;
+            31) decrease_user_traffic; pause ;;
+            32) extra_traffic_recovery_menu ;;
             0) return 0 ;;
             *) echo "Invalid choice"; sleep 1 ;;
         esac
