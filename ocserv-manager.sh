@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Ocserv Manager v3.4.0
+# Ocserv Manager v3.6.0
 # Multi-instance installer and manager for ocserv on Ubuntu/Debian.
 # Designed as a replacement for the original single-instance ocserv.sh.
 
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="3.4.0"
+PROGRAM_VERSION="3.6.0"
 PROGRAM_NAME="Ocserv Manager"
 
 OCSERV_ETC="/etc/ocserv"
@@ -1496,6 +1496,23 @@ fw_install_iptables_persistent_simple() {
     return 0
 }
 
+fw_apply_plain_iptables_persistent() {
+    # Legacy/plain mode deliberately mirrors the old installer firewall behavior.
+    # It does not create Manager INPUT/FORWARD/NAT chains and it does not use the
+    # Manager boot reapply service. The only firewall mutation is the broad
+    # POSTROUTING MASQUERADE rule, followed by saving the complete IPv4 ruleset.
+    export DEBIAN_FRONTEND=noninteractive
+    command -v apt >/dev/null 2>&1 || { print_err "apt is unavailable."; return 1; }
+    apt install iptables -y || return 1
+    apt install iptables-persistent -y || return 1
+    if ! iptables -t nat -C POSTROUTING -j MASQUERADE >/dev/null 2>&1; then
+        iptables -t nat -A POSTROUTING -j MASQUERADE || return 1
+    fi
+    mkdir -p /etc/iptables
+    iptables-save > /etc/iptables/rules.v4 || return 1
+    return 0
+}
+
 fw_write_persistent_rules_files() {
     local tmp4 tmp6
     mkdir -p "$(dirname "$IPTABLES_RULES_V4")" "$(dirname "$IPTABLES_RULES_V6")"
@@ -1510,19 +1527,13 @@ fw_write_persistent_rules_files() {
 }
 
 configure_firewall_mode() {
-    local instance="$1" current choice profile
-    current="$(firewall_mode_for_instance "$instance")"
+    local instance="$1" choice profile
     profile="$(fw_profile_for_instance "$instance")"
     echo
     echo "==== Firewall setup: $instance ===="
     echo "1) iptables - standard Manager rules"
-    echo "2) iptables-persistent - SIMPLE compatibility mode"
-    echo "   No Manager INPUT/FORWARD/NAT chains for this instance."
-    echo "   Runs the equivalent of:"
-    echo "     apt install iptables -y"
-    echo "     apt install iptables-persistent -y"
-    echo "     iptables -t nat -A POSTROUTING -j MASQUERADE"
-    echo "     iptables-save > $IPTABLES_RULES_V4"
+    echo "2) iptables-persistent - legacy/plain"
+    echo "   Uses persistent host-wide NAT and does not create Manager INPUT/FORWARD/NAT rules for this instance."
     echo "3) UFW"
     echo "0) Back / keep current"
     echo "Current: $profile"
@@ -1543,14 +1554,15 @@ configure_firewall_mode() {
                 return 0
                 ;;
             2)
-                echo
-                print_warn "SIMPLE mode intentionally removes Manager-owned firewall chains for this instance."
-                print_warn "The resulting host NAT is broad: POSTROUTING -j MASQUERADE."
-                ask_yes_no "Use simple iptables-persistent compatibility mode?" "n" || continue
+                print_warn "This mode uses broad host-wide source NAT and can affect networking outside ocserv on some hosts."
+                ask_yes_no "Use iptables-persistent legacy/plain mode?" "n" || continue
                 fw_optional_backup_existing_persistent_rules
-                if ! fw_install_iptables_persistent_simple; then
-                    print_err "Could not install iptables/iptables-persistent. Firewall profile was not changed."
-                    return 1
+                if ! dpkg-query -W -f='${Status}' iptables 2>/dev/null | grep -qx 'install ok installed' || \
+                   ! dpkg-query -W -f='${Status}' iptables-persistent 2>/dev/null | grep -qx 'install ok installed'; then
+                    if ! fw_install_iptables_persistent_simple; then
+                        print_err "Could not install iptables/iptables-persistent. Firewall profile was not changed."
+                        return 1
+                    fi
                 fi
                 state_set "$instance" FIREWALL_PROFILE iptables-persistent-simple
                 state_set "$instance" FIREWALL_MODE iptables
@@ -1560,7 +1572,7 @@ configure_firewall_mode() {
                 state_set "$instance" FIREWALL_BASE_NAT_MODE none
                 state_set "$instance" FIREWALL_BASE_SNAT_IP ""
                 state_set "$instance" FIREWALL_PERSISTENCE iptables-persistent
-                print_ok "Simple iptables-persistent profile selected."
+                print_ok "iptables-persistent legacy/plain profile selected."
                 return 0
                 ;;
             3)
@@ -1757,6 +1769,27 @@ EOF
     fi
 }
 
+
+fw_any_instance_needs_manager_reapply() {
+    local i
+    while IFS= read -r i; do
+        [[ -n "$i" && -f "$(instance_state_file "$i")" ]] || continue
+        [[ "$(fw_profile_for_instance "$i")" != iptables-persistent-simple ]] && return 0
+    done < <(list_instances | sort -u)
+    return 1
+}
+
+fw_sync_manager_reapply_service() {
+    [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" == 1 ]] && return 0
+    if fw_any_instance_needs_manager_reapply; then
+        install_firewall_reapply_unit
+    else
+        systemctl disable --now ocserv-manager-firewall.service >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/multi-user.target.wants/ocserv-manager-firewall.service >/dev/null 2>&1 || true
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+
 reapply_all_firewall_rules() {
     local instance f domain subnet
     command -v iptables >/dev/null 2>&1 || { print_err "iptables is unavailable; cannot reapply ocserv firewall rules."; return 1; }
@@ -1812,74 +1845,11 @@ ensure_firewall_boot_persistence_for_existing_instances() {
     local first
     first="$(list_instances 2>/dev/null | head -n1 || true)"
     [[ -n "$first" ]] || return 0
-    install_firewall_reapply_unit
+    fw_sync_manager_reapply_service
 }
 
 valid_interface_name() {
     [[ "${1:-}" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]]
-}
-
-apply_firewall_for_instance() {
-    local instance="$1" mode subnet iface profile
-    ensure_firewall_policy_file "$instance" || return 1
-    fw_remove_legacy_v29_rules "$instance" || true
-    enable_ip_forwarding
-    profile="$(fw_profile_for_instance "$instance")"
-    mode="$(firewall_mode_for_instance "$instance")"
-
-    if [[ "$profile" == iptables-persistent-simple ]]; then
-        # This profile intentionally reproduces the old plain host firewall style:
-        # no Manager-owned INPUT/FORWARD/NAT/mangle/raw chains for this instance.
-        [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" == 1 ]] || {
-            if ! dpkg-query -W -f='${Status}' iptables 2>/dev/null | grep -qx 'install ok installed' || \
-               ! dpkg-query -W -f='${Status}' iptables-persistent 2>/dev/null | grep -qx 'install ok installed'; then
-                fw_install_iptables_persistent_simple || return 1
-            fi
-        }
-        fw_remove_ufw_rules_by_prefix "$instance" || true
-        fw_remove_instance_chains "$instance" ipv4 || true
-        fw_remove_instance_chains "$instance" ipv6 || true
-        fw_remove_legacy_v29_rules "$instance" || true
-        fw_force_remove_old_direct_rules "$instance" || true
-        remove_all_vhost_firewalls "$instance" 2>/dev/null || true
-        state_set "$instance" FIREWALL_PROFILE iptables-persistent-simple
-        state_set "$instance" FIREWALL_MODE iptables
-        state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 1
-        state_set "$instance" FIREWALL_BASE_INGRESS 0
-        state_set "$instance" FIREWALL_BASE_FORWARD 0
-        state_set "$instance" FIREWALL_BASE_NAT_MODE none
-        state_set "$instance" FIREWALL_PERSISTENCE iptables-persistent
-        fw_sync_host_global_masquerade || return 1
-        install_firewall_reapply_unit
-        if [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" != 1 ]]; then
-            fw_write_persistent_rules_files || return 1
-            systemctl enable netfilter-persistent.service >/dev/null 2>&1 || true
-            print_ok "Simple iptables-persistent applied: no Manager FORWARD chains; host-wide POSTROUTING MASQUERADE saved to $IPTABLES_RULES_V4."
-        fi
-        audit "firewall-simple-persistent instance=$instance global_masquerade=1 rules_v4=$IPTABLES_RULES_V4"
-        return 0
-    fi
-
-    [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" == 1 ]] || install_available_packages iptables
-    if [[ "$mode" == ufw && ! -x "$(command -v ufw 2>/dev/null || true)" ]]; then
-        print_err "UFW backend is selected for $instance, but ufw is not installed."; return 1
-    fi
-    fw_ensure_instance_chains "$instance" ipv4
-    fw_flush_instance_chains "$instance" ipv4
-    if command -v ip6tables >/dev/null 2>&1; then fw_ensure_instance_chains "$instance" ipv6; fw_flush_instance_chains "$instance" ipv6; fi
-    if [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" != 1 || "$mode" != ufw ]]; then
-        fw_remove_ufw_rules_by_prefix "$instance"
-    fi
-    fw_apply_base_rules "$instance" || return 1
-    fw_apply_custom_rules "$instance" || return 1
-    fw_sync_host_global_masquerade || return 1
-    install_firewall_reapply_unit
-    if [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" != 1 ]] && fw_any_instance_requests_iptables_persistent; then
-        fw_save_iptables_persistent_noninteractive || print_warn "Could not update iptables-persistent rules files."
-    fi
-    subnet="$(state_get "$instance" SUBNET 2>/dev/null || true)"; iface="$(fw_primary_out_iface "$instance")"
-    audit "firewall-v34-applied instance=$instance backend=$mode profile=$profile subnet=$subnet primary_out=$iface custom_rules=$(jq '.rules|length' "$(firewall_policy_file "$instance")" 2>/dev/null || echo 0)"
-    [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" == 1 ]] || print_ok "Firewall policy applied for $instance (profile=$profile, backend=$mode)."
 }
 
 remove_ipv6_firewall_values() {
@@ -11988,6 +11958,10 @@ vhost_fw_comment() { printf 'ocserv-manager:vhost:%s:%s\n' "$1" "$2"; }
 
 apply_firewall_for_vhost() {
     local instance="$1" domain="$2" subnet="$3" iface comment
+    if [[ "$(fw_profile_for_instance "$instance")" == iptables-persistent-simple ]]; then
+        # Legacy/plain mode never creates or reapplies per-vhost firewall rules.
+        return 0
+    fi
     iface="$(state_get "$instance" OUT_IFACE 2>/dev/null || true)"
     [[ -n "$iface" ]] || iface="$(default_route_iface)"
     [[ -n "$iface" ]] || { print_err "Could not detect outbound interface for vhost $domain."; return 1; }
@@ -12128,7 +12102,11 @@ create_vhost() {
     tmp="$(mktemp)"; generate_ocserv_config "$instance" "$tmp"
     if transactional_replace_config "$instance" "$tmp"; then
         if apply_firewall_for_vhost "$instance" "$domain" "$subnet"; then
-            print_ok "VHost $domain created with scoped NAT/FORWARD rules."
+            if [[ "$(fw_profile_for_instance "$instance")" == iptables-persistent-simple ]]; then
+                print_ok "VHost $domain created. SIMPLE firewall mode kept it free of Manager FORWARD/NAT rules."
+            else
+                print_ok "VHost $domain created with scoped NAT/FORWARD rules."
+            fi
             audit "vhost-create instance=$instance domain=$domain subnet=$subnet"
         else
             print_err "VHost firewall setup failed. Rolling the vhost configuration back."
@@ -12567,7 +12545,7 @@ reconfigure_managed_instance() {
     oldtcp="$(state_get "$instance" TCP_PORT 2>/dev/null || echo 443)"; oldudp="$(state_get "$instance" UDP_PORT 2>/dev/null || echo "$oldtcp")"; oldfw="$(firewall_mode_for_instance "$instance")"
     echo "Reconfigure sections. Existing values are preserved unless the selected section is changed."
     while true; do
-        choice="$(choose_menu "Select section:" "Listen IP and TCP/UDP ports" "VPN subnet" "Server certificate" "Authentication" "DNS" "Client/session and ban limits" "MTU/DPD/keepalive/IPv6 network profile" "Full/split routing, DNS leak and bypass" "Firewall mode (standard iptables / simple iptables-persistent / UFW)" "Open per-instance Firewall Manager" "Finish and apply" "Cancel")"
+        choice="$(choose_menu "Select section:" "Listen IP and TCP/UDP ports" "VPN subnet" "Server certificate" "Authentication" "DNS" "Client/session and ban limits" "MTU/DPD/keepalive/IPv6 network profile" "Full/split routing, DNS leak and bypass" "Firewall mode (iptables / iptables-persistent / UFW)" "Open per-instance Firewall Manager" "Finish and apply" "Cancel")"
         case "$choice" in
             1)
                 listen="$(choose_listen_host)"; tcp="$(choose_available_tcp_port "$instance" "$listen" "$(state_get "$instance" TCP_PORT)")"; udp="$(choose_available_udp_port "$instance" "$listen" "$tcp")"; state_set "$instance" LISTEN_HOST "$listen"; state_set "$instance" TCP_PORT "$tcp"; state_set "$instance" UDP_PORT "$udp" ;;
@@ -12902,6 +12880,12 @@ fw_remove_chain_hook_and_chain() {
     while "$cmd" -t "$table" -C "$builtin" -m comment --comment "$comment" -j "$chain" >/dev/null 2>&1; do
         "$cmd" -t "$table" -D "$builtin" -m comment --comment "$comment" -j "$chain" || break
     done
+    # Early v3 builds could leave an un-commented jump to the same deterministic
+    # per-instance chain. Remove that exact legacy hook as well before deleting
+    # the chain. This does not touch unrelated chains/rules.
+    while "$cmd" -t "$table" -C "$builtin" -j "$chain" >/dev/null 2>&1; do
+        "$cmd" -t "$table" -D "$builtin" -j "$chain" || break
+    done
     if fw_chain_exists "$cmd" "$table" "$chain"; then
         "$cmd" -t "$table" -F "$chain" >/dev/null 2>&1 || true
         "$cmd" -t "$table" -X "$chain" >/dev/null 2>&1 || true
@@ -12922,6 +12906,93 @@ fw_remove_instance_chains() {
     fw_remove_chain_hook_and_chain "$family" mangle POSTROUTING "$(firewall_chain_name "$instance" postrouting)" "$instance" mangle-postrouting
     fw_remove_chain_hook_and_chain "$family" raw PREROUTING "$(firewall_chain_name "$instance" prerouting)" "$instance" raw-prerouting
     fw_remove_chain_hook_and_chain "$family" raw OUTPUT "$(firewall_chain_name "$instance" output)" "$instance" raw-output
+}
+
+
+fw_delete_rule_spec_line() {
+    local family="$1" table="$2" line="$3" cmd
+    local -a argv=()
+    cmd="$(fw_cmd_for_family "$family" 2>/dev/null || true)"
+    [[ -n "$cmd" && "$line" == -A\ * ]] || return 0
+    # Parse iptables -S output without eval. This safely preserves quoted values
+    # while turning the rule from -A into the equivalent -D command.
+    mapfile -d '' -t argv < <(python3 - "$line" <<'PYFWDEL'
+import shlex,sys
+try:
+    a=shlex.split(sys.argv[1])
+except Exception:
+    raise SystemExit(0)
+if not a or a[0] != '-A':
+    raise SystemExit(0)
+a[0]='-D'
+out=sys.stdout.buffer
+for x in a:
+    out.write(x.encode()+b'\0')
+PYFWDEL
+)
+    ((${#argv[@]})) || return 0
+    "$cmd" -t "$table" "${argv[@]}" >/dev/null 2>&1 || true
+}
+
+fw_purge_rules_by_manager_identity() {
+    local instance="$1" family="$2" table line
+    local prefix1="ocserv-manager:$instance" prefix2="ocserv-manager:vhost:$instance:"
+    for table in filter nat mangle raw; do
+        while IFS= read -r line; do
+            [[ "$line" == -A\ * ]] || continue
+            if [[ "$line" == *"$prefix1"* || "$line" == *"$prefix2"* ]]; then
+                fw_delete_rule_spec_line "$family" "$table" "$line"
+            fi
+        done < <("$(fw_cmd_for_family "$family")" -t "$table" -S 2>/dev/null || true)
+    done
+}
+
+fw_purge_direct_rules_for_subnet() {
+    local subnet="$1" family="${2:-ipv4}" cmd line
+    [[ -n "$subnet" ]] || return 0
+    cmd="$(fw_cmd_for_family "$family" 2>/dev/null || true)"; [[ -n "$cmd" ]] || return 0
+    # legacy/plain mode promises there are no Manager-style forwarding/NAT rules for
+    # the VPN subnet. Remove historical direct ACCEPT/MASQUERADE/SNAT signatures
+    # regardless of the old output-interface or comment text. The broad
+    # POSTROUTING -j MASQUERADE compatibility rule is intentionally preserved.
+    while IFS= read -r line; do
+        [[ "$line" == -A\ FORWARD\ * ]] || continue
+        if { [[ "$line" == *" -s $subnet "* ]] || [[ "$line" == *" -d $subnet "* ]]; } && [[ "$line" == *" -j ACCEPT"* ]]; then
+            fw_delete_rule_spec_line "$family" filter "$line"
+        fi
+    done < <("$cmd" -t filter -S FORWARD 2>/dev/null || true)
+    while IFS= read -r line; do
+        [[ "$line" == -A\ POSTROUTING\ * ]] || continue
+        [[ "$line" == *" -s $subnet "* ]] || continue
+        if [[ "$line" == *" -j MASQUERADE"* || "$line" == *" -j SNAT"* ]]; then
+            fw_delete_rule_spec_line "$family" nat "$line"
+        fi
+    done < <("$cmd" -t nat -S POSTROUTING 2>/dev/null || true)
+}
+
+fw_deep_purge_instance_traces() {
+    local instance="$1" subnet ipv6 dir f vsub
+    subnet="$(state_get "$instance" SUBNET 2>/dev/null || true)"
+    ipv6="$(state_get "$instance" IPV6_NETWORK 2>/dev/null || true)"
+
+    fw_purge_rules_by_manager_identity "$instance" ipv4 || true
+    fw_purge_rules_by_manager_identity "$instance" ipv6 || true
+    fw_remove_instance_chains "$instance" ipv4 || true
+    fw_remove_instance_chains "$instance" ipv6 || true
+    fw_purge_direct_rules_for_subnet "$subnet" ipv4 || true
+    [[ -n "$ipv6" ]] && fw_purge_direct_rules_for_subnet "$ipv6" ipv6 || true
+
+    # Current vhost subnets also belong to this ocserv process. In legacy/plain mode
+    # they must not retain old scoped FORWARD/NAT rules either.
+    dir="$(vhost_dir "$instance" 2>/dev/null || true)"
+    if [[ -d "$dir" ]]; then
+        for f in "$dir"/*.conf; do
+            [[ -f "$f" ]] || continue
+            vsub="$(config_ipv4_cidr "$f" 2>/dev/null || true)"
+            [[ -n "$vsub" ]] && fw_purge_direct_rules_for_subnet "$vsub" ipv4 || true
+        done
+    fi
+    return 0
 }
 
 fw_remove_ufw_rules_by_prefix() {
@@ -13301,8 +13372,8 @@ fw_toggle_host_global_masquerade() {
         rollback="$(fw_prepare_change "$instance" host-global-masquerade-off)"
         state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 0
     else
-        print_warn "This is host-wide and equivalent in effect to: iptables -t nat -A POSTROUTING -j MASQUERADE"
-        print_warn "It can affect unrelated services, containers, and source-address selection."
+        print_warn "This changes source NAT for all IPv4 traffic leaving the host."
+        print_warn "It can affect DNS, unrelated services, containers, and source-address selection on some systems."
         ask_yes_no "Enable host-wide POSTROUTING MASQUERADE?" "n" || return 0
         rollback="$(fw_prepare_change "$instance" host-global-masquerade-on)"
         state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 1
@@ -13417,27 +13488,21 @@ fw_apply_custom_rules() {
 apply_firewall_for_instance() {
     local instance="$1" mode subnet iface profile
     ensure_firewall_policy_file "$instance" || return 1
-    fw_remove_legacy_v29_rules "$instance" || true
-    enable_ip_forwarding
     profile="$(fw_profile_for_instance "$instance")"
     mode="$(firewall_mode_for_instance "$instance")"
 
     if [[ "$profile" == iptables-persistent-simple ]]; then
-        # Plain compatibility mode: no Manager-owned INPUT/FORWARD/NAT/mangle/raw
-        # chains for this instance. Keep only the host-wide POSTROUTING MASQUERADE
-        # and persist the resulting complete host ruleset.
-        if [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" != 1 ]]; then
-            if ! dpkg-query -W -f='${Status}' iptables 2>/dev/null | grep -qx 'install ok installed' || \
-               ! dpkg-query -W -f='${Status}' iptables-persistent 2>/dev/null | grep -qx 'install ok installed'; then
-                fw_install_iptables_persistent_simple || return 1
-            fi
+        # Legacy/plain profile: no Manager-owned firewall rules are ever created.
+        # If this instance came from an older Manager firewall profile, purge only
+        # those historical Manager/ocserv-style traces once before applying the
+        # old four-command firewall behavior.
+        if [[ "$(state_get "$instance" FIREWALL_PLAIN_TRANSITION_CLEANED 2>/dev/null || echo 0)" != 1 ]]; then
+            fw_remove_ufw_rules_by_prefix "$instance" || true
+            fw_remove_legacy_v29_rules "$instance" || true
+            fw_force_remove_old_direct_rules "$instance" || true
+            fw_deep_purge_instance_traces "$instance" || true
+            state_set "$instance" FIREWALL_PLAIN_TRANSITION_CLEANED 1
         fi
-        fw_remove_ufw_rules_by_prefix "$instance" || true
-        fw_remove_instance_chains "$instance" ipv4 || true
-        fw_remove_instance_chains "$instance" ipv6 || true
-        fw_remove_legacy_v29_rules "$instance" || true
-        fw_force_remove_old_direct_rules "$instance" || true
-        remove_all_vhost_firewalls "$instance" 2>/dev/null || true
         state_set "$instance" FIREWALL_PROFILE iptables-persistent-simple
         state_set "$instance" FIREWALL_MODE iptables
         state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 1
@@ -13445,17 +13510,22 @@ apply_firewall_for_instance() {
         state_set "$instance" FIREWALL_BASE_FORWARD 0
         state_set "$instance" FIREWALL_BASE_NAT_MODE none
         state_set "$instance" FIREWALL_PERSISTENCE iptables-persistent
-        fw_sync_host_global_masquerade || return 1
-        install_firewall_reapply_unit
-        if [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" != 1 ]]; then
-            fw_write_persistent_rules_files || return 1
-            systemctl enable netfilter-persistent.service >/dev/null 2>&1 || true
-            print_ok "Simple iptables-persistent applied: Manager FORWARD chains removed; host-wide POSTROUTING MASQUERADE saved to $IPTABLES_RULES_V4."
+
+        # Do not run this from the Manager firewall boot service. In this profile
+        # netfilter-persistent alone owns boot restoration.
+        if [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" == 1 ]]; then
+            return 0
         fi
-        audit "firewall-simple-persistent instance=$instance global_masquerade=1 rules_v4=$IPTABLES_RULES_V4"
+        fw_sync_manager_reapply_service || true
+        fw_apply_plain_iptables_persistent || return 1
+        audit "firewall-plain-persistent instance=$instance rule=POSTROUTING-MASQUERADE rules_v4=$IPTABLES_RULES_V4"
+        print_ok "iptables-persistent legacy/plain applied: no Manager INPUT/FORWARD/NAT rules; POSTROUTING MASQUERADE saved to $IPTABLES_RULES_V4."
         return 0
     fi
 
+    # Standard/advanced profiles are Manager-owned and may create scoped rules.
+    fw_remove_legacy_v29_rules "$instance" || true
+    enable_ip_forwarding
     [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" == 1 ]] || install_available_packages iptables
     if [[ "$mode" == ufw && ! -x "$(command -v ufw 2>/dev/null || true)" ]]; then
         print_err "UFW backend is selected for $instance, but ufw is not installed."; return 1
@@ -13474,7 +13544,7 @@ apply_firewall_for_instance() {
         fw_save_iptables_persistent_noninteractive || print_warn "Could not update iptables-persistent rules files."
     fi
     subnet="$(state_get "$instance" SUBNET 2>/dev/null || true)"; iface="$(fw_primary_out_iface "$instance")"
-    audit "firewall-v34-applied instance=$instance backend=$mode profile=$profile subnet=$subnet primary_out=$iface custom_rules=$(jq '.rules|length' "$(firewall_policy_file "$instance")" 2>/dev/null || echo 0)"
+    audit "firewall-v35-applied instance=$instance backend=$mode profile=$profile subnet=$subnet primary_out=$iface custom_rules=$(jq '.rules|length' "$(firewall_policy_file "$instance")" 2>/dev/null || echo 0)"
     [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" == 1 ]] || print_ok "Firewall policy applied for $instance (profile=$profile, backend=$mode)."
 }
 
@@ -13495,6 +13565,9 @@ reapply_all_firewall_rules() {
     enable_ip_forwarding
     while read -r instance; do
         [[ -n "$instance" && -f "$(instance_state_file "$instance")" ]] || continue
+        if [[ "$(fw_profile_for_instance "$instance")" == iptables-persistent-simple ]]; then
+            continue
+        fi
         apply_firewall_for_instance "$instance" || print_warn "Could not reapply firewall policy for $instance"
         if [[ -d "$(vhost_dir "$instance")" ]]; then
             for f in "$(vhost_dir "$instance")"/*.conf; do
@@ -13504,6 +13577,59 @@ reapply_all_firewall_rules() {
             done
         fi
     done < <(list_instances | sort -u)
+}
+
+fw_network_path_report() {
+    local instance="${1:-default}"
+    echo "==== Network path report (read-only): $instance ===="
+    echo "Generated: $(date -Is 2>/dev/null || date)"
+    echo
+    echo "---- Manager persistence ownership ----"
+    printf 'Profile: %s\n' "$(fw_profile_for_instance "$instance" 2>/dev/null || echo unknown)"
+    local v
+    v="$(systemctl is-enabled ocserv-manager-firewall.service 2>/dev/null || true)"; printf 'ocserv-manager-firewall enabled: %s\n' "${v:-no}"
+    v="$(systemctl is-active ocserv-manager-firewall.service 2>/dev/null || true)"; printf 'ocserv-manager-firewall active: %s\n' "${v:-no}"
+    v="$(systemctl is-enabled netfilter-persistent.service 2>/dev/null || true)"; printf 'netfilter-persistent enabled: %s\n' "${v:-no}"
+    v="$(systemctl is-active netfilter-persistent.service 2>/dev/null || true)"; printf 'netfilter-persistent active: %s\n' "${v:-no}"
+    echo
+    echo "---- IPv4 forwarding ----"
+    sysctl net.ipv4.ip_forward 2>/dev/null || true
+    echo
+    echo "---- iptables FORWARD ----"
+    iptables -S FORWARD 2>/dev/null || true
+    echo
+    echo "---- iptables NAT POSTROUTING ----"
+    iptables -t nat -S POSTROUTING 2>/dev/null || true
+    echo
+    echo "---- Manager-owned iptables traces ----"
+    iptables-save 2>/dev/null | grep -E 'OCM[A-F0-9]+|ocserv-manager' || echo "(none)"
+    echo
+    echo "---- IPv4 policy rules ----"
+    ip -4 rule show 2>/dev/null || true
+    echo
+    echo "---- IPv4 routes: all tables ----"
+    ip -4 route show table all 2>/dev/null || true
+    echo
+    echo "---- IPv6 policy rules ----"
+    ip -6 rule show 2>/dev/null || true
+    echo
+    echo "---- IPv6 routes: all tables ----"
+    ip -6 route show table all 2>/dev/null || true
+    echo
+    echo "---- nftables tables ----"
+    if command -v nft >/dev/null 2>&1; then
+        nft list tables 2>/dev/null || true
+    else
+        echo "nft command not installed"
+    fi
+    echo
+    echo "---- DNS resolver ----"
+    cat /etc/resolv.conf 2>/dev/null || true
+    echo
+    echo "---- Default IPv4 route decision ----"
+    ip -4 route get 1.1.1.1 2>/dev/null || true
+    echo
+    echo "This report does not modify routes, nftables, DNS, or firewall rules."
 }
 
 fw_show_detected_network() {
@@ -13797,7 +13923,7 @@ fw_restore_temp_bundle() {
     [[ -f "$dir/state.env" ]] && cp -a "$dir/state.env" "$(instance_state_file "$instance")"
     if [[ -s "$dir/rules.v4" ]] && command -v iptables-restore >/dev/null 2>&1; then iptables-restore < "$dir/rules.v4" || true; fi
     if [[ -s "$dir/rules.v6" ]] && command -v ip6tables-restore >/dev/null 2>&1; then ip6tables-restore < "$dir/rules.v6" || true; fi
-    apply_firewall_for_instance "$instance" >/dev/null 2>&1 || true
+    fw_sync_manager_reapply_service >/dev/null 2>&1 || true
 }
 
 fw_prepare_change() {
@@ -13902,6 +14028,44 @@ fw_base_policy_menu() {
     done
 }
 
+
+fw_activate_simple_persistent_now() {
+    local instance="$1" rollback
+    rollback="$(fw_prepare_change "$instance" iptables-persistent-legacy-plain)"
+    print_warn "This mode disables Manager-owned INPUT/FORWARD/NAT rules for this instance and uses broad host-wide source NAT."
+    ask_yes_no "Apply iptables-persistent legacy/plain mode now?" "n" || { rm -rf "$rollback"; return 0; }
+    fw_optional_backup_existing_persistent_rules
+
+    # Migration cleanup is internal and runs only once when moving an older
+    # Manager-managed firewall to legacy/plain mode. It is intentionally not
+    # exposed as a normal restore/cleanup workflow.
+    if [[ "$(state_get "$instance" FIREWALL_PLAIN_TRANSITION_CLEANED 2>/dev/null || echo 0)" != 1 ]]; then
+        fw_remove_ufw_rules_by_prefix "$instance" || true
+        fw_remove_legacy_v29_rules "$instance" || true
+        fw_force_remove_old_direct_rules "$instance" || true
+        fw_deep_purge_instance_traces "$instance" || true
+        state_set "$instance" FIREWALL_PLAIN_TRANSITION_CLEANED 1
+    fi
+
+    state_set "$instance" FIREWALL_PROFILE iptables-persistent-simple
+    state_set "$instance" FIREWALL_MODE iptables
+    state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 1
+    state_set "$instance" FIREWALL_BASE_INGRESS 0
+    state_set "$instance" FIREWALL_BASE_FORWARD 0
+    state_set "$instance" FIREWALL_BASE_NAT_MODE none
+    state_set "$instance" FIREWALL_BASE_SNAT_IP ""
+    state_set "$instance" FIREWALL_PERSISTENCE iptables-persistent
+
+    fw_sync_manager_reapply_service || true
+    if fw_apply_plain_iptables_persistent; then
+        rm -rf "$rollback"
+        print_ok "iptables-persistent legacy/plain is active."
+        return 0
+    fi
+    print_err "iptables-persistent setup failed; restoring the pre-change firewall."
+    fw_restore_temp_bundle "$instance" "$rollback"; rm -rf "$rollback"; return 1
+}
+
 fw_backend_menu() {
     local instance="$1" rollback
     rollback="$(fw_prepare_change "$instance" firewall-profile-change)"
@@ -13935,43 +14099,34 @@ fw_show_live_rules() {
 }
 
 fw_restore_snapshot_menu() {
-    local instance="$1" root d i choice rollback profile
+    local instance="$1" root d i choice rollback
     local -a snaps=()
     root="$(fw_snapshot_dir_for_instance "$instance")"; [[ -d "$root" ]] || { print_warn "No persistent firewall snapshots exist for $instance."; return 0; }
     while IFS= read -r d; do [[ -d "$d" ]] && snaps+=("$d"); done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%p\n' | sort -r)
     ((${#snaps[@]})) || { print_warn "No snapshots found."; return 0; }
     echo "Firewall snapshots:"; for ((i=0;i<${#snaps[@]};i++)); do printf '%d) %s\n' "$((i+1))" "${snaps[$i]}"; done; echo "0) Cancel"
-    read -r -p "Select: " choice || true; [[ "$choice" == 0 ]] && return 0; [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#snaps[@]})) || { print_warn "Invalid selection."; return 0; }
-    d="${snaps[$((choice-1))]}"; ask_yes_no "Restore firewall snapshot $d?" "n" || return 0
+    read -r -p "Select: " choice || true
+    [[ "$choice" == 0 ]] && return 0
+    [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#snaps[@]})) || { print_warn "Invalid selection."; return 0; }
+    d="${snaps[$((choice-1))]}"
+    ask_yes_no "Restore firewall snapshot $d exactly as saved?" "n" || return 0
     rollback="$(fw_prepare_change "$instance" restore-snapshot)"
-
-    # Remove current Manager hooks/chains before any restore. This prevents stale
-    # ocserv FORWARD jumps from surviving a return to an older/plain ruleset.
-    fw_remove_ufw_rules_by_prefix "$instance" || true
-    fw_remove_instance_chains "$instance" ipv4 || true
-    fw_remove_instance_chains "$instance" ipv6 || true
-    fw_remove_legacy_v29_rules "$instance" || true
-    fw_force_remove_old_direct_rules "$instance" || true
-    remove_all_vhost_firewalls "$instance" 2>/dev/null || true
 
     [[ -f "$d/policy.json" ]] && cp -a "$d/policy.json" "$(firewall_policy_file "$instance")"
     [[ -f "$d/state.env" ]] && cp -a "$d/state.env" "$(instance_state_file "$instance")"
-    if [[ -s "$d/rules.v4" ]]; then iptables-restore < "$d/rules.v4" || { fw_restore_temp_bundle "$instance" "$rollback"; rm -rf "$rollback"; return 1; }; fi
-    if [[ -s "$d/rules.v6" ]] && command -v ip6tables-restore >/dev/null 2>&1; then ip6tables-restore < "$d/rules.v6" || true; fi
-
-    profile="$(fw_profile_for_instance "$instance")"
-    if [[ "$profile" == iptables-persistent-simple ]]; then
-        # Old snapshots may themselves contain v3 Manager chains. The simple
-        # profile guarantees that they are removed after the host rules load.
-        fw_remove_instance_chains "$instance" ipv4 || true
-        fw_remove_instance_chains "$instance" ipv6 || true
-        fw_remove_legacy_v29_rules "$instance" || true
-        fw_force_remove_old_direct_rules "$instance" || true
-        remove_all_vhost_firewalls "$instance" 2>/dev/null || true
+    if [[ -s "$d/rules.v4" ]] && ! iptables-restore < "$d/rules.v4"; then
+        print_err "IPv4 firewall restore failed; restoring the pre-restore state."
+        fw_restore_temp_bundle "$instance" "$rollback"; rm -rf "$rollback"; return 1
     fi
-    if apply_firewall_for_instance "$instance"; then rm -rf "$rollback"; print_ok "Firewall snapshot restored cleanly."; return 0; fi
-    print_err "Restore failed; rolling back the pre-restore live firewall."
-    fw_restore_temp_bundle "$instance" "$rollback"; rm -rf "$rollback"; return 1
+    if [[ -s "$d/rules.v6" ]] && command -v ip6tables-restore >/dev/null 2>&1; then
+        if ! ip6tables-restore < "$d/rules.v6"; then
+            print_err "IPv6 firewall restore failed; restoring the pre-restore state."
+            fw_restore_temp_bundle "$instance" "$rollback"; rm -rf "$rollback"; return 1
+        fi
+    fi
+    fw_sync_manager_reapply_service >/dev/null 2>&1 || true
+    rm -rf "$rollback"
+    print_ok "Firewall snapshot restored exactly as saved."
 }
 
 fw_reset_defaults() {
@@ -14072,35 +14227,19 @@ fw_simple_rule_list() {
     jq -r '.rules | to_entries[] | . as $e | (if $e.value.enabled==false then "OFF" else "ON " end) as $st | [$e.key+1,$st,($e.value.kind // "unknown"),($e.value.source // "any"),($e.value.destination // "any"),($e.value.out_iface // "any"),($e.value.description // "")] | @tsv' "$file" | awk -F '\t' '{printf "%s) %s  %s  src=%s  dst=%s  out=%s  %s\n",$1,$2,$3,$4,$5,$6,$7}'
 }
 
-fw_clean_reload_rules_v4() {
-    local instance="$1" rollback profile
+fw_reload_rules_v4() {
+    local instance="$1" rollback
     [[ -s "$IPTABLES_RULES_V4" ]] || { print_err "$IPTABLES_RULES_V4 does not exist or is empty."; return 1; }
-    print_warn "This reloads the complete saved IPv4 host firewall."
-    ask_yes_no "Cleanly reload $IPTABLES_RULES_V4 and remove stale Manager firewall chains for $instance?" "n" || return 0
-    rollback="$(fw_prepare_change "$instance" clean-reload-rules-v4)"
-    fw_remove_ufw_rules_by_prefix "$instance" || true
-    fw_remove_instance_chains "$instance" ipv4 || true
-    fw_remove_instance_chains "$instance" ipv6 || true
-    fw_remove_legacy_v29_rules "$instance" || true
-    fw_force_remove_old_direct_rules "$instance" || true
-    remove_all_vhost_firewalls "$instance" 2>/dev/null || true
+    print_warn "Reloading the saved IPv4 rules replaces the current live IPv4 iptables tables with the saved file."
+    ask_yes_no "Reload the saved IPv4 firewall now?" "n" || return 0
+    rollback="$(fw_prepare_change "$instance" reload-rules-v4)"
     if ! iptables-restore < "$IPTABLES_RULES_V4"; then
-        print_err "iptables-restore failed; restoring previous live firewall."
+        print_err "iptables restore failed; restoring the previous live firewall."
         fw_restore_temp_bundle "$instance" "$rollback"; rm -rf "$rollback"; return 1
     fi
-    # If rules.v4 was saved by an older Manager, remove its instance chains again.
-    fw_remove_instance_chains "$instance" ipv4 || true
-    fw_remove_legacy_v29_rules "$instance" || true
-    fw_force_remove_old_direct_rules "$instance" || true
-    remove_all_vhost_firewalls "$instance" 2>/dev/null || true
-    profile="$(fw_profile_for_instance "$instance")"
-    if [[ "$profile" == iptables-persistent-simple ]]; then
-        state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 1
-        fw_sync_host_global_masquerade || { fw_restore_temp_bundle "$instance" "$rollback"; rm -rf "$rollback"; return 1; }
-    fi
-    fw_write_persistent_rules_files || { fw_restore_temp_bundle "$instance" "$rollback"; rm -rf "$rollback"; return 1; }
+    fw_sync_manager_reapply_service >/dev/null 2>&1 || true
     rm -rf "$rollback"
-    print_ok "Saved IPv4 firewall reloaded and stale Manager chains for $instance were removed."
+    print_ok "Saved IPv4 firewall reloaded."
 }
 
 fw_backup_restore_menu() {
@@ -14109,15 +14248,13 @@ fw_backup_restore_menu() {
         echo; echo "==== Firewall backup / restore: $instance ===="
         echo "1) Create snapshot"
         echo "2) Restore snapshot"
-        echo "3) Clean reload $IPTABLES_RULES_V4 (remove stale Manager chains)"
-        echo "4) Reset to Manager defaults"
+        echo "3) Reset firewall profile to Manager defaults"
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
             1) fw_create_snapshot "$instance" manual || true; pause ;;
             2) fw_restore_snapshot_menu "$instance"; pause ;;
-            3) fw_clean_reload_rules_v4 "$instance"; pause ;;
-            4) fw_reset_defaults "$instance"; pause ;;
+            3) fw_reset_defaults "$instance"; pause ;;
             0) return 0 ;;
             *) print_warn "Invalid selection." ;;
         esac
@@ -14146,43 +14283,24 @@ fw_iptables_management_menu() {
     while true; do
         echo; echo "==== iptables: $instance ===="
         echo "Profile: $(fw_profile_for_instance "$instance")"
-        echo "Global POSTROUTING MASQUERADE: $(iptables -t nat -C POSTROUTING -j MASQUERADE >/dev/null 2>&1 && echo ON || echo OFF)"
-        echo "Saved rules: $([[ -s "$IPTABLES_RULES_V4" ]] && echo "$IPTABLES_RULES_V4" || echo none)"
+        echo "Global MASQUERADE: $(iptables -t nat -C POSTROUTING -j MASQUERADE >/dev/null 2>&1 && echo ON || echo OFF)"
+        echo "Saved IPv4 rules: $([[ -s "$IPTABLES_RULES_V4" ]] && echo present || echo not-saved)"
         echo
-        echo "1) Simple iptables-persistent setup (install + Global MASQUERADE + save)"
-        echo "2) Show current iptables rules"
-        echo "3) Save current rules to $IPTABLES_RULES_V4"
-        echo "4) Clean reload $IPTABLES_RULES_V4"
-        echo "5) Toggle Global POSTROUTING MASQUERADE"
-        echo "6) Advanced managed rules"
-        echo "7) netfilter-persistent service"
+        echo "1) Apply iptables-persistent legacy/plain mode"
+        echo "2) Show current rules"
+        echo "3) Save current IPv4 rules"
+        echo "4) Reload saved IPv4 rules"
+        echo "5) Global MASQUERADE on/off"
+        echo "6) netfilter-persistent service"
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
-            1)
-                if ask_yes_no "Apply SIMPLE iptables-persistent mode now? Manager FORWARD chains for this instance will be removed." "n"; then
-                    local rb; rb="$(fw_prepare_change "$instance" simple-iptables-persistent)"
-                    fw_optional_backup_existing_persistent_rules
-                    if fw_install_iptables_persistent_simple; then
-                        state_set "$instance" FIREWALL_PROFILE iptables-persistent-simple
-                        state_set "$instance" FIREWALL_MODE iptables
-                        state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 1
-                        state_set "$instance" FIREWALL_BASE_INGRESS 0
-                        state_set "$instance" FIREWALL_BASE_FORWARD 0
-                        state_set "$instance" FIREWALL_BASE_NAT_MODE none
-                        state_set "$instance" FIREWALL_PERSISTENCE iptables-persistent
-                        fw_commit_or_rollback "$instance" "$rb"
-                    else
-                        rm -rf "$rb"; print_err "Package installation failed; no profile change was committed."
-                    fi
-                fi
-                pause ;;
+            1) fw_activate_simple_persistent_now "$instance"; pause ;;
             2) iptables -S 2>/dev/null || true; echo; iptables -t nat -S 2>/dev/null || true; pause ;;
             3) fw_save_iptables_persistent_interactive; pause ;;
-            4) fw_clean_reload_rules_v4 "$instance"; pause ;;
+            4) fw_reload_rules_v4 "$instance"; pause ;;
             5) fw_toggle_host_global_masquerade "$instance"; pause ;;
-            6) fw_rules_management_menu "$instance" ;;
-            7) fw_netfilter_persistent_service_menu; pause ;;
+            6) fw_netfilter_persistent_service_menu; pause ;;
             0) return 0 ;;
             *) print_warn "Invalid selection." ;;
         esac
@@ -14319,10 +14437,11 @@ fw_status_menu() {
         echo; echo "==== Firewall status: $instance ===="
         fw_policy_summary "$instance"
         echo
-        echo "1) Apply/reapply saved firewall now"
-        echo "2) Show live Manager-owned rules"
-        echo "3) Show full host firewall read-only"
+        echo "1) Apply current saved profile"
+        echo "2) Show Manager-owned rules"
+        echo "3) Show full host firewall (read-only)"
         echo "4) Show detected network"
+        echo "5) Network path report (read-only)"
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
@@ -14330,6 +14449,7 @@ fw_status_menu() {
             2) fw_show_live_rules "$instance"; pause ;;
             3) fw_show_host_firewall_readonly; pause ;;
             4) fw_show_detected_network; pause ;;
+            5) fw_network_path_report "$instance"; pause ;;
             0) return 0 ;;
             *) print_warn "Invalid selection." ;;
         esac
@@ -14344,12 +14464,12 @@ firewall_manager_menu() {
         echo "Current profile: $(fw_profile_for_instance "$instance")"
         echo "Global MASQUERADE: $(iptables -t nat -C POSTROUTING -j MASQUERADE >/dev/null 2>&1 && echo ON || echo OFF)"
         echo
-        echo "1) Choose firewall mode (standard iptables / simple iptables-persistent / UFW)"
+        echo "1) Choose/change firewall mode"
         echo "2) iptables"
         echo "3) UFW"
-        echo "4) NAT / routing / advanced rules"
+        echo "4) Advanced NAT / routing / managed rules"
         echo "5) Backup / restore"
-        echo "6) Status / live rules"
+        echo "6) Status / diagnostics"
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
@@ -14365,9 +14485,6 @@ firewall_manager_menu() {
     done
 }
 
-# -----------------------------------------------------------------------------
-# Instance management menus
-# -----------------------------------------------------------------------------
 instance_detail_menu() {
     local instance="$1" choice
     while true; do
@@ -14618,6 +14735,10 @@ case "${1:-}" in
         need_root; ensure_dirs; reapply_all_firewall_rules
         exit $?
         ;;
+    --network-report)
+        need_root; ensure_dirs; fw_network_path_report "${2:-default}"
+        exit $?
+        ;;
     --json-status)
         need_root; ensure_dirs
         command -v jq >/dev/null 2>&1 || { print_err "jq is required for JSON status. Run the interactive manager once or install jq."; exit 1; }
@@ -14681,6 +14802,7 @@ case "${1:-}" in
 $PROGRAM_NAME $PROGRAM_VERSION
 Usage: $0 [option]
   --version                 Show manager version
+  --network-report [instance]  Read-only policy-route/nftables/DNS/firewall report
   --reapply-firewall        Reapply only manager-owned scoped firewall rules (normally used by systemd)
   --json-status [instance]  Print read-only JSON status
   --validate-all            Validate all registered ocserv configs
