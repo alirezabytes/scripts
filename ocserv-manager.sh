@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Ocserv Manager v3.0.0
+# Ocserv Manager v3.1.0
 # Multi-instance installer and manager for ocserv on Ubuntu/Debian.
 # Designed as a replacement for the original single-instance ocserv.sh.
 
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="3.0.0"
+PROGRAM_VERSION="3.1.0"
 PROGRAM_NAME="Ocserv Manager"
 
 OCSERV_ETC="/etc/ocserv"
@@ -3308,22 +3308,39 @@ occtl_json() {
 }
 
 connected_users_count() {
-    local instance="$1" json
-    json="$(occtl_json "$instance" show users 2>/dev/null)" || { echo 0; return; }
-    python3 - "$json" <<'PY'
+    # Never pass occtl JSON as a command-line argument. Busy servers can return
+    # hundreds/thousands of session objects and exceed Linux ARG_MAX.
+    local instance="$1" tmp rc
+    tmp="$(mktemp)"
+    if ! occtl_json "$instance" show users >"$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        echo 0
+        return 0
+    fi
+    python3 - "$tmp" <<'PYCOUNT'
 import json,sys
-try: x=json.loads(sys.argv[1])
-except Exception: print(0); raise SystemExit
-if isinstance(x,list): print(len(x))
+try:
+    with open(sys.argv[1], 'r', encoding='utf-8', errors='replace') as f:
+        x=json.load(f)
+except Exception:
+    print(0)
+    raise SystemExit(0)
+if isinstance(x,list):
+    print(len(x))
 elif isinstance(x,dict):
     for k in ('users','connections','sessions'):
-        if isinstance(x.get(k),list): print(len(x[k])); break
+        if isinstance(x.get(k),list):
+            print(len(x[k])); break
     else:
-        # Some occtl JSON versions use numeric keys or one object per ID.
         vals=[v for v in x.values() if isinstance(v,dict)]
         print(len(vals))
-else: print(0)
-PY
+else:
+    print(0)
+PYCOUNT
+    rc=$?
+    rm -f "$tmp"
+    (( rc == 0 )) || echo 0
+    return 0
 }
 
 show_connected_users() {
@@ -3466,7 +3483,7 @@ create_instance_wizard() {
     configure_network_profile "$instance"
     configure_routing_profile "$instance"
     configure_firewall_mode "$instance"
-    if ask_yes_no "Open the advanced per-instance Firewall Manager now? You can also configure it later." "n"; then firewall_manager_menu "$instance"; fi
+    if ask_yes_no "Open per-instance Firewall setup now? You can also configure it later." "n"; then firewall_manager_menu "$instance"; fi
     state_set "$instance" CENTRAL_ENABLED 0
     state_set "$instance" MANAGED 1
 
@@ -12360,14 +12377,14 @@ status_dashboard() {
     echo "ocserv binary: ${binary:-not found}"
     echo "Outbound interface: $(default_route_iface || echo unknown)"
     echo "IPv4 forwarding: $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unknown)"
-    echo "Firewall: per-instance Firewall Manager; iptables is default, UFW is opt-in and never auto-enabled."
-    echo "Advanced NAT/FORWARD/custom rules are isolated in manager-owned per-instance chains."
+    echo "Firewall: per-instance simple setup; iptables is default, UFW is opt-in and never auto-enabled."
+    echo "Advanced rules remain available under Firewall -> Advanced and stay isolated in manager-owned chains."
     echo
     printf '%-18s %-9s %-23s %-18s %-10s %-10s\n' "INSTANCE" "STATE" "LISTEN" "SUBNET" "ONLINE" "CERT-DAYS"
     while read -r i; do
         [[ -n "$i" ]] || continue
         svc="$(instance_service "$i")"; active="$(systemctl is-active "$svc" 2>/dev/null || echo unknown)"
-        tcp="$(state_get "$i" TCP_PORT 2>/dev/null || echo '?')"; udp="$(state_get "$i" UDP_PORT 2>/dev/null || echo '?')"; listen="$(state_get "$i" LISTEN_HOST 2>/dev/null || echo '*')"; subnet="$(state_get "$i" SUBNET 2>/dev/null || echo '?')"; connected="$(connected_users_count "$i")"; cert="$(state_get "$i" SERVER_CERT 2>/dev/null || true)"; days="$(certificate_days_left "$cert" 2>/dev/null || echo -1)"
+        tcp="$(state_get "$i" TCP_PORT 2>/dev/null || echo '?')"; udp="$(state_get "$i" UDP_PORT 2>/dev/null || echo '?')"; listen="$(state_get "$i" LISTEN_HOST 2>/dev/null || echo '*')"; subnet="$(state_get "$i" SUBNET 2>/dev/null || echo '?')"; connected="$(connected_users_count "$i" 2>/dev/null || echo 0)"; cert="$(state_get "$i" SERVER_CERT 2>/dev/null || true)"; days="$(certificate_days_left "$cert" 2>/dev/null || echo -1)"
         printf '%-18s %-9s %-23s %-18s %-10s %-10s\n' "$i" "$active" "$listen:$tcp/$udp" "$subnet" "$connected" "$days"
     done < <(list_instances | sort -u)
 
@@ -13611,57 +13628,259 @@ fw_show_host_firewall_readonly() {
     print_info "This view is read-only. Firewall Manager edits only rules owned by the selected ocserv instance."
 }
 
-firewall_manager_menu() {
-    local instance="$1" choice rollback file tmp
-    ensure_firewall_policy_file "$instance" || return 1
+
+fw_choose_interface_simple() {
+    local prompt="$1" allow_any="${2:-0}" line name state addr i choice
+    local -a items=() states=() addrs=()
+    while IFS= read -r line; do
+        name="$(awk -F': ' '{print $2}' <<<"$line" | sed 's/@.*//')"
+        [[ -n "$name" ]] || continue
+        [[ "$name" == lo ]] && continue
+        [[ "$name" =~ ^vpns[0-9]+$ ]] && continue
+        state="$(awk '{for(i=1;i<=NF;i++) if($i=="state") print $(i+1)}' <<<"$line")"
+        addr="$(ip -o -4 addr show dev "$name" 2>/dev/null | awk '{print $4}' | paste -sd, -)"
+        items+=("$name"); states+=("${state:-?}"); addrs+=("${addr:-no-ipv4}")
+    done < <(ip -o link show 2>/dev/null)
+    echo "$prompt" >&2
+    [[ "$allow_any" == 1 ]] && echo "0) Any interface" >&2
+    for ((i=0;i<${#items[@]};i++)); do
+        printf '%d) %s  state=%s  ipv4=%s\n' "$((i+1))" "${items[$i]}" "${states[$i]}" "${addrs[$i]}" >&2
+    done
+    echo "m) Enter interface manually" >&2
     while true; do
-        echo; echo "==== Firewall Manager: $instance ===="
-        fw_policy_summary "$instance"
-        echo
-        echo "1) Select/change backend (iptables / UFW)"
-        echo "2) Base ocserv firewall policy (ingress / forward / primary route / NAT)"
-        echo "3) List custom managed rules"
-        echo "4) Add managed rule"
-        echo "5) Edit managed rule"
-        echo "6) Enable/disable managed rule"
-        echo "7) Delete managed rule"
-        echo "8) Clone managed rule"
-        echo "9) Detect/show interfaces, local IPs, routes and policy rules"
-        echo "10) Apply/reapply current saved firewall policy"
-        echo "11) Show live manager-owned firewall rules"
-        echo "12) Create firewall snapshot"
-        echo "13) Restore firewall snapshot / previous saved state"
-        echo "14) Reset to Manager firewall defaults"
-        echo "15) Remove all custom rules (keep base policy)"
-        echo "16) Show full host firewall (read-only; iptables/UFW/nftables)"
+        read -r -p "Select: " choice || true
+        [[ "$allow_any" == 1 && "$choice" == 0 ]] && { echo ""; return 0; }
+        if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#items[@]})); then
+            echo "${items[$((choice-1))]}"; return 0
+        fi
+        if [[ "$choice" == m || "$choice" == M ]]; then
+            name="$(ask_value "Interface name" "")"
+            valid_interface_name "$name" && { echo "$name"; return 0; }
+            print_warn "Invalid interface name." >&2
+        else
+            print_warn "Invalid selection." >&2
+        fi
+    done
+}
+
+fw_quick_add_forward() {
+    local instance="$1" rollback outif desc id file tmp rule
+    ensure_firewall_policy_file "$instance" || return 1
+    echo
+    print_info "Creates: VPN subnet -> selected interface/TUN, plus RELATED/ESTABLISHED return traffic."
+    outif="$(fw_choose_interface_simple "Choose interface/TUN" 0)" || return 0
+    [[ -n "$outif" ]] || return 0
+    desc="$(ask_value "Description" "VPN through $outif")"
+    rollback="$(fw_prepare_change "$instance" quick-forward)"
+    id="$(fw_new_rule_id)"
+    rule="$(jq -nc --arg id "$id" --arg out "$outif" --arg desc "$desc" '{id:$id,enabled:true,kind:"forward_pair",family:"ipv4",source:"@vpn",destination:"any",in_iface:"",out_iface:$out,action:"ACCEPT",return_established:true,description:$desc}')"
+    file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"
+    jq --argjson r "$rule" '.rules += [$r]' "$file" >"$tmp" && mv "$tmp" "$file"
+    fw_commit_or_rollback "$instance" "$rollback"
+}
+
+fw_quick_add_masquerade() {
+    local instance="$1" rollback outif desc id file tmp rule
+    ensure_firewall_policy_file "$instance" || return 1
+    echo
+    print_info "Adds extra MASQUERADE for this VPN subnet on one selected egress interface."
+    outif="$(fw_choose_interface_simple "Choose NAT egress interface" 0)" || return 0
+    [[ -n "$outif" ]] || return 0
+    desc="$(ask_value "Description" "VPN NAT via $outif")"
+    rollback="$(fw_prepare_change "$instance" quick-masquerade)"
+    id="$(fw_new_rule_id)"
+    rule="$(jq -nc --arg id "$id" --arg out "$outif" --arg desc "$desc" '{id:$id,enabled:true,kind:"nat_masquerade",family:"ipv4",source:"@vpn",destination:"any",in_iface:"",out_iface:$out,action:"ACCEPT",return_established:false,description:$desc}')"
+    file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"
+    jq --argjson r "$rule" '.rules += [$r]' "$file" >"$tmp" && mv "$tmp" "$file"
+    fw_commit_or_rollback "$instance" "$rollback"
+}
+
+fw_show_detected_network_simple() {
+    local def line name state addr suffix
+    def="$(default_route_iface 2>/dev/null || true)"
+    echo "==== Useful interfaces ===="
+    while IFS= read -r line; do
+        name="$(awk -F': ' '{print $2}' <<<"$line" | sed 's/@.*//')"
+        [[ -n "$name" && "$name" != lo ]] || continue
+        [[ "$name" =~ ^vpns[0-9]+$ ]] && continue
+        state="$(awk '{for(i=1;i<=NF;i++) if($i=="state") print $(i+1)}' <<<"$line")"
+        addr="$(ip -o -4 addr show dev "$name" 2>/dev/null | awk '{print $4}' | paste -sd, -)"
+        suffix=""; [[ "$name" == "$def" ]] && suffix="  [default Internet]"
+        printf -- '- %s  state=%s  ipv4=%s%s\n' "$name" "${state:-?}" "${addr:-no-ipv4}" "$suffix"
+    done < <(ip -o link show 2>/dev/null)
+    echo; echo "==== Default route ===="
+    ip -4 route show default 2>/dev/null | sed 's/^/- /' || true
+    echo; echo "==== Policy rules ===="
+    ip rule show 2>/dev/null | sed 's/^/- /' || true
+    echo
+    print_info "Ephemeral ocserv client interfaces (vpnsNNN) are hidden here. Advanced view shows everything."
+}
+
+fw_simple_rule_list() {
+    local instance="$1" file
+    ensure_firewall_policy_file "$instance" || return 1
+    file="$(firewall_policy_file "$instance")"
+    if [[ "$(jq '.rules|length' "$file")" == 0 ]]; then
+        print_info "No extra managed firewall rules for $instance."
+        return 0
+    fi
+    jq -r '.rules | to_entries[] | . as $e | (if $e.value.enabled==false then "OFF" else "ON " end) as $st | [$e.key+1,$st,($e.value.kind // "unknown"),($e.value.source // "any"),($e.value.destination // "any"),($e.value.out_iface // "any"),($e.value.description // "")] | @tsv' "$file" | awk -F '\t' '{printf "%s) %s  %s  src=%s  dst=%s  out=%s  %s\n",$1,$2,$3,$4,$5,$6,$7}'
+}
+
+fw_quick_setup_menu() {
+    local instance="$1" choice
+    while true; do
+        echo; echo "==== Quick firewall setup: $instance ===="
+        echo "1) Allow VPN through an interface/TUN (common: singtun0, wg0, tun0)"
+        echo "2) Add extra MASQUERADE NAT on an interface"
+        echo "3) Change normal Internet egress / base NAT"
+        echo "4) Show useful interfaces/routes"
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
-            1) fw_backend_menu "$instance"; pause ;;
-            2) fw_base_policy_menu "$instance" ;;
-            3) fw_list_rules "$instance"; pause ;;
-            4) fw_policy_add_rule "$instance"; pause ;;
-            5) fw_policy_edit_rule "$instance"; pause ;;
-            6) fw_policy_toggle_rule "$instance"; pause ;;
-            7) fw_policy_delete_rule "$instance"; pause ;;
-            8) fw_policy_clone_rule "$instance"; pause ;;
-            9) fw_show_detected_network; pause ;;
-            10) apply_firewall_for_instance "$instance"; pause ;;
-            11) fw_show_live_rules "$instance"; pause ;;
-            12) fw_create_snapshot "$instance" manual || true; pause ;;
-            13) fw_restore_snapshot_menu "$instance"; pause ;;
-            14) fw_reset_defaults "$instance"; pause ;;
-            15)
-                ask_yes_no "Delete all custom firewall rules for $instance?" "n" || continue
-                rollback="$(fw_prepare_change "$instance" clear-custom-rules)"; file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"; jq '.rules=[]' "$file" > "$tmp" && mv "$tmp" "$file"; fw_commit_or_rollback "$instance" "$rollback"; pause
-                ;;
-            16) fw_show_host_firewall_readonly; pause ;;
+            1) fw_quick_add_forward "$instance"; pause ;;
+            2) fw_quick_add_masquerade "$instance"; pause ;;
+            3) fw_base_policy_menu "$instance" ;;
+            4) fw_show_detected_network_simple; pause ;;
             0) return 0 ;;
             *) print_warn "Invalid selection." ;;
         esac
     done
 }
 
+fw_rules_simple_menu() {
+    local instance="$1" choice
+    while true; do
+        echo; echo "==== Extra firewall rules: $instance ===="
+        fw_simple_rule_list "$instance"
+        echo
+        echo "1) Add common VPN -> interface/TUN rule"
+        echo "2) Enable/disable a rule"
+        echo "3) Delete a rule"
+        echo "4) Edit/rebuild a rule (detailed wizard)"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
+        case "$choice" in
+            1) fw_quick_add_forward "$instance"; pause ;;
+            2) fw_policy_toggle_rule "$instance"; pause ;;
+            3) fw_policy_delete_rule "$instance"; pause ;;
+            4) fw_policy_edit_rule "$instance"; pause ;;
+            0) return 0 ;;
+            *) print_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+fw_status_apply_menu() {
+    local instance="$1" choice
+    while true; do
+        echo; echo "==== Firewall status: $instance ===="
+        fw_policy_summary "$instance"
+        echo
+        echo "1) Show extra rules"
+        echo "2) Apply/reapply saved firewall now"
+        echo "3) Show useful interfaces/routes"
+        echo "4) Show live Manager-owned chains"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
+        case "$choice" in
+            1) fw_simple_rule_list "$instance"; pause ;;
+            2) apply_firewall_for_instance "$instance"; pause ;;
+            3) fw_show_detected_network_simple; pause ;;
+            4) fw_show_live_rules "$instance"; pause ;;
+            0) return 0 ;;
+            *) print_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+fw_backup_restore_menu() {
+    local instance="$1" choice
+    while true; do
+        echo; echo "==== Firewall backup / restore: $instance ===="
+        echo "1) Create snapshot"
+        echo "2) Restore snapshot / previous saved state"
+        echo "3) Reset to Manager firewall defaults"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
+        case "$choice" in
+            1) fw_create_snapshot "$instance" manual || true; pause ;;
+            2) fw_restore_snapshot_menu "$instance"; pause ;;
+            3) fw_reset_defaults "$instance"; pause ;;
+            0) return 0 ;;
+            *) print_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+fw_advanced_menu() {
+    local instance="$1" choice rollback file tmp
+    while true; do
+        echo; echo "==== Advanced firewall: $instance ===="
+        echo "1) Full rule wizard (FORWARD/NAT/SNAT/DNAT/INPUT/OUTPUT/UFW/mangle/raw)"
+        echo "2) Clone a rule"
+        echo "3) Full network detection (all vpnsNNN interfaces/tables)"
+        echo "4) Show full host firewall read-only"
+        echo "5) Remove all extra/custom rules (keep base policy)"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
+        case "$choice" in
+            1) fw_policy_add_rule "$instance"; pause ;;
+            2) fw_policy_clone_rule "$instance"; pause ;;
+            3) fw_show_detected_network; pause ;;
+            4) fw_show_host_firewall_readonly; pause ;;
+            5)
+                ask_yes_no "Delete all custom firewall rules for $instance?" "n" || continue
+                rollback="$(fw_prepare_change "$instance" clear-custom-rules)"
+                file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"
+                jq '.rules=[]' "$file" >"$tmp" && mv "$tmp" "$file"
+                fw_commit_or_rollback "$instance" "$rollback"; pause ;;
+            0) return 0 ;;
+            *) print_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+firewall_manager_menu() {
+    local instance="$1" choice
+    ensure_firewall_policy_file "$instance" || return 1
+    while true; do
+        echo; echo "==== Firewall: $instance ===="
+        echo "Backend: $(firewall_mode_for_instance "$instance")"
+        echo "VPN subnet: $(state_get "$instance" SUBNET 2>/dev/null || echo unknown)"
+        echo "Internet egress: $(fw_primary_out_iface "$instance")"
+        echo "Base NAT: $(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || echo masquerade)"
+        echo "Extra rules: $(jq '.rules|length' "$(firewall_policy_file "$instance")" 2>/dev/null || echo 0)"
+        echo
+        echo "1) Quick setup"
+        echo "2) Extra routes / rules"
+        echo "3) Base settings (iptables/UFW, ports, Internet FORWARD/NAT)"
+        echo "4) Status / apply / detected network"
+        echo "5) Backup / restore / reset"
+        echo "6) Advanced"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
+        case "$choice" in
+            1) fw_quick_setup_menu "$instance" ;;
+            2) fw_rules_simple_menu "$instance" ;;
+            3)
+                echo; echo "1) Change backend (iptables / UFW)"; echo "2) Base ocserv firewall policy"; echo "0) Back"
+                read -r -p "Select: " choice || true
+                case "$choice" in
+                    1) fw_backend_menu "$instance"; pause ;;
+                    2) fw_base_policy_menu "$instance" ;;
+                    0) : ;;
+                    *) print_warn "Invalid selection." ;;
+                esac
+                ;;
+            4) fw_status_apply_menu "$instance" ;;
+            5) fw_backup_restore_menu "$instance" ;;
+            6) fw_advanced_menu "$instance" ;;
+            0) return 0 ;;
+            *) print_warn "Invalid selection." ;;
+        esac
+    done
+}
 
 # -----------------------------------------------------------------------------
 # Instance management menus
@@ -13675,7 +13894,7 @@ instance_detail_menu() {
         echo "10) Virtual hosts (SNI)"; echo "11) Diagnostics"; echo "12) Repair"
         echo "13) Clone"; echo "14) Delete instance"; echo "15) Connection stability / mobile roaming / restore"
         echo "16) config-per-user / config-per-group settings"
-        echo "17) Firewall Manager (iptables / UFW / routes / NAT / custom rules / restore)"
+        echo "17) Firewall (simple setup + advanced)"
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
@@ -13700,7 +13919,7 @@ instances_menu() {
         echo "1) List/status dashboard"; echo "2) Create new instance"; echo "3) Manage existing instance"; echo "4) Import existing ocserv installation"; echo "5) Migrate/copy default single instance to named multi-instance"; echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
-            1) status_dashboard; pause;; 2) create_instance_wizard; pause;;
+            1) status_dashboard || print_warn "Dashboard completed with one or more non-fatal errors."; pause;; 2) create_instance_wizard; pause;;
             3) instance="$(choose_instance)" && instance_detail_menu "$instance";;
             4) import_existing_menu; pause;; 5) migrate_default_to_named_instance; pause;; 0) return;; *) print_warn "Invalid selection.";; esac
     done
