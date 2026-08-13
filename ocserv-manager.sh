@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Ocserv Manager v2.7.1
+# Ocserv Manager v2.8.3
 # Multi-instance installer and manager for ocserv on Ubuntu/Debian.
 # Designed as a replacement for the original single-instance ocserv.sh.
 
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="2.8.2"
+PROGRAM_VERSION="2.8.3"
 PROGRAM_NAME="Ocserv Manager"
 
 OCSERV_ETC="/etc/ocserv"
@@ -31,7 +31,7 @@ CENTRAL_INTEGRATION_DIR="/etc/ocserv-manager/central"
 CENTRAL_LIB_DIR="/usr/local/lib/ocserv-manager/central"
 CENTRAL_EMBED_STATE="$MANAGER_ETC/central-embedded.env"
 CENTRAL_PROFILE="$CENTRAL_INTEGRATION_DIR/profile.env"
-CENTRAL_EMBEDDED_VERSION="v20.4.2"
+CENTRAL_EMBEDDED_VERSION="v20.4.3"
 TEMPLATE_ROOT="$MANAGER_ETC/templates"
 INSTANCE_BASE_ROOT="$MANAGER_ETC/config-bases"
 STABILITY_BACKUP_ROOT="$BACKUP_ROOT/stability"
@@ -4133,7 +4133,7 @@ extract_embedded_central_manager() {
     mkdir -p "$(dirname "$destination")"
     cat > "$destination" <<'__OCSERV_MANAGER_EMBEDDED_CENTRAL_V20_7F3A1D__'
 #!/usr/bin/env bash
-# ocserv-central-manager v20.4.2
+# ocserv-central-manager v20.4.3
 # Native multi-instance source synchronization: each ocserv instance can publish its own ocpasswd authority and occtl session stream.
 # Adds safe in-place program update for Manager, Master API, Node Agent, hooks, and cleanup code without reconfigure.
 # Keeps v18 prune controls, v17 threshold export, v16 real ocpasswd prune/group export, v15 extra-traffic decrease/history, v14 reset recovery, v13 authoritative group refresh, v12 cleanup+VACUUM, v10 exhausted tools, and v8 unlimited groups.
@@ -4163,7 +4163,7 @@ CLEANUP_ENV="/etc/ocserv-central/cleanup.env"
 CLEANUP_SERVICE="/etc/systemd/system/ocserv-central-cleanup.service"
 CLEANUP_TIMER="/etc/systemd/system/ocserv-central-cleanup.timer"
 
-PROGRAM_VERSION="v20.4.2"
+PROGRAM_VERSION="v20.4.3"
 API_VERSION="2.3"
 UPDATE_BACKUP_ROOT="/root/ocserv-central-update-backups"
 MASTER_VERSION_FILE="/etc/ocserv-central/installed-version"
@@ -4343,7 +4343,7 @@ REMOVE_MISSING_USERS = os.getenv("REMOVE_MISSING_USERS", "0") == "1"
 EXHAUSTED_LOG_DEFAULT = os.getenv("EXHAUSTED_LOG_PATH", "/var/lib/ocserv-central/quota_exhausted_users.jsonl")
 GIB = 1024 * 1024 * 1024
 
-app = FastAPI(title="ocserv-central", version="2.2")
+app = FastAPI(title="ocserv-central", version="2.3")
 
 def now() -> int:
     return int(time.time())
@@ -5206,7 +5206,7 @@ def startup():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "2.2", "time": now(), "multi_instance_sources": True}
+    return {"ok": True, "version": "2.3", "time": now(), "multi_instance_sources": True}
 
 @app.get("/config")
 def get_config(x_api_token: str | None = Header(default=None)):
@@ -10648,12 +10648,13 @@ apply_cleanup_code_update_without_reconfigure() {
 show_preserved_update_settings() {
     echo
     print_info "The following existing values were preserved:"
-    [[ -f "$MASTER_SERVICE" ]] && echo "- Master systemd Environment values: token, DB path, limits path, ocpasswd path, TTL, prune policy"
-    [[ -f "$MASTER_ETC/limits.json" ]] && echo "- $MASTER_ETC/limits.json"
-    [[ -f "$DB_DIR/central.db" ]] && echo "- $DB_DIR/central.db"
-    [[ -f "$NODE_ETC/node.env" ]] && echo "- $NODE_ETC/node.env"
-    [[ -f "$NODE_ETC/ocserv_conf_path" ]] && echo "- Existing ocserv.conf and hook path configuration"
-    [[ -f "$CLEANUP_ENV" ]] && echo "- $CLEANUP_ENV"
+    [[ -f "$MASTER_SERVICE" ]] && echo "- Master systemd Environment values: token, DB path, limits path, ocpasswd path, TTL, prune policy" || true
+    [[ -f "$MASTER_ETC/limits.json" ]] && echo "- $MASTER_ETC/limits.json" || true
+    [[ -f "$DB_DIR/central.db" ]] && echo "- $DB_DIR/central.db" || true
+    [[ -f "$NODE_ETC/node.env" ]] && echo "- $NODE_ETC/node.env" || true
+    [[ -f "$NODE_ETC/ocserv_conf_path" ]] && echo "- Existing ocserv.conf and hook path configuration" || true
+    [[ -f "$CLEANUP_ENV" ]] && echo "- $CLEANUP_ENV" || true
+    return 0
 }
 
 apply_program_update_without_reconfigure() {
@@ -11003,7 +11004,23 @@ central_self_test_handlers() {
     if (( missing != 0 )); then
         return 1
     fi
-    echo "Central handler self-test: OK (${#handlers[@]} required handlers)."
+
+    # Regression guard for set -e: display/report helpers must not fail merely
+    # because an optional file is absent. This exact class of bug previously
+    # made a successful Central update return exit=1 after Master health passed.
+    if ! (
+        MASTER_SERVICE="/nonexistent/ocserv-central.service"
+        MASTER_ETC="/nonexistent/ocserv-central"
+        DB_DIR="/nonexistent/ocserv-central-db"
+        NODE_ETC="/nonexistent/ocserv-central-node"
+        CLEANUP_ENV="/nonexistent/ocserv-central-cleanup.env"
+        show_preserved_update_settings >/dev/null
+    ); then
+        print_err "Central nonfatal-helper self-test failed: show_preserved_update_settings returned nonzero with optional files absent."
+        return 1
+    fi
+
+    echo "Central handler/runtime self-test: OK (${#handlers[@]} required handlers + nonfatal update-report helper)."
     return 0
 }
 
@@ -11012,7 +11029,7 @@ main_menu() {
     while true; do
         safe_clear
         echo "=============================================="
-        echo "       Ocserv Central Manager v20.4.2"
+        echo "       Ocserv Central Manager v20.4.3"
         echo "=============================================="
         echo "1) Master server menu"
         echo "2) Local ocserv instances / Node integration (multi-instance, recommended)"
@@ -11095,7 +11112,7 @@ case "${1:-}" in
         ;;
     --help|-h)
         cat <<'EOHELP'
-ocserv-central-manager v20.4.2 (embedded in Ocserv Manager)
+ocserv-central-manager v20.4.3 (embedded in Ocserv Manager)
   --install-master       Install/reconfigure Master
   --install-node         Install/reconfigure legacy single-config Node
   --install-both         Install Master + attach all local ocserv instances as Nodes
@@ -12840,7 +12857,7 @@ Usage: $0 [option]
   --central-instances-status Show local Central attachment/source status
   --central-attach-all-local-master Attach all local instances to the local Master at 127.0.0.1:8088
   --central-sync-local-master-profile Sync current local Master token/profile to already attached local instances
-  --central-import-v19-node [node.env] Import v19 Node API settings into the v20.4.2 source-aware shared instance profile
+  --central-import-v19-node [node.env] Import v19 Node API settings into the v20.4.3 source-aware shared instance profile
   --central-menu            Open the integrated Central Manager console
   --central-update          Update installed Central code/components without reconfigure
   --central-status          Show integrated Central status
