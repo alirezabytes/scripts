@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Ocserv Manager v3.1.0
+# Ocserv Manager v3.2.0
 # Multi-instance installer and manager for ocserv on Ubuntu/Debian.
 # Designed as a replacement for the original single-instance ocserv.sh.
 
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="3.1.0"
+PROGRAM_VERSION="3.2.0"
 PROGRAM_NAME="Ocserv Manager"
 
 OCSERV_ETC="/etc/ocserv"
@@ -12654,7 +12654,7 @@ api_menu() {
 }
 
 # -----------------------------------------------------------------------------
-# Firewall Manager v3.0 - per-instance managed policy and isolated chains
+# Firewall Manager v3.2 - per-instance policy, tunnel optimization and isolated chains
 # -----------------------------------------------------------------------------
 firewall_policy_file() { printf '%s/%s.json\n' "$FIREWALL_POLICY_ROOT" "$1"; }
 firewall_chain_hash() { printf '%s' "$1" | sha256sum | awk '{print toupper(substr($1,1,8))}'; }
@@ -12678,6 +12678,7 @@ ensure_firewall_v3_defaults() {
     [[ -n "$(state_get "$instance" FIREWALL_BASE_FORWARD 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_BASE_FORWARD 1
     [[ -n "$(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_BASE_NAT_MODE masquerade
     [[ -n "$(state_get "$instance" FIREWALL_BASE_SNAT_IP 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_BASE_SNAT_IP ""
+    [[ -n "$(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 0
     [[ -n "$(state_get "$instance" FIREWALL_PRIMARY_ROUTE 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_PRIMARY_ROUTE ""
     [[ -n "$(state_get "$instance" FIREWALL_MODE 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_MODE "$mode"
 }
@@ -12969,6 +12970,13 @@ fw_apply_structured_rule() {
             args+=( -j SNAT --to-source "$tosrc" )
             fw_add_rule_to_chain "$family" nat "$chain" "$instance" "$rid" "${args[@]}"
             ;;
+        mss_clamp)
+            chain="$(firewall_chain_name "$instance" forward)"; args=()
+            fw_append_addr_match args -s "$source"; fw_append_addr_match args -d "$dest"
+            fw_append_iface_match args -i "$inif"; fw_append_iface_match args -o "$outif"
+            args+=( -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu )
+            fw_add_rule_to_chain "$family" mangle "$chain" "$instance" "$rid" "${args[@]}"
+            ;;
         dnat)
             [[ -n "$todst" ]] || return 0
             chain="$(firewall_chain_name "$instance" prerouting)"; args=()
@@ -13044,7 +13052,7 @@ fw_apply_ufw_custom_input() {
 }
 
 fw_apply_base_rules() {
-    local instance="$1" subnet iface ipv6 nat6 ingress forward natmode snat tcp udp mode inchain fwdchain postchain
+    local instance="$1" subnet iface ipv6 nat6 ingress forward natmode snat global_masq tcp udp mode inchain fwdchain postchain
     subnet="$(state_get "$instance" SUBNET 2>/dev/null || true)"; [[ -n "$subnet" ]] || return 0
     iface="$(fw_primary_out_iface "$instance")"; [[ -n "$iface" ]] || { print_err "Could not detect primary outbound interface."; return 1; }
     state_set "$instance" OUT_IFACE "$iface"
@@ -13052,6 +13060,7 @@ fw_apply_base_rules() {
     forward="$(state_get "$instance" FIREWALL_BASE_FORWARD 2>/dev/null || echo 1)"
     natmode="$(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || echo masquerade)"
     snat="$(state_get "$instance" FIREWALL_BASE_SNAT_IP 2>/dev/null || true)"
+    global_masq="$(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || echo 0)"
     tcp="$(state_get "$instance" TCP_PORT 2>/dev/null || echo 443)"; udp="$(state_get "$instance" UDP_PORT 2>/dev/null || echo "$tcp")"
     mode="$(firewall_mode_for_instance "$instance")"
     inchain="$(firewall_chain_name "$instance" input)"; fwdchain="$(firewall_chain_name "$instance" forward)"; postchain="$(firewall_chain_name "$instance" postrouting)"
@@ -13085,6 +13094,12 @@ fw_apply_base_rules() {
             ;;
         none) : ;;
     esac
+    if [[ "$global_masq" == 1 ]]; then
+        # Intentionally broad compatibility mode. This is equivalent in effect to:
+        #   iptables -t nat -A POSTROUTING -j MASQUERADE
+        # It is opt-in because it affects unrelated host/container traffic too.
+        fw_add_rule_to_chain ipv4 nat "$postchain" "$instance" base-global-masquerade -j MASQUERADE
+    fi
 
     ipv6="$(state_get "$instance" IPV6_NETWORK 2>/dev/null || true)"; nat6="$(state_get "$instance" IPV6_NAT 2>/dev/null || echo 0)"
     if [[ -n "$ipv6" ]] && command -v ip6tables >/dev/null 2>&1; then
@@ -13325,6 +13340,7 @@ fw_policy_summary() {
     echo "Base ingress: $(state_get "$instance" FIREWALL_BASE_INGRESS 2>/dev/null || echo 1)"
     echo "Base forward: $(state_get "$instance" FIREWALL_BASE_FORWARD 2>/dev/null || echo 1)"
     echo "Base IPv4 NAT: $(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || echo masquerade)"
+    echo "Host-wide Global MASQUERADE: $(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || echo 0)"
     echo "Primary outbound: $(fw_primary_out_iface "$instance")"
     echo "Saved route hint: $(state_get "$instance" FIREWALL_PRIMARY_ROUTE 2>/dev/null || true)"
     echo "Custom rules: total=$count enabled=$enabled disabled=$disabled"
@@ -13358,10 +13374,11 @@ fw_rule_wizard() {
     echo "7) OUTPUT allow/deny/reject" >&2
     echo "8) Advanced managed netfilter rule (filter/nat/mangle/raw; no flush/policy commands)" >&2
     echo "9) Native UFW rule (in / out / route; UFW backend only)" >&2
+    echo "10) TCP MSS clamp to PMTU on a forwarded path" >&2
     echo "0) Cancel" >&2
     read -r -p "Select: " type || true
     [[ "$type" == 0 ]] && return 1
-    case "$type" in 1) kind=forward_pair ;; 2) kind=forward ;; 3) kind=nat_masquerade ;; 4) kind=nat_snat ;; 5) kind=dnat ;; 6) kind=input ;; 7) kind=output ;; 8) kind=advanced ;; 9) kind=ufw_native ;; *) print_warn "Invalid selection." >&2; return 1 ;; esac
+    case "$type" in 1) kind=forward_pair ;; 2) kind=forward ;; 3) kind=nat_masquerade ;; 4) kind=nat_snat ;; 5) kind=dnat ;; 6) kind=input ;; 7) kind=output ;; 8) kind=advanced ;; 9) kind=ufw_native ;; 10) kind=mss_clamp ;; *) print_warn "Invalid selection." >&2; return 1 ;; esac
     family="$(choose_menu "Address family:" "IPv4" "IPv6")"; [[ "$family" == 2 ]] && family=ipv6 || family=ipv4
     desc="$(ask_value "Description (optional)" "")"
     source=any; dest=any; inif=""; outif=""; action=ACCEPT; proto=all; dport=""; tosrc=""; todst=""; ret=false
@@ -13380,6 +13397,11 @@ fw_rule_wizard() {
             echo "1) Select output interface" >&2; echo "2) Select detected route" >&2; read -r -p "Select [2]: " type || true; type="${type:-2}"
             if [[ "$type" == 2 ]]; then rec="$(fw_choose_route "Choose route used by this NAT rule" "$family")" || return 1; IFS='|' read -r rdest rdev rvia rsrc rtable rraw <<<"$rec"; outif="$rdev"; [[ "$dest" == any && "$rdest" != default ]] && dest="$rdest"; else outif="$(fw_choose_interface "Choose output interface" "" 0)"; fi
             if [[ "$kind" == nat_snat ]]; then [[ "$family" == ipv4 ]] && tosrc="$(fw_choose_local_ipv4 "Choose the local/source IPv4 used for SNAT")" || tosrc="$(ask_value "IPv6 source address for SNAT" "")"; fi
+            ;;
+        mss_clamp)
+            source="$(fw_choose_source "$instance" "$family")"; dest="$(fw_choose_destination "$family")"
+            outif="$(fw_choose_interface "Choose forwarded output interface/TUN" "" 0)"
+            [[ -n "$outif" ]] || return 1
             ;;
         dnat)
             source="$(fw_choose_source "$instance" "$family")"; dest="$(fw_choose_destination "$family")"; inif="$(fw_choose_interface "Choose inbound interface (0=any)" "" 1)"
@@ -13554,6 +13576,7 @@ fw_base_policy_menu() {
         echo "3) IPv4 NAT mode (current: $(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || echo masquerade))"
         echo "4) Primary outbound interface / detected route (current: $(fw_primary_out_iface "$instance"))"
         echo "5) IPv6 NAT66 toggle (current: $(state_get "$instance" IPV6_NAT 2>/dev/null || echo 0))"
+        echo "6) Host-wide Global MASQUERADE compatibility mode (current: $(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || echo 0))"
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
@@ -13567,6 +13590,19 @@ fw_base_policy_menu() {
                 ;;
             4) rollback="$(fw_prepare_change "$instance" primary-outbound)"; fw_select_primary_outbound "$instance"; fw_commit_or_rollback "$instance" "$rollback" ;;
             5) rollback="$(fw_prepare_change "$instance" ipv6-nat)"; [[ "$(state_get "$instance" IPV6_NAT 2>/dev/null || echo 0)" == 1 ]] && state_set "$instance" IPV6_NAT 0 || state_set "$instance" IPV6_NAT 1; fw_commit_or_rollback "$instance" "$rollback" ;;
+            6)
+                echo
+                print_warn "Global MASQUERADE is host-wide and intentionally broad."
+                print_warn "It is equivalent in effect to: iptables -t nat -A POSTROUTING -j MASQUERADE"
+                print_warn "It can affect containers, multi-IP source selection, FRP/proxies and unrelated services."
+                if [[ "$(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || echo 0)" == 1 ]]; then
+                    ask_yes_no "Disable host-wide Global MASQUERADE?" "y" || continue
+                    rollback="$(fw_prepare_change "$instance" global-masquerade-off)"; state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 0; fw_commit_or_rollback "$instance" "$rollback"
+                else
+                    ask_yes_no "Enable host-wide Global MASQUERADE anyway?" "n" || continue
+                    rollback="$(fw_prepare_change "$instance" global-masquerade-on)"; state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 1; fw_commit_or_rollback "$instance" "$rollback"
+                fi
+                ;;
             0) return 0 ;;
             *) print_warn "Invalid selection." ;;
         esac
@@ -13613,7 +13649,7 @@ fw_reset_defaults() {
     echo "Reset options:"; echo "1) Reset base/custom policy but keep current backend"; echo "2) Full Manager firewall defaults (iptables + base ingress/forward/MASQUERADE + no custom rules)"; echo "0) Cancel"
     read -r -p "Select: " mode || true; [[ "$mode" == 0 ]] && return 0
     ask_yes_no "Reset the saved firewall policy for $instance?" "n" || return 0; rollback="$(fw_prepare_change "$instance" reset-defaults)"
-    state_set "$instance" FIREWALL_BASE_INGRESS 1; state_set "$instance" FIREWALL_BASE_FORWARD 1; state_set "$instance" FIREWALL_BASE_NAT_MODE masquerade; state_set "$instance" FIREWALL_BASE_SNAT_IP ""; state_set "$instance" OUT_IFACE "$(default_route_iface)"; state_set "$instance" FIREWALL_PRIMARY_ROUTE "default(auto)"
+    state_set "$instance" FIREWALL_BASE_INGRESS 1; state_set "$instance" FIREWALL_BASE_FORWARD 1; state_set "$instance" FIREWALL_BASE_NAT_MODE masquerade; state_set "$instance" FIREWALL_BASE_SNAT_IP ""; state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 0; state_set "$instance" OUT_IFACE "$(default_route_iface)"; state_set "$instance" FIREWALL_PRIMARY_ROUTE "default(auto)"
     [[ "$mode" == 2 ]] && state_set "$instance" FIREWALL_MODE iptables
     file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"; jq '.rules=[]' "$file" > "$tmp" && mv "$tmp" "$file"
     fw_commit_or_rollback "$instance" "$rollback"
@@ -13695,6 +13731,61 @@ fw_quick_add_masquerade() {
     fw_commit_or_rollback "$instance" "$rollback"
 }
 
+fw_quick_optimize_tunnel() {
+    local instance="$1" outif rollback file tmp subnet id rule existing added=0
+    ensure_firewall_policy_file "$instance" || return 1
+    echo
+    print_info "Optimizes VPN -> selected interface/TUN with three scoped pieces:"
+    echo "- Stateful FORWARD pair"
+    echo "- MASQUERADE only for this instance VPN subnet on the selected interface"
+    echo "- TCP MSS clamp to PMTU for SYN packets on this forwarded path"
+    echo
+    print_info "This reproduces the useful VPN->TUN NAT effect of a broad POSTROUTING MASQUERADE without NATing unrelated host traffic."
+    outif="$(fw_choose_interface_simple "Choose interface/TUN to optimize" 0)" || return 0
+    [[ -n "$outif" ]] || return 0
+    subnet="$(state_get "$instance" SUBNET 2>/dev/null || true)"; [[ -n "$subnet" ]] || { print_err "VPN subnet is unknown for $instance."; return 1; }
+    rollback="$(fw_prepare_change "$instance" optimize-tunnel)"
+    file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"; cp -a "$file" "$tmp"
+
+    existing="$(jq --arg o "$outif" '[.rules[] | select(.enabled!=false and .kind=="forward_pair" and .source=="@vpn" and (.destination//"any")=="any" and (.out_iface//"")==$o)] | length' "$tmp")"
+    if [[ "$existing" == 0 ]]; then
+        id="$(fw_new_rule_id)"; rule="$(jq -nc --arg id "$id" --arg out "$outif" '{id:$id,enabled:true,kind:"forward_pair",family:"ipv4",source:"@vpn",destination:"any",in_iface:"",out_iface:$out,action:"ACCEPT",return_established:true,description:("VPN forward via " + $out)}')"
+        jq --argjson r "$rule" '.rules += [$r]' "$tmp" > "$tmp.new" && mv "$tmp.new" "$tmp"; added=$((added+1))
+    fi
+    existing="$(jq --arg o "$outif" '[.rules[] | select(.enabled!=false and .kind=="nat_masquerade" and .source=="@vpn" and (.destination//"any")=="any" and (.out_iface//"")==$o)] | length' "$tmp")"
+    if [[ "$existing" == 0 ]]; then
+        id="$(fw_new_rule_id)"; rule="$(jq -nc --arg id "$id" --arg out "$outif" '{id:$id,enabled:true,kind:"nat_masquerade",family:"ipv4",source:"@vpn",destination:"any",in_iface:"",out_iface:$out,action:"ACCEPT",return_established:false,description:("VPN scoped NAT via " + $out)}')"
+        jq --argjson r "$rule" '.rules += [$r]' "$tmp" > "$tmp.new" && mv "$tmp.new" "$tmp"; added=$((added+1))
+    fi
+    existing="$(jq --arg o "$outif" '[.rules[] | select(.enabled!=false and .kind=="mss_clamp" and .source=="@vpn" and (.destination//"any")=="any" and (.out_iface//"")==$o)] | length' "$tmp")"
+    if [[ "$existing" == 0 ]]; then
+        id="$(fw_new_rule_id)"; rule="$(jq -nc --arg id "$id" --arg out "$outif" '{id:$id,enabled:true,kind:"mss_clamp",family:"ipv4",source:"@vpn",destination:"any",in_iface:"",out_iface:$out,action:"ACCEPT",return_established:false,description:("TCP MSS clamp via " + $out)}')"
+        jq --argjson r "$rule" '.rules += [$r]' "$tmp" > "$tmp.new" && mv "$tmp.new" "$tmp"; added=$((added+1))
+    fi
+    mv "$tmp" "$file"
+    if fw_commit_or_rollback "$instance" "$rollback"; then
+        if (( added == 0 )); then print_ok "Tunnel optimization was already complete for $outif."; else print_ok "Tunnel optimization completed for $outif; added $added missing rule(s)."; fi
+        echo "Expected effective path: $subnet -> $outif with scoped MASQUERADE and TCP MSS clamp."
+    fi
+}
+
+fw_toggle_global_masquerade_quick() {
+    local instance="$1" current rollback
+    current="$(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || echo 0)"
+    echo
+    print_warn "Host-wide Global MASQUERADE affects ALL IPv4 traffic reaching POSTROUTING."
+    echo "Equivalent in effect to: iptables -t nat -A POSTROUTING -j MASQUERADE"
+    echo "Recommended only for compatibility/testing when scoped VPN NAT is insufficient."
+    if [[ "$current" == 1 ]]; then
+        ask_yes_no "Global MASQUERADE is ON. Disable it?" "y" || return 0
+        rollback="$(fw_prepare_change "$instance" global-masquerade-off)"; state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 0
+    else
+        ask_yes_no "Enable Global MASQUERADE despite the host-wide scope?" "n" || return 0
+        rollback="$(fw_prepare_change "$instance" global-masquerade-on)"; state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 1
+    fi
+    fw_commit_or_rollback "$instance" "$rollback"
+}
+
 fw_show_detected_network_simple() {
     local def line name state addr suffix
     def="$(default_route_iface 2>/dev/null || true)"
@@ -13731,17 +13822,21 @@ fw_quick_setup_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Quick firewall setup: $instance ===="
-        echo "1) Allow VPN through an interface/TUN (common: singtun0, wg0, tun0)"
-        echo "2) Add extra MASQUERADE NAT on an interface"
-        echo "3) Change normal Internet egress / base NAT"
-        echo "4) Show useful interfaces/routes"
+        echo "1) Optimize VPN through an interface/TUN (FORWARD + scoped NAT + MSS clamp)"
+        echo "2) Allow VPN through an interface/TUN only (FORWARD only)"
+        echo "3) Add scoped VPN MASQUERADE on an interface"
+        echo "4) Toggle host-wide Global MASQUERADE (old broad compatibility rule)"
+        echo "5) Change normal Internet egress / base NAT"
+        echo "6) Show useful interfaces/routes"
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
-            1) fw_quick_add_forward "$instance"; pause ;;
-            2) fw_quick_add_masquerade "$instance"; pause ;;
-            3) fw_base_policy_menu "$instance" ;;
-            4) fw_show_detected_network_simple; pause ;;
+            1) fw_quick_optimize_tunnel "$instance"; pause ;;
+            2) fw_quick_add_forward "$instance"; pause ;;
+            3) fw_quick_add_masquerade "$instance"; pause ;;
+            4) fw_toggle_global_masquerade_quick "$instance"; pause ;;
+            5) fw_base_policy_menu "$instance" ;;
+            6) fw_show_detected_network_simple; pause ;;
             0) return 0 ;;
             *) print_warn "Invalid selection." ;;
         esac
@@ -13754,17 +13849,19 @@ fw_rules_simple_menu() {
         echo; echo "==== Extra firewall rules: $instance ===="
         fw_simple_rule_list "$instance"
         echo
-        echo "1) Add common VPN -> interface/TUN rule"
-        echo "2) Enable/disable a rule"
-        echo "3) Delete a rule"
-        echo "4) Edit/rebuild a rule (detailed wizard)"
+        echo "1) Optimize VPN -> interface/TUN (FORWARD + NAT + MSS clamp)"
+        echo "2) Add FORWARD-only VPN -> interface/TUN rule"
+        echo "3) Enable/disable a rule"
+        echo "4) Delete a rule"
+        echo "5) Edit/rebuild a rule (detailed wizard)"
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
-            1) fw_quick_add_forward "$instance"; pause ;;
-            2) fw_policy_toggle_rule "$instance"; pause ;;
-            3) fw_policy_delete_rule "$instance"; pause ;;
-            4) fw_policy_edit_rule "$instance"; pause ;;
+            1) fw_quick_optimize_tunnel "$instance"; pause ;;
+            2) fw_quick_add_forward "$instance"; pause ;;
+            3) fw_policy_toggle_rule "$instance"; pause ;;
+            4) fw_policy_delete_rule "$instance"; pause ;;
+            5) fw_policy_edit_rule "$instance"; pause ;;
             0) return 0 ;;
             *) print_warn "Invalid selection." ;;
         esac
@@ -13850,6 +13947,7 @@ firewall_manager_menu() {
         echo "VPN subnet: $(state_get "$instance" SUBNET 2>/dev/null || echo unknown)"
         echo "Internet egress: $(fw_primary_out_iface "$instance")"
         echo "Base NAT: $(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || echo masquerade)"
+        echo "Global MASQUERADE: $(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || echo 0)"
         echo "Extra rules: $(jq '.rules|length' "$(firewall_policy_file "$instance")" 2>/dev/null || echo 0)"
         echo
         echo "1) Quick setup"
