@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="2.8.0"
+PROGRAM_VERSION="2.8.1"
 PROGRAM_NAME="Ocserv Manager"
 
 OCSERV_ETC="/etc/ocserv"
@@ -31,7 +31,7 @@ CENTRAL_INTEGRATION_DIR="/etc/ocserv-manager/central"
 CENTRAL_LIB_DIR="/usr/local/lib/ocserv-manager/central"
 CENTRAL_EMBED_STATE="$MANAGER_ETC/central-embedded.env"
 CENTRAL_PROFILE="$CENTRAL_INTEGRATION_DIR/profile.env"
-CENTRAL_EMBEDDED_VERSION="v20.4"
+CENTRAL_EMBEDDED_VERSION="v20.4.1"
 TEMPLATE_ROOT="$MANAGER_ETC/templates"
 INSTANCE_BASE_ROOT="$MANAGER_ETC/config-bases"
 STABILITY_BACKUP_ROOT="$BACKUP_ROOT/stability"
@@ -4071,7 +4071,7 @@ extract_embedded_central_manager() {
     mkdir -p "$(dirname "$destination")"
     cat > "$destination" <<'__OCSERV_MANAGER_EMBEDDED_CENTRAL_V20_7F3A1D__'
 #!/usr/bin/env bash
-# ocserv-central-manager v20.4
+# ocserv-central-manager v20.4.1
 # Native multi-instance source synchronization: each ocserv instance can publish its own ocpasswd authority and occtl session stream.
 # Adds safe in-place program update for Manager, Master API, Node Agent, hooks, and cleanup code without reconfigure.
 # Keeps v18 prune controls, v17 threshold export, v16 real ocpasswd prune/group export, v15 extra-traffic decrease/history, v14 reset recovery, v13 authoritative group refresh, v12 cleanup+VACUUM, v10 exhausted tools, and v8 unlimited groups.
@@ -4101,7 +4101,7 @@ CLEANUP_ENV="/etc/ocserv-central/cleanup.env"
 CLEANUP_SERVICE="/etc/systemd/system/ocserv-central-cleanup.service"
 CLEANUP_TIMER="/etc/systemd/system/ocserv-central-cleanup.timer"
 
-PROGRAM_VERSION="v20.4"
+PROGRAM_VERSION="v20.4.1"
 API_VERSION="2.3"
 UPDATE_BACKUP_ROOT="/root/ocserv-central-update-backups"
 MASTER_VERSION_FILE="/etc/ocserv-central/installed-version"
@@ -10861,12 +10861,79 @@ open_manager_multi_instance() {
     fi
 }
 
+# Modern source-aware equivalent of the old v19 "Install both master and node on this server".
+# Install/reconfigure the local Master first, then delegate local-instance discovery and
+# per-instance Node/source attachment to the parent Ocserv Manager. Keeping this bridge
+# inside Central prevents the UI from referencing a missing shell function and avoids
+# duplicating multi-instance registry logic in two places.
+install_both_master_and_local_nodes() {
+    need_root
+
+    print_info "Step 1/2: installing or reconfiguring the local Central Master..."
+    if ! install_master; then
+        print_err "Central Master installation/reconfiguration failed. Local instances were not attached."
+        return 1
+    fi
+
+    if ! wait_for_master_health 20 >/dev/null; then
+        print_err "Central Master did not pass the local health check at http://127.0.0.1:8088/health."
+        print_info "Local instances were not attached. Check: journalctl -u ocserv-central -n 100 --no-pager"
+        return 1
+    fi
+
+    print_info "Step 2/2: attaching all local ocserv instances as source-aware Nodes..."
+    if ! manager_multi_instance_available; then
+        print_err "The parent Ocserv Manager multi-instance capability is not available."
+        print_info "Master is installed and healthy, but no local instance was attached automatically."
+        print_info "Run this from the full Ocserv Manager package, or use the legacy single-instance Node menu only for standalone installs."
+        return 1
+    fi
+
+    if ! /usr/local/sbin/ocserv-manager --central-attach-all-local-master; then
+        print_err "Central Master is running, but one or more local ocserv instances could not be attached."
+        print_info "Open: Local ocserv instances / Node integration to inspect or retry individual instances."
+        return 1
+    fi
+
+    print_ok "Central Master and all detected local ocserv instance Node integrations are ready."
+    return 0
+}
+
+central_self_test_handlers() {
+    local fn missing=0
+    local handlers=(
+        master_menu
+        open_manager_multi_instance
+        install_both_master_and_local_nodes
+        node_menu
+        full_status
+        uninstall_node
+        uninstall_master
+        apply_program_update_without_reconfigure
+        install_master
+        install_node
+        apply_master_update_menu
+        apply_node_update_menu
+    )
+    for fn in "${handlers[@]}"; do
+        if ! declare -F "$fn" >/dev/null 2>&1; then
+            print_err "Central handler is referenced but not defined: $fn"
+            missing=1
+        fi
+    done
+    if (( missing != 0 )); then
+        return 1
+    fi
+    echo "Central handler self-test: OK (${#handlers[@]} required handlers)."
+    return 0
+}
+
 main_menu() {
     need_root
     while true; do
         safe_clear
         echo "=============================================="
-        echo "       Ocserv Central Manager v20.4"
+        echo "       Ocserv Central Manager v20.4.1"
         echo "=============================================="
         echo "1) Master server menu"
         echo "2) Local ocserv instances / Node integration (multi-instance, recommended)"
@@ -10939,13 +11006,17 @@ case "${1:-}" in
         uninstall_node
         exit $?
         ;;
+    --self-test-handlers)
+        central_self_test_handlers
+        exit $?
+        ;;
     --version|-V)
         echo "ocserv-central-manager $PROGRAM_VERSION"
         exit 0
         ;;
     --help|-h)
         cat <<'EOHELP'
-ocserv-central-manager v20.4 (embedded in Ocserv Manager)
+ocserv-central-manager v20.4.1 (embedded in Ocserv Manager)
   --install-master       Install/reconfigure Master
   --install-node         Install/reconfigure legacy single-config Node
   --install-both         Install Master + attach all local ocserv instances as Nodes
@@ -10957,6 +11028,7 @@ ocserv-central-manager v20.4 (embedded in Ocserv Manager)
   --apply-update         Update installed Central components without reconfigure
   --apply-master-update  Update Master code without reconfigure
   --apply-node-update    Update Node code without reconfigure
+  --self-test-handlers   Validate that all required menu/CLI handlers exist
   --version              Show version
 EOHELP
         exit 0
@@ -10988,6 +11060,7 @@ install_embedded_central_manager_code() {
     tmp="$(mktemp)"
     extract_embedded_central_manager "$tmp"
     bash -n "$tmp" || { rm -f "$tmp"; print_err "Embedded Central Manager failed syntax validation."; return 1; }
+    "$tmp" --self-test-handlers >/dev/null || { rm -f "$tmp"; print_err "Embedded Central Manager failed handler self-test; runtime was not replaced."; return 1; }
     new_hash="$(sha256sum "$tmp" | awk '{print $1}')"
     current_hash=""
     [[ -f "$CENTRAL_MANAGER_BIN" ]] && current_hash="$(sha256sum "$CENTRAL_MANAGER_BIN" | awk '{print $1}')"
@@ -11023,6 +11096,7 @@ update_embedded_central_without_reconfigure() {
     tmp="$(mktemp)"
     extract_embedded_central_manager "$tmp"
     bash -n "$tmp" || { rm -f "$tmp"; print_err "Embedded Central Manager failed syntax validation."; return 1; }
+    "$tmp" --self-test-handlers >/dev/null || { rm -f "$tmp"; print_err "Embedded Central Manager failed handler self-test; update was not applied."; return 1; }
     if [[ -x "$CENTRAL_MANAGER_BIN" || -f /etc/systemd/system/ocserv-central.service || -f /etc/systemd/system/ocserv-central-agent.service ]]; then
         print_info "Applying integrated Central $CENTRAL_EMBEDDED_VERSION code update without reconfigure..."
         "$tmp" --apply-update
@@ -12682,7 +12756,7 @@ Usage: $0 [option]
   --central-instances       Manage all local ocserv instances from Central (native multi-instance)
   --central-instances-status Show local Central attachment/source status
   --central-attach-all-local-master Attach all local instances to the local Master at 127.0.0.1:8088
-  --central-import-v19-node [node.env] Import v19 Node API settings into the v20.4 source-aware shared instance profile
+  --central-import-v19-node [node.env] Import v19 Node API settings into the v20.4.1 source-aware shared instance profile
   --central-menu            Open the integrated Central Manager console
   --central-update          Update installed Central code/components without reconfigure
   --central-status          Show integrated Central status
