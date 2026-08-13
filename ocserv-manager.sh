@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Ocserv Manager v3.2.0
+# Ocserv Manager v3.3.0
 # Multi-instance installer and manager for ocserv on Ubuntu/Debian.
 # Designed as a replacement for the original single-instance ocserv.sh.
 
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="3.2.0"
+PROGRAM_VERSION="3.3.0"
 PROGRAM_NAME="Ocserv Manager"
 
 OCSERV_ETC="/etc/ocserv"
@@ -37,6 +37,8 @@ INSTANCE_BASE_ROOT="$MANAGER_ETC/config-bases"
 STABILITY_BACKUP_ROOT="$BACKUP_ROOT/stability"
 FIREWALL_POLICY_ROOT="$MANAGER_ETC/firewall"
 FIREWALL_SNAPSHOT_ROOT="$BACKUP_ROOT/firewall"
+IPTABLES_RULES_V4="${IPTABLES_RULES_V4:-/etc/iptables/rules.v4}"
+IPTABLES_RULES_V6="${IPTABLES_RULES_V6:-/etc/iptables/rules.v6}"
 
 C_RESET='\033[0m'
 C_RED='\033[31m'
@@ -1466,40 +1468,79 @@ firewall_mode_for_instance() {
 }
 
 configure_firewall_mode() {
-    local instance="$1" current choice default_choice
+    local instance="$1" current choice default_choice global persistent
     current="$(firewall_mode_for_instance "$instance")"
-    [[ "$current" == ufw ]] && default_choice=2 || default_choice=1
+    global="$(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || echo 0)"
+    persistent="$(state_get "$instance" FIREWALL_PERSISTENCE 2>/dev/null || echo manager)"
+    if [[ "$current" == ufw ]]; then
+        default_choice=3
+    elif [[ "$global" == 1 && "$persistent" == iptables-persistent ]]; then
+        default_choice=2
+    else
+        default_choice=1
+    fi
     echo
     echo "==== Firewall integration: $instance ===="
-    echo "1) iptables only (recommended/default)"
-    echo "   - Ocserv Manager does NOT install, enable, disable, or modify UFW."
-    echo "   - Scoped INPUT + FORWARD + MASQUERADE rules are managed with iptables."
-    echo "2) UFW integration (optional, only for administrators who intentionally use UFW)"
-    echo "   - NAT/FORWARD remains scoped iptables rules; TCP/UDP ingress is also allowed through UFW."
-    echo "   - Ocserv Manager will NEVER enable UFW automatically."
-    echo "Current: $current"
+    echo "1) iptables - standard scoped ocserv rules (recommended/default)"
+    echo "   - Opens the instance TCP/UDP ports, FORWARDs the VPN subnet, and applies scoped NAT."
+    echo "   - UFW is not installed, enabled, disabled, or modified."
+    echo "2) iptables - host-wide POSTROUTING MASQUERADE + iptables-persistent"
+    echo "   - Compatibility profile equivalent in effect to: iptables -t nat -A POSTROUTING -j MASQUERADE"
+    echo "   - Installs iptables-persistent and saves the complete current IPv4 ruleset to $IPTABLES_RULES_V4."
+    echo "   - This is intentionally broad and can affect unrelated host/container traffic."
+    echo "3) UFW integration"
+    echo "   - TCP/UDP ingress can be managed through UFW; forwarding/NAT remains available through Manager-owned netfilter rules."
+    echo "   - UFW is never enabled unless you explicitly choose to enable it."
+    echo "Current backend: $current | global_masquerade=$global | persistence=$persistent"
     while true; do
-        read -r -p "Select firewall mode [$default_choice]: " choice || true
+        read -r -p "Select firewall profile [$default_choice]: " choice || true
         choice="${choice:-$default_choice}"
         case "$choice" in
             1)
                 state_set "$instance" FIREWALL_MODE iptables
-                print_ok "Firewall mode set to iptables-only. UFW will be left completely alone."
+                state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 0
+                state_set "$instance" FIREWALL_BASE_NAT_MODE masquerade
+                state_set "$instance" FIREWALL_BASE_SNAT_IP ""
+                state_set "$instance" FIREWALL_PERSISTENCE manager
+                if systemctl is-enabled --quiet netfilter-persistent.service 2>/dev/null; then
+                    print_warn "netfilter-persistent is already enabled on this host. Manager will not auto-save it, but existing rules.v4/rules.v6 may still be loaded at boot."
+                fi
+                print_ok "Standard iptables profile selected. UFW will be left completely alone."
                 return 0
                 ;;
             2)
+                print_warn "This profile enables host-wide POSTROUTING MASQUERADE and persists the full current iptables ruleset."
+                if ! ask_yes_no "Use the host-wide iptables-persistent compatibility profile?" "n"; then
+                    continue
+                fi
+                fw_optional_backup_existing_persistent_rules
+                install_available_packages iptables iptables-persistent
+                state_set "$instance" FIREWALL_MODE iptables
+                state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 1
+                state_set "$instance" FIREWALL_BASE_NAT_MODE none
+                state_set "$instance" FIREWALL_BASE_SNAT_IP ""
+                state_set "$instance" FIREWALL_PERSISTENCE iptables-persistent
+                print_ok "Host-wide MASQUERADE + iptables-persistent profile selected."
+                return 0
+                ;;
+            3)
                 if ! command -v ufw >/dev/null 2>&1; then
-                    print_info "UFW is not installed. It is optional and is NOT required by ocserv-manager."
-                    if ask_yes_no "Install the UFW package for this explicitly selected mode? (It will NOT be enabled automatically)" "n"; then
+                    print_info "UFW is not installed."
+                    if ask_yes_no "Install the UFW package?" "n"; then
                         install_available_packages ufw
                     else
-                        print_warn "UFW mode was not selected because the ufw command is unavailable. Keeping iptables-only mode."
-                        state_set "$instance" FIREWALL_MODE iptables
-                        return 0
+                        print_warn "UFW profile was not selected because ufw is unavailable."
+                        continue
                     fi
                 fi
                 state_set "$instance" FIREWALL_MODE ufw
-                print_ok "Optional UFW integration selected. The manager will not enable or disable UFW."
+                state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 0
+                state_set "$instance" FIREWALL_BASE_NAT_MODE masquerade
+                [[ -n "$(state_get "$instance" FIREWALL_PERSISTENCE 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_PERSISTENCE manager
+                if ask_yes_no "Enable UFW now?" "n"; then
+                    ufw --force enable || { print_err "Could not enable UFW."; return 1; }
+                fi
+                print_ok "UFW integration selected."
                 return 0
                 ;;
             *) print_warn "Invalid selection." ;;
@@ -11867,6 +11908,13 @@ delete_instance() {
         rm -rf "$dir"
     fi
     rm -f "$(instance_state_file "$instance")" "$(central_env_file "$instance")" "$CENTRAL_LIB_DIR/hook-$instance.sh" "$INSTANCE_BASE_ROOT/$instance.conf"
+    # A host-wide MASQUERADE request may have belonged only to the deleted instance.
+    # Re-evaluate the remaining instance states and persist the removal when the host
+    # is already using iptables-persistent.
+    fw_sync_host_global_masquerade 2>/dev/null || true
+    if dpkg-query -W -f='${Status}' iptables-persistent 2>/dev/null | grep -qx 'install ok installed' && [[ -f "$IPTABLES_RULES_V4" ]]; then
+        fw_save_iptables_persistent_noninteractive || print_warn "Could not refresh iptables-persistent after instance deletion."
+    fi
     if ! find "$STATE_ROOT" -maxdepth 1 -type f -name '*.env' -print -quit 2>/dev/null | grep -q .; then
         systemctl disable --now ocserv-manager-firewall.service >/dev/null 2>&1 || true
         rm -f "$FIREWALL_REAPPLY_SERVICE"
@@ -12464,7 +12512,7 @@ reconfigure_managed_instance() {
     oldtcp="$(state_get "$instance" TCP_PORT 2>/dev/null || echo 443)"; oldudp="$(state_get "$instance" UDP_PORT 2>/dev/null || echo "$oldtcp")"; oldfw="$(firewall_mode_for_instance "$instance")"
     echo "Reconfigure sections. Existing values are preserved unless the selected section is changed."
     while true; do
-        choice="$(choose_menu "Select section:" "Listen IP and TCP/UDP ports" "VPN subnet" "Server certificate" "Authentication" "DNS" "Client/session and ban limits" "MTU/DPD/keepalive/IPv6 network profile" "Full/split routing, DNS leak and bypass" "Firewall integration (iptables default / optional UFW)" "Open advanced per-instance Firewall Manager" "Finish and apply" "Cancel")"
+        choice="$(choose_menu "Select section:" "Listen IP and TCP/UDP ports" "VPN subnet" "Server certificate" "Authentication" "DNS" "Client/session and ban limits" "MTU/DPD/keepalive/IPv6 network profile" "Full/split routing, DNS leak and bypass" "Firewall profile (iptables / iptables-persistent / UFW)" "Open per-instance Firewall Manager" "Finish and apply" "Cancel")"
         case "$choice" in
             1)
                 listen="$(choose_listen_host)"; tcp="$(choose_available_tcp_port "$instance" "$listen" "$(state_get "$instance" TCP_PORT)")"; udp="$(choose_available_udp_port "$instance" "$listen" "$tcp")"; state_set "$instance" LISTEN_HOST "$listen"; state_set "$instance" TCP_PORT "$tcp"; state_set "$instance" UDP_PORT "$udp" ;;
@@ -12654,7 +12702,7 @@ api_menu() {
 }
 
 # -----------------------------------------------------------------------------
-# Firewall Manager v3.2 - per-instance policy, tunnel optimization and isolated chains
+# Firewall Manager v3.3 - general iptables/UFW management, persistence, NAT and isolated chains
 # -----------------------------------------------------------------------------
 firewall_policy_file() { printf '%s/%s.json\n' "$FIREWALL_POLICY_ROOT" "$1"; }
 firewall_chain_hash() { printf '%s' "$1" | sha256sum | awk '{print toupper(substr($1,1,8))}'; }
@@ -12679,23 +12727,24 @@ ensure_firewall_v3_defaults() {
     [[ -n "$(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_BASE_NAT_MODE masquerade
     [[ -n "$(state_get "$instance" FIREWALL_BASE_SNAT_IP 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_BASE_SNAT_IP ""
     [[ -n "$(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 0
+    [[ -n "$(state_get "$instance" FIREWALL_PERSISTENCE 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_PERSISTENCE manager
     [[ -n "$(state_get "$instance" FIREWALL_PRIMARY_ROUTE 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_PRIMARY_ROUTE ""
     [[ -n "$(state_get "$instance" FIREWALL_MODE 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_MODE "$mode"
 }
 
 ensure_firewall_policy_file() {
-    local instance="$1" file tun iface id tmp
+    local instance="$1" file legacy_ifaces iface id tmp
     ensure_dirs
     ensure_firewall_v3_defaults "$instance"
     file="$(firewall_policy_file "$instance")"
     if [[ ! -f "$file" ]]; then
         printf '{\n  "version": 1,\n  "instance": %s,\n  "rules": []\n}\n' "$(jq -Rn --arg v "$instance" '$v')" > "$file"
         chmod 600 "$file"
-        # Preserve v2.9 extra-interface forwarding behavior by converting it into ordinary
+        # Preserve an older extra-interface forwarding setting by converting it into ordinary
         # managed stateful FORWARD rules. This is configuration migration, not a backup.
-        tun="$(state_get "$instance" TUN_FORWARD_IFACES 2>/dev/null || true)"
-        tun="${tun//,/ }"
-        for iface in $tun; do
+        legacy_ifaces="$(state_get "$instance" TUN_FORWARD_IFACES 2>/dev/null || true)"
+        legacy_ifaces="${legacy_ifaces//,/ }"
+        for iface in $legacy_ifaces; do
             valid_interface_name "$iface" || continue
             id="migrated-forward-$(printf '%s' "$iface" | sha256sum | cut -c1-8)"
             tmp="$(mktemp)"
@@ -13051,8 +13100,158 @@ fw_apply_ufw_custom_input() {
     "${cmd[@]}" >/dev/null
 }
 
+fw_global_state_file() { printf '%s/firewall-global.env\n' "$MANAGER_ETC"; }
+fw_global_state_get() {
+    local key="$1" f; f="$(fw_global_state_file)"; [[ -f "$f" ]] || return 1
+    sed -n "s/^${key}=//p" "$f" | tail -n1
+}
+fw_global_state_set() {
+    local key="$1" value="$2" f tmp; f="$(fw_global_state_file)"; mkdir -p "$(dirname "$f")"; touch "$f"; chmod 600 "$f"
+    tmp="$(mktemp)"; grep -vE "^${key}=" "$f" > "$tmp" || true; printf '%s=%s\n' "$key" "$value" >> "$tmp"; mv "$tmp" "$f"; chmod 600 "$f"
+}
+
+fw_any_instance_requests_global_masquerade() {
+    local i
+    while IFS= read -r i; do
+        [[ -n "$i" ]] || continue
+        [[ "$(state_get "$i" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || echo 0)" == 1 ]] && return 0
+    done < <(list_instances | sort -u)
+    return 1
+}
+
+fw_any_instance_requests_iptables_persistent() {
+    local i
+    while IFS= read -r i; do
+        [[ -n "$i" ]] || continue
+        [[ "$(state_get "$i" FIREWALL_PERSISTENCE 2>/dev/null || echo manager)" == iptables-persistent ]] && return 0
+    done < <(list_instances | sort -u)
+    return 1
+}
+
+fw_sync_host_global_masquerade() {
+    local owned
+    command -v iptables >/dev/null 2>&1 || return 1
+    owned="$(fw_global_state_get GLOBAL_MASQUERADE_OWNED 2>/dev/null || echo 0)"
+    if fw_any_instance_requests_global_masquerade; then
+        if iptables -t nat -C POSTROUTING -j MASQUERADE >/dev/null 2>&1; then
+            # Preserve an identical rule that pre-dated the Manager. We only remove
+            # the rule later when we know this Manager created it itself.
+            [[ "$owned" == 1 ]] || fw_global_state_set GLOBAL_MASQUERADE_PREEXISTING 1
+        else
+            iptables -t nat -A POSTROUTING -j MASQUERADE
+            fw_global_state_set GLOBAL_MASQUERADE_OWNED 1
+            fw_global_state_set GLOBAL_MASQUERADE_PREEXISTING 0
+        fi
+    else
+        if [[ "$owned" == 1 ]]; then
+            if iptables -t nat -C POSTROUTING -j MASQUERADE >/dev/null 2>&1; then
+                iptables -t nat -D POSTROUTING -j MASQUERADE
+            fi
+            fw_global_state_set GLOBAL_MASQUERADE_OWNED 0
+        fi
+        # If the exact rule existed before Manager ownership, leave it untouched.
+    fi
+    return 0
+}
+
+fw_save_iptables_persistent_noninteractive() {
+    local tmp4 tmp6
+    install_available_packages iptables iptables-persistent
+    mkdir -p "$(dirname "$IPTABLES_RULES_V4")" "$(dirname "$IPTABLES_RULES_V6")"
+    tmp4="$(mktemp "${IPTABLES_RULES_V4}.tmp.XXXXXX")"
+    iptables-save > "$tmp4" || { rm -f "$tmp4"; return 1; }
+    chmod 600 "$tmp4"; mv -f "$tmp4" "$IPTABLES_RULES_V4"
+    if command -v ip6tables-save >/dev/null 2>&1; then
+        tmp6="$(mktemp "${IPTABLES_RULES_V6}.tmp.XXXXXX")"
+        if ip6tables-save > "$tmp6"; then chmod 600 "$tmp6"; mv -f "$tmp6" "$IPTABLES_RULES_V6"; else rm -f "$tmp6"; fi
+    fi
+    systemctl enable netfilter-persistent.service >/dev/null 2>&1 || true
+    return 0
+}
+
+fw_optional_backup_existing_persistent_rules() {
+    local stamp
+    [[ -f "$IPTABLES_RULES_V4" || -f "$IPTABLES_RULES_V6" ]] || return 0
+    if ask_yes_no "Create a persistent backup of the current $IPTABLES_RULES_V4 / $IPTABLES_RULES_V6 before they are overwritten?" "y"; then
+        ensure_backup_root; stamp="$(date +%Y%m%d-%H%M%S)"
+        mkdir -p "$BACKUP_ROOT/iptables-persistent-$stamp"
+        [[ -f "$IPTABLES_RULES_V4" ]] && cp -a "$IPTABLES_RULES_V4" "$BACKUP_ROOT/iptables-persistent-$stamp/rules.v4"
+        [[ -f "$IPTABLES_RULES_V6" ]] && cp -a "$IPTABLES_RULES_V6" "$BACKUP_ROOT/iptables-persistent-$stamp/rules.v6"
+        print_ok "Persistent iptables backup saved: $BACKUP_ROOT/iptables-persistent-$stamp"
+    else
+        print_info "Persistent rules backup skipped by request."
+    fi
+    return 0
+}
+
+fw_save_iptables_persistent_interactive() {
+    fw_optional_backup_existing_persistent_rules
+    fw_save_iptables_persistent_noninteractive || return 1
+    print_ok "Current IPv4 rules saved to $IPTABLES_RULES_V4."
+    [[ -f "$IPTABLES_RULES_V6" ]] && print_ok "Current IPv6 rules saved to $IPTABLES_RULES_V6."
+    return 0
+}
+
+fw_reload_iptables_persistent() {
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent reload
+    else
+        [[ -f "$IPTABLES_RULES_V4" ]] || { print_err "$IPTABLES_RULES_V4 not found."; return 1; }
+        iptables-restore < "$IPTABLES_RULES_V4"
+        if [[ -f "$IPTABLES_RULES_V6" ]] && command -v ip6tables-restore >/dev/null 2>&1; then ip6tables-restore < "$IPTABLES_RULES_V6"; fi
+    fi
+}
+
+fw_set_persistence_mode() {
+    local instance="$1" choice rollback
+    echo "1) Manager boot reapply only"
+    echo "2) iptables-persistent (save the complete host ruleset to /etc/iptables/rules.v4)"
+    read -r -p "Select persistence mode: " choice || true
+    case "$choice" in
+        1)
+            rollback="$(fw_prepare_change "$instance" persistence-manager)"
+            state_set "$instance" FIREWALL_PERSISTENCE manager
+            fw_commit_or_rollback "$instance" "$rollback"
+            if systemctl is-enabled --quiet netfilter-persistent.service 2>/dev/null; then
+                print_warn "netfilter-persistent remains enabled because it may be used by unrelated host rules. Disable it explicitly from iptables management if desired."
+            fi
+            ;;
+        2)
+            fw_optional_backup_existing_persistent_rules
+            install_available_packages iptables iptables-persistent
+            rollback="$(fw_prepare_change "$instance" persistence-iptables-persistent)"
+            state_set "$instance" FIREWALL_PERSISTENCE iptables-persistent
+            fw_commit_or_rollback "$instance" "$rollback"
+            ;;
+        *) print_warn "Invalid selection." ;;
+    esac
+}
+
+fw_toggle_host_global_masquerade() {
+    local instance="$1" current rollback
+    current="$(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || echo 0)"
+    if [[ "$current" == 1 ]]; then
+        ask_yes_no "Disable host-wide POSTROUTING MASQUERADE?" "y" || return 0
+        rollback="$(fw_prepare_change "$instance" host-global-masquerade-off)"
+        state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 0
+    else
+        print_warn "This is host-wide and equivalent in effect to: iptables -t nat -A POSTROUTING -j MASQUERADE"
+        print_warn "It can affect unrelated services, containers, and source-address selection."
+        ask_yes_no "Enable host-wide POSTROUTING MASQUERADE?" "n" || return 0
+        rollback="$(fw_prepare_change "$instance" host-global-masquerade-on)"
+        state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 1
+    fi
+    if fw_commit_or_rollback "$instance" "$rollback"; then
+        if [[ "$(state_get "$instance" FIREWALL_PERSISTENCE 2>/dev/null || echo manager)" == iptables-persistent ]]; then
+            fw_save_iptables_persistent_noninteractive || print_warn "Could not update /etc/iptables/rules.v4 after the change."
+        elif [[ -f "$IPTABLES_RULES_V4" && -x "$(command -v iptables-save 2>/dev/null || true)" ]]; then
+            print_info "iptables-persistent files exist but this instance is not configured to auto-save them. Use iptables management -> Save current rules if desired."
+        fi
+    fi
+}
+
 fw_apply_base_rules() {
-    local instance="$1" subnet iface ipv6 nat6 ingress forward natmode snat global_masq tcp udp mode inchain fwdchain postchain
+    local instance="$1" subnet iface ipv6 nat6 ingress forward natmode snat tcp udp mode inchain fwdchain postchain
     subnet="$(state_get "$instance" SUBNET 2>/dev/null || true)"; [[ -n "$subnet" ]] || return 0
     iface="$(fw_primary_out_iface "$instance")"; [[ -n "$iface" ]] || { print_err "Could not detect primary outbound interface."; return 1; }
     state_set "$instance" OUT_IFACE "$iface"
@@ -13060,7 +13259,6 @@ fw_apply_base_rules() {
     forward="$(state_get "$instance" FIREWALL_BASE_FORWARD 2>/dev/null || echo 1)"
     natmode="$(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || echo masquerade)"
     snat="$(state_get "$instance" FIREWALL_BASE_SNAT_IP 2>/dev/null || true)"
-    global_masq="$(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || echo 0)"
     tcp="$(state_get "$instance" TCP_PORT 2>/dev/null || echo 443)"; udp="$(state_get "$instance" UDP_PORT 2>/dev/null || echo "$tcp")"
     mode="$(firewall_mode_for_instance "$instance")"
     inchain="$(firewall_chain_name "$instance" input)"; fwdchain="$(firewall_chain_name "$instance" forward)"; postchain="$(firewall_chain_name "$instance" postrouting)"
@@ -13094,12 +13292,6 @@ fw_apply_base_rules() {
             ;;
         none) : ;;
     esac
-    if [[ "$global_masq" == 1 ]]; then
-        # Intentionally broad compatibility mode. This is equivalent in effect to:
-        #   iptables -t nat -A POSTROUTING -j MASQUERADE
-        # It is opt-in because it affects unrelated host/container traffic too.
-        fw_add_rule_to_chain ipv4 nat "$postchain" "$instance" base-global-masquerade -j MASQUERADE
-    fi
 
     ipv6="$(state_get "$instance" IPV6_NETWORK 2>/dev/null || true)"; nat6="$(state_get "$instance" IPV6_NAT 2>/dev/null || echo 0)"
     if [[ -n "$ipv6" ]] && command -v ip6tables >/dev/null 2>&1; then
@@ -13174,7 +13366,11 @@ apply_firewall_for_instance() {
     fi
     fw_apply_base_rules "$instance" || return 1
     fw_apply_custom_rules "$instance" || return 1
+    fw_sync_host_global_masquerade || return 1
     install_firewall_reapply_unit
+    if [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" != 1 ]] && fw_any_instance_requests_iptables_persistent; then
+        fw_save_iptables_persistent_noninteractive || print_warn "Could not update iptables-persistent rules files."
+    fi
     subnet="$(state_get "$instance" SUBNET 2>/dev/null || true)"; iface="$(fw_primary_out_iface "$instance")"
     audit "firewall-v3-applied instance=$instance backend=$mode subnet=$subnet primary_out=$iface custom_rules=$(jq '.rules|length' "$(firewall_policy_file "$instance")" 2>/dev/null || echo 0)"
     [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" == 1 ]] || print_ok "Firewall policy applied for $instance (backend=$mode, primary outbound=${iface:-none})."
@@ -13341,6 +13537,7 @@ fw_policy_summary() {
     echo "Base forward: $(state_get "$instance" FIREWALL_BASE_FORWARD 2>/dev/null || echo 1)"
     echo "Base IPv4 NAT: $(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || echo masquerade)"
     echo "Host-wide Global MASQUERADE: $(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || echo 0)"
+    echo "iptables persistence: $(state_get "$instance" FIREWALL_PERSISTENCE 2>/dev/null || echo manager)"
     echo "Primary outbound: $(fw_primary_out_iface "$instance")"
     echo "Saved route hint: $(state_get "$instance" FIREWALL_PRIMARY_ROUTE 2>/dev/null || true)"
     echo "Custom rules: total=$count enabled=$enabled disabled=$disabled"
@@ -13400,7 +13597,7 @@ fw_rule_wizard() {
             ;;
         mss_clamp)
             source="$(fw_choose_source "$instance" "$family")"; dest="$(fw_choose_destination "$family")"
-            outif="$(fw_choose_interface "Choose forwarded output interface/TUN" "" 0)"
+            outif="$(fw_choose_interface "Choose forwarded output interface" "" 0)"
             [[ -n "$outif" ]] || return 1
             ;;
         dnat)
@@ -13576,7 +13773,6 @@ fw_base_policy_menu() {
         echo "3) IPv4 NAT mode (current: $(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || echo masquerade))"
         echo "4) Primary outbound interface / detected route (current: $(fw_primary_out_iface "$instance"))"
         echo "5) IPv6 NAT66 toggle (current: $(state_get "$instance" IPV6_NAT 2>/dev/null || echo 0))"
-        echo "6) Host-wide Global MASQUERADE compatibility mode (current: $(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || echo 0))"
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
@@ -13590,19 +13786,6 @@ fw_base_policy_menu() {
                 ;;
             4) rollback="$(fw_prepare_change "$instance" primary-outbound)"; fw_select_primary_outbound "$instance"; fw_commit_or_rollback "$instance" "$rollback" ;;
             5) rollback="$(fw_prepare_change "$instance" ipv6-nat)"; [[ "$(state_get "$instance" IPV6_NAT 2>/dev/null || echo 0)" == 1 ]] && state_set "$instance" IPV6_NAT 0 || state_set "$instance" IPV6_NAT 1; fw_commit_or_rollback "$instance" "$rollback" ;;
-            6)
-                echo
-                print_warn "Global MASQUERADE is host-wide and intentionally broad."
-                print_warn "It is equivalent in effect to: iptables -t nat -A POSTROUTING -j MASQUERADE"
-                print_warn "It can affect containers, multi-IP source selection, FRP/proxies and unrelated services."
-                if [[ "$(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || echo 0)" == 1 ]]; then
-                    ask_yes_no "Disable host-wide Global MASQUERADE?" "y" || continue
-                    rollback="$(fw_prepare_change "$instance" global-masquerade-off)"; state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 0; fw_commit_or_rollback "$instance" "$rollback"
-                else
-                    ask_yes_no "Enable host-wide Global MASQUERADE anyway?" "n" || continue
-                    rollback="$(fw_prepare_change "$instance" global-masquerade-on)"; state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 1; fw_commit_or_rollback "$instance" "$rollback"
-                fi
-                ;;
             0) return 0 ;;
             *) print_warn "Invalid selection." ;;
         esac
@@ -13610,10 +13793,15 @@ fw_base_policy_menu() {
 }
 
 fw_backend_menu() {
-    local instance="$1" rollback old
-    old="$(firewall_mode_for_instance "$instance")"; rollback="$(fw_prepare_change "$instance" backend-change)"
-    configure_firewall_mode "$instance" || { rm -rf "$rollback"; return 0; }
-    if [[ "$old" != "$(firewall_mode_for_instance "$instance")" ]]; then fw_commit_or_rollback "$instance" "$rollback"; else rm -rf "$rollback"; fi
+    local instance="$1" rollback
+    rollback="$(fw_prepare_change "$instance" firewall-profile-change)"
+    if ! configure_firewall_mode "$instance"; then
+        rm -rf "$rollback"
+        return 1
+    fi
+    # A profile change can keep the same backend while changing NAT/persistence,
+    # so always re-apply the full saved policy instead of comparing only backend.
+    fw_commit_or_rollback "$instance" "$rollback"
 }
 
 fw_show_live_rules() {
@@ -13626,6 +13814,13 @@ fw_show_live_rules() {
         for role in prerouting input forward output postrouting; do chain="$(firewall_chain_name "$instance" "$role")"; echo "-- mangle/$role ($chain)"; "$cmd" -t mangle -S "$chain" 2>/dev/null || echo "(not present)"; done
         for role in prerouting output; do chain="$(firewall_chain_name "$instance" "$role")"; echo "-- raw/$role ($chain)"; "$cmd" -t raw -S "$chain" 2>/dev/null || echo "(not present)"; done
     done
+    echo "==== Host-wide POSTROUTING compatibility rule ===="
+    if iptables -t nat -C POSTROUTING -j MASQUERADE >/dev/null 2>&1; then
+        echo "-A POSTROUTING -j MASQUERADE"
+        echo "Manager-owned: $(fw_global_state_get GLOBAL_MASQUERADE_OWNED 2>/dev/null || echo 0)"
+    else
+        echo "(disabled)"
+    fi
     if command -v ufw >/dev/null 2>&1; then echo "==== UFW rules tagged for $instance ===="; ufw status numbered 2>/dev/null | grep -F "ocserv-manager:$instance" || echo "(none)"; fi
 }
 
@@ -13649,7 +13844,7 @@ fw_reset_defaults() {
     echo "Reset options:"; echo "1) Reset base/custom policy but keep current backend"; echo "2) Full Manager firewall defaults (iptables + base ingress/forward/MASQUERADE + no custom rules)"; echo "0) Cancel"
     read -r -p "Select: " mode || true; [[ "$mode" == 0 ]] && return 0
     ask_yes_no "Reset the saved firewall policy for $instance?" "n" || return 0; rollback="$(fw_prepare_change "$instance" reset-defaults)"
-    state_set "$instance" FIREWALL_BASE_INGRESS 1; state_set "$instance" FIREWALL_BASE_FORWARD 1; state_set "$instance" FIREWALL_BASE_NAT_MODE masquerade; state_set "$instance" FIREWALL_BASE_SNAT_IP ""; state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 0; state_set "$instance" OUT_IFACE "$(default_route_iface)"; state_set "$instance" FIREWALL_PRIMARY_ROUTE "default(auto)"
+    state_set "$instance" FIREWALL_BASE_INGRESS 1; state_set "$instance" FIREWALL_BASE_FORWARD 1; state_set "$instance" FIREWALL_BASE_NAT_MODE masquerade; state_set "$instance" FIREWALL_BASE_SNAT_IP ""; state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 0; state_set "$instance" FIREWALL_PERSISTENCE manager; state_set "$instance" OUT_IFACE "$(default_route_iface)"; state_set "$instance" FIREWALL_PRIMARY_ROUTE "default(auto)"
     [[ "$mode" == 2 ]] && state_set "$instance" FIREWALL_MODE iptables
     file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"; jq '.rules=[]' "$file" > "$tmp" && mv "$tmp" "$file"
     fw_commit_or_rollback "$instance" "$rollback"
@@ -13703,8 +13898,8 @@ fw_quick_add_forward() {
     local instance="$1" rollback outif desc id file tmp rule
     ensure_firewall_policy_file "$instance" || return 1
     echo
-    print_info "Creates: VPN subnet -> selected interface/TUN, plus RELATED/ESTABLISHED return traffic."
-    outif="$(fw_choose_interface_simple "Choose interface/TUN" 0)" || return 0
+    print_info "Creates a scoped VPN FORWARD rule through the selected interface, plus RELATED/ESTABLISHED return traffic."
+    outif="$(fw_choose_interface_simple "Choose interface" 0)" || return 0
     [[ -n "$outif" ]] || return 0
     desc="$(ask_value "Description" "VPN through $outif")"
     rollback="$(fw_prepare_change "$instance" quick-forward)"
@@ -13731,82 +13926,6 @@ fw_quick_add_masquerade() {
     fw_commit_or_rollback "$instance" "$rollback"
 }
 
-fw_quick_optimize_tunnel() {
-    local instance="$1" outif rollback file tmp subnet id rule existing added=0
-    ensure_firewall_policy_file "$instance" || return 1
-    echo
-    print_info "Optimizes VPN -> selected interface/TUN with three scoped pieces:"
-    echo "- Stateful FORWARD pair"
-    echo "- MASQUERADE only for this instance VPN subnet on the selected interface"
-    echo "- TCP MSS clamp to PMTU for SYN packets on this forwarded path"
-    echo
-    print_info "This reproduces the useful VPN->TUN NAT effect of a broad POSTROUTING MASQUERADE without NATing unrelated host traffic."
-    outif="$(fw_choose_interface_simple "Choose interface/TUN to optimize" 0)" || return 0
-    [[ -n "$outif" ]] || return 0
-    subnet="$(state_get "$instance" SUBNET 2>/dev/null || true)"; [[ -n "$subnet" ]] || { print_err "VPN subnet is unknown for $instance."; return 1; }
-    rollback="$(fw_prepare_change "$instance" optimize-tunnel)"
-    file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"; cp -a "$file" "$tmp"
-
-    existing="$(jq --arg o "$outif" '[.rules[] | select(.enabled!=false and .kind=="forward_pair" and .source=="@vpn" and (.destination//"any")=="any" and (.out_iface//"")==$o)] | length' "$tmp")"
-    if [[ "$existing" == 0 ]]; then
-        id="$(fw_new_rule_id)"; rule="$(jq -nc --arg id "$id" --arg out "$outif" '{id:$id,enabled:true,kind:"forward_pair",family:"ipv4",source:"@vpn",destination:"any",in_iface:"",out_iface:$out,action:"ACCEPT",return_established:true,description:("VPN forward via " + $out)}')"
-        jq --argjson r "$rule" '.rules += [$r]' "$tmp" > "$tmp.new" && mv "$tmp.new" "$tmp"; added=$((added+1))
-    fi
-    existing="$(jq --arg o "$outif" '[.rules[] | select(.enabled!=false and .kind=="nat_masquerade" and .source=="@vpn" and (.destination//"any")=="any" and (.out_iface//"")==$o)] | length' "$tmp")"
-    if [[ "$existing" == 0 ]]; then
-        id="$(fw_new_rule_id)"; rule="$(jq -nc --arg id "$id" --arg out "$outif" '{id:$id,enabled:true,kind:"nat_masquerade",family:"ipv4",source:"@vpn",destination:"any",in_iface:"",out_iface:$out,action:"ACCEPT",return_established:false,description:("VPN scoped NAT via " + $out)}')"
-        jq --argjson r "$rule" '.rules += [$r]' "$tmp" > "$tmp.new" && mv "$tmp.new" "$tmp"; added=$((added+1))
-    fi
-    existing="$(jq --arg o "$outif" '[.rules[] | select(.enabled!=false and .kind=="mss_clamp" and .source=="@vpn" and (.destination//"any")=="any" and (.out_iface//"")==$o)] | length' "$tmp")"
-    if [[ "$existing" == 0 ]]; then
-        id="$(fw_new_rule_id)"; rule="$(jq -nc --arg id "$id" --arg out "$outif" '{id:$id,enabled:true,kind:"mss_clamp",family:"ipv4",source:"@vpn",destination:"any",in_iface:"",out_iface:$out,action:"ACCEPT",return_established:false,description:("TCP MSS clamp via " + $out)}')"
-        jq --argjson r "$rule" '.rules += [$r]' "$tmp" > "$tmp.new" && mv "$tmp.new" "$tmp"; added=$((added+1))
-    fi
-    mv "$tmp" "$file"
-    if fw_commit_or_rollback "$instance" "$rollback"; then
-        if (( added == 0 )); then print_ok "Tunnel optimization was already complete for $outif."; else print_ok "Tunnel optimization completed for $outif; added $added missing rule(s)."; fi
-        echo "Expected effective path: $subnet -> $outif with scoped MASQUERADE and TCP MSS clamp."
-    fi
-}
-
-fw_toggle_global_masquerade_quick() {
-    local instance="$1" current rollback
-    current="$(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || echo 0)"
-    echo
-    print_warn "Host-wide Global MASQUERADE affects ALL IPv4 traffic reaching POSTROUTING."
-    echo "Equivalent in effect to: iptables -t nat -A POSTROUTING -j MASQUERADE"
-    echo "Recommended only for compatibility/testing when scoped VPN NAT is insufficient."
-    if [[ "$current" == 1 ]]; then
-        ask_yes_no "Global MASQUERADE is ON. Disable it?" "y" || return 0
-        rollback="$(fw_prepare_change "$instance" global-masquerade-off)"; state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 0
-    else
-        ask_yes_no "Enable Global MASQUERADE despite the host-wide scope?" "n" || return 0
-        rollback="$(fw_prepare_change "$instance" global-masquerade-on)"; state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 1
-    fi
-    fw_commit_or_rollback "$instance" "$rollback"
-}
-
-fw_show_detected_network_simple() {
-    local def line name state addr suffix
-    def="$(default_route_iface 2>/dev/null || true)"
-    echo "==== Useful interfaces ===="
-    while IFS= read -r line; do
-        name="$(awk -F': ' '{print $2}' <<<"$line" | sed 's/@.*//')"
-        [[ -n "$name" && "$name" != lo ]] || continue
-        [[ "$name" =~ ^vpns[0-9]+$ ]] && continue
-        state="$(awk '{for(i=1;i<=NF;i++) if($i=="state") print $(i+1)}' <<<"$line")"
-        addr="$(ip -o -4 addr show dev "$name" 2>/dev/null | awk '{print $4}' | paste -sd, -)"
-        suffix=""; [[ "$name" == "$def" ]] && suffix="  [default Internet]"
-        printf -- '- %s  state=%s  ipv4=%s%s\n' "$name" "${state:-?}" "${addr:-no-ipv4}" "$suffix"
-    done < <(ip -o link show 2>/dev/null)
-    echo; echo "==== Default route ===="
-    ip -4 route show default 2>/dev/null | sed 's/^/- /' || true
-    echo; echo "==== Policy rules ===="
-    ip rule show 2>/dev/null | sed 's/^/- /' || true
-    echo
-    print_info "Ephemeral ocserv client interfaces (vpnsNNN) are hidden here. Advanced view shows everything."
-}
-
 fw_simple_rule_list() {
     local instance="$1" file
     ensure_firewall_policy_file "$instance" || return 1
@@ -13816,79 +13935,6 @@ fw_simple_rule_list() {
         return 0
     fi
     jq -r '.rules | to_entries[] | . as $e | (if $e.value.enabled==false then "OFF" else "ON " end) as $st | [$e.key+1,$st,($e.value.kind // "unknown"),($e.value.source // "any"),($e.value.destination // "any"),($e.value.out_iface // "any"),($e.value.description // "")] | @tsv' "$file" | awk -F '\t' '{printf "%s) %s  %s  src=%s  dst=%s  out=%s  %s\n",$1,$2,$3,$4,$5,$6,$7}'
-}
-
-fw_quick_setup_menu() {
-    local instance="$1" choice
-    while true; do
-        echo; echo "==== Quick firewall setup: $instance ===="
-        echo "1) Optimize VPN through an interface/TUN (FORWARD + scoped NAT + MSS clamp)"
-        echo "2) Allow VPN through an interface/TUN only (FORWARD only)"
-        echo "3) Add scoped VPN MASQUERADE on an interface"
-        echo "4) Toggle host-wide Global MASQUERADE (old broad compatibility rule)"
-        echo "5) Change normal Internet egress / base NAT"
-        echo "6) Show useful interfaces/routes"
-        echo "0) Back"
-        read -r -p "Select: " choice || true
-        case "$choice" in
-            1) fw_quick_optimize_tunnel "$instance"; pause ;;
-            2) fw_quick_add_forward "$instance"; pause ;;
-            3) fw_quick_add_masquerade "$instance"; pause ;;
-            4) fw_toggle_global_masquerade_quick "$instance"; pause ;;
-            5) fw_base_policy_menu "$instance" ;;
-            6) fw_show_detected_network_simple; pause ;;
-            0) return 0 ;;
-            *) print_warn "Invalid selection." ;;
-        esac
-    done
-}
-
-fw_rules_simple_menu() {
-    local instance="$1" choice
-    while true; do
-        echo; echo "==== Extra firewall rules: $instance ===="
-        fw_simple_rule_list "$instance"
-        echo
-        echo "1) Optimize VPN -> interface/TUN (FORWARD + NAT + MSS clamp)"
-        echo "2) Add FORWARD-only VPN -> interface/TUN rule"
-        echo "3) Enable/disable a rule"
-        echo "4) Delete a rule"
-        echo "5) Edit/rebuild a rule (detailed wizard)"
-        echo "0) Back"
-        read -r -p "Select: " choice || true
-        case "$choice" in
-            1) fw_quick_optimize_tunnel "$instance"; pause ;;
-            2) fw_quick_add_forward "$instance"; pause ;;
-            3) fw_policy_toggle_rule "$instance"; pause ;;
-            4) fw_policy_delete_rule "$instance"; pause ;;
-            5) fw_policy_edit_rule "$instance"; pause ;;
-            0) return 0 ;;
-            *) print_warn "Invalid selection." ;;
-        esac
-    done
-}
-
-fw_status_apply_menu() {
-    local instance="$1" choice
-    while true; do
-        echo; echo "==== Firewall status: $instance ===="
-        fw_policy_summary "$instance"
-        echo
-        echo "1) Show extra rules"
-        echo "2) Apply/reapply saved firewall now"
-        echo "3) Show useful interfaces/routes"
-        echo "4) Show live Manager-owned chains"
-        echo "0) Back"
-        read -r -p "Select: " choice || true
-        case "$choice" in
-            1) fw_simple_rule_list "$instance"; pause ;;
-            2) apply_firewall_for_instance "$instance"; pause ;;
-            3) fw_show_detected_network_simple; pause ;;
-            4) fw_show_live_rules "$instance"; pause ;;
-            0) return 0 ;;
-            *) print_warn "Invalid selection." ;;
-        esac
-    done
 }
 
 fw_backup_restore_menu() {
@@ -13910,28 +13956,195 @@ fw_backup_restore_menu() {
     done
 }
 
-fw_advanced_menu() {
-    local instance="$1" choice rollback file tmp
+fw_netfilter_persistent_service_menu() {
+    local choice
+    echo "netfilter-persistent service: $(systemctl is-enabled netfilter-persistent.service 2>/dev/null || echo not-installed/disabled) / $(systemctl is-active netfilter-persistent.service 2>/dev/null || echo inactive)"
+    echo "1) Enable service at boot"
+    echo "2) Disable service at boot"
+    echo "3) Restart/reload service now"
+    echo "0) Back"
+    read -r -p "Select: " choice || true
+    case "$choice" in
+        1) install_available_packages iptables iptables-persistent; systemctl enable netfilter-persistent.service; print_ok "netfilter-persistent enabled." ;;
+        2) print_warn "Disabling this service affects the whole host, not only ocserv."; ask_yes_no "Disable netfilter-persistent at boot?" "n" && systemctl disable netfilter-persistent.service ;;
+        3) command -v netfilter-persistent >/dev/null 2>&1 && netfilter-persistent reload || print_warn "netfilter-persistent is not installed." ;;
+        0) return 0 ;;
+        *) print_warn "Invalid selection." ;;
+    esac
+}
+
+fw_iptables_management_menu() {
+    local instance="$1" choice
     while true; do
-        echo; echo "==== Advanced firewall: $instance ===="
-        echo "1) Full rule wizard (FORWARD/NAT/SNAT/DNAT/INPUT/OUTPUT/UFW/mangle/raw)"
-        echo "2) Clone a rule"
-        echo "3) Full network detection (all vpnsNNN interfaces/tables)"
-        echo "4) Show full host firewall read-only"
-        echo "5) Remove all extra/custom rules (keep base policy)"
+        echo; echo "==== iptables management: $instance ===="
+        echo "Host-wide Global MASQUERADE: $(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || echo 0)"
+        echo "Persistence: $(state_get "$instance" FIREWALL_PERSISTENCE 2>/dev/null || echo manager)"
+        echo "1) Show current iptables rules (filter + nat)"
+        echo "2) Toggle host-wide POSTROUTING MASQUERADE"
+        echo "3) Change persistence mode (Manager / iptables-persistent)"
+        echo "4) Save current host rules to /etc/iptables/rules.v4 now"
+        echo "5) Reload iptables-persistent rules now"
+        echo "6) netfilter-persistent service (status / enable / disable / reload)"
+        echo "7) Add a managed netfilter rule"
+        echo "8) List/edit/enable/disable/delete managed rules"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
+        case "$choice" in
+            1) echo "==== filter ===="; iptables -S || true; echo; echo "==== nat ===="; iptables -t nat -S || true; pause ;;
+            2) fw_toggle_host_global_masquerade "$instance"; pause ;;
+            3) fw_set_persistence_mode "$instance"; pause ;;
+            4) fw_save_iptables_persistent_interactive; pause ;;
+            5) fw_reload_iptables_persistent; pause ;;
+            6) fw_netfilter_persistent_service_menu; pause ;;
+            7) fw_policy_add_rule "$instance"; pause ;;
+            8) fw_rules_management_menu "$instance" ;;
+            0) return 0 ;;
+            *) print_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+fw_add_ufw_rule_simple() {
+    local instance="$1" direction action proto dport source dest inif outif desc id rule rollback file tmp choice
+    command -v ufw >/dev/null 2>&1 || { print_warn "UFW is not installed."; return 1; }
+    if [[ "$(firewall_mode_for_instance "$instance")" != ufw ]]; then
+        ask_yes_no "Switch this instance backend to UFW so the managed UFW rule is applied?" "n" || return 0
+        state_set "$instance" FIREWALL_MODE ufw
+    fi
+    echo "Direction: 1) in  2) out  3) route"; read -r -p "Select [1]: " choice || true
+    case "${choice:-1}" in 2) direction=out ;; 3) direction=route ;; *) direction=in ;; esac
+    echo "Action: 1) allow  2) deny  3) reject  4) limit"; read -r -p "Select [1]: " choice || true
+    case "${choice:-1}" in 2) action=deny ;; 3) action=reject ;; 4) action=limit ;; *) action=allow ;; esac
+    echo "Protocol: 1) any  2) tcp  3) udp"; read -r -p "Select [1]: " choice || true
+    case "${choice:-1}" in 2) proto=tcp ;; 3) proto=udp ;; *) proto=all ;; esac
+    dport="$(ask_value "Destination port (blank = any)" "")"
+    source="$(fw_choose_source "$instance" ipv4)"; dest="$(fw_choose_destination ipv4)"
+    inif=""; outif=""
+    if [[ "$direction" == in || "$direction" == route ]]; then inif="$(fw_choose_interface "Inbound interface" "" 1)"; fi
+    if [[ "$direction" == out || "$direction" == route ]]; then outif="$(fw_choose_interface "Outbound interface" "" 1)"; fi
+    desc="$(ask_value "Description (optional)" "")"; id="$(fw_new_rule_id)"
+    rule="$(jq -nc --arg id "$id" --arg dir "$direction" --arg act "$action" --arg proto "$proto" --arg port "$dport" --arg src "$source" --arg dst "$dest" --arg ini "$inif" --arg outi "$outif" --arg desc "$desc" '{id:$id,enabled:true,kind:"ufw_native",family:"ipv4",direction:$dir,ufw_action:$act,protocol:$proto,dport:$port,source:$src,destination:$dst,in_iface:$ini,out_iface:$outi,description:$desc}')"
+    rollback="$(fw_prepare_change "$instance" add-ufw-rule)"; file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"
+    jq --argjson r "$rule" '.rules += [$r]' "$file" > "$tmp" && mv "$tmp" "$file"
+    fw_commit_or_rollback "$instance" "$rollback"
+}
+
+fw_delete_ufw_rule_by_number() {
+    local n
+    command -v ufw >/dev/null 2>&1 || { print_err "UFW is not installed."; return 1; }
+    ufw status numbered || true
+    n="$(ask_value "UFW rule number to delete (blank = cancel)" "")"; [[ -n "$n" ]] || return 0
+    [[ "$n" =~ ^[0-9]+$ ]] || { print_warn "Invalid rule number."; return 1; }
+    print_warn "This can delete a rule that was not created by Ocserv Manager."
+    ask_yes_no "Delete UFW rule number $n?" "n" || return 0
+    yes | ufw delete "$n"
+}
+
+fw_ufw_management_menu() {
+    local instance="$1" choice
+    while true; do
+        echo; echo "==== UFW management: $instance ===="
+        echo "1) Install UFW package"
+        echo "2) Show UFW status / numbered rules"
+        echo "3) Enable UFW"
+        echo "4) Disable UFW"
+        echo "5) Reload UFW"
+        echo "6) Add a managed UFW rule"
+        echo "7) Delete a UFW rule by number"
+        echo "8) Switch this instance backend to UFW"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
+        case "$choice" in
+            1) install_available_packages ufw; pause ;;
+            2) command -v ufw >/dev/null 2>&1 && { ufw status verbose || true; ufw status numbered || true; } || print_warn "UFW is not installed."; pause ;;
+            3) command -v ufw >/dev/null 2>&1 || install_available_packages ufw; print_warn "Enabling UFW can affect remote access if existing allow rules are incomplete."; ask_yes_no "Enable UFW now?" "n" && ufw --force enable; pause ;;
+            4) command -v ufw >/dev/null 2>&1 && { ask_yes_no "Disable UFW now?" "n" && ufw disable; } || print_warn "UFW is not installed."; pause ;;
+            5) command -v ufw >/dev/null 2>&1 && ufw reload || print_warn "UFW is not installed."; pause ;;
+            6) fw_add_ufw_rule_simple "$instance"; pause ;;
+            7) fw_delete_ufw_rule_by_number; pause ;;
+            8) state_set "$instance" FIREWALL_MODE ufw; apply_firewall_for_instance "$instance"; pause ;;
+            0) return 0 ;;
+            *) print_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+fw_routing_nat_menu() {
+    local instance="$1" choice
+    while true; do
+        echo; echo "==== Routing / NAT: $instance ===="
+        echo "1) Select primary outbound interface / detected route"
+        echo "2) Configure base IPv4 NAT (MASQUERADE / SNAT / none)"
+        echo "3) Add VPN FORWARD rule through an interface"
+        echo "4) Add VPN MASQUERADE rule on an interface"
+        echo "5) Add/edit advanced NAT or forwarding rule"
+        echo "6) Show detected interfaces, local IPs, routes and policy rules"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
+        case "$choice" in
+            1) local rb; rb="$(fw_prepare_change "$instance" primary-outbound)"; fw_select_primary_outbound "$instance"; fw_commit_or_rollback "$instance" "$rb"; pause ;;
+            2) fw_base_policy_menu "$instance" ;;
+            3) fw_quick_add_forward "$instance"; pause ;;
+            4) fw_quick_add_masquerade "$instance"; pause ;;
+            5) fw_policy_add_rule "$instance"; pause ;;
+            6) fw_show_detected_network; pause ;;
+            0) return 0 ;;
+            *) print_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+fw_rules_management_menu() {
+    local instance="$1" choice
+    while true; do
+        echo; echo "==== Managed firewall rules: $instance ===="
+        fw_simple_rule_list "$instance"
+        echo
+        echo "1) Add rule"
+        echo "2) Edit rule"
+        echo "3) Enable/disable rule"
+        echo "4) Delete rule"
+        echo "5) Clone rule"
+        echo "6) Remove all managed custom rules"
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
             1) fw_policy_add_rule "$instance"; pause ;;
-            2) fw_policy_clone_rule "$instance"; pause ;;
-            3) fw_show_detected_network; pause ;;
-            4) fw_show_host_firewall_readonly; pause ;;
-            5)
-                ask_yes_no "Delete all custom firewall rules for $instance?" "n" || continue
-                rollback="$(fw_prepare_change "$instance" clear-custom-rules)"
-                file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"
-                jq '.rules=[]' "$file" >"$tmp" && mv "$tmp" "$file"
-                fw_commit_or_rollback "$instance" "$rollback"; pause ;;
+            2) fw_policy_edit_rule "$instance"; pause ;;
+            3) fw_policy_toggle_rule "$instance"; pause ;;
+            4) fw_policy_delete_rule "$instance"; pause ;;
+            5) fw_policy_clone_rule "$instance"; pause ;;
+            6)
+                if ask_yes_no "Remove ALL managed custom firewall rules for $instance? Base ocserv rules are kept." "n"; then
+                    local rollback file tmp
+                    rollback="$(fw_prepare_change "$instance" clear-managed-rules)"; file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"
+                    jq '.rules=[]' "$file" > "$tmp" && mv "$tmp" "$file"
+                    fw_commit_or_rollback "$instance" "$rollback"
+                fi
+                pause ;;
+            0) return 0 ;;
+            *) print_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+fw_status_menu() {
+    local instance="$1" choice
+    while true; do
+        echo; echo "==== Firewall status: $instance ===="
+        fw_policy_summary "$instance"
+        echo
+        echo "1) Apply/reapply saved firewall now"
+        echo "2) Show live Manager-owned rules"
+        echo "3) Show full host firewall read-only"
+        echo "4) Show detected network"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
+        case "$choice" in
+            1) apply_firewall_for_instance "$instance"; pause ;;
+            2) fw_show_live_rules "$instance"; pause ;;
+            3) fw_show_host_firewall_readonly; pause ;;
+            4) fw_show_detected_network; pause ;;
             0) return 0 ;;
             *) print_warn "Invalid selection." ;;
         esac
@@ -13942,38 +14155,33 @@ firewall_manager_menu() {
     local instance="$1" choice
     ensure_firewall_policy_file "$instance" || return 1
     while true; do
-        echo; echo "==== Firewall: $instance ===="
+        echo; echo "==== Firewall Manager: $instance ===="
         echo "Backend: $(firewall_mode_for_instance "$instance")"
         echo "VPN subnet: $(state_get "$instance" SUBNET 2>/dev/null || echo unknown)"
-        echo "Internet egress: $(fw_primary_out_iface "$instance")"
+        echo "Primary outbound: $(fw_primary_out_iface "$instance")"
         echo "Base NAT: $(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || echo masquerade)"
-        echo "Global MASQUERADE: $(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || echo 0)"
-        echo "Extra rules: $(jq '.rules|length' "$(firewall_policy_file "$instance")" 2>/dev/null || echo 0)"
+        echo "Global POSTROUTING MASQUERADE: $(state_get "$instance" FIREWALL_GLOBAL_MASQUERADE 2>/dev/null || echo 0)"
+        echo "Persistence: $(state_get "$instance" FIREWALL_PERSISTENCE 2>/dev/null || echo manager)"
         echo
-        echo "1) Quick setup"
-        echo "2) Extra routes / rules"
-        echo "3) Base settings (iptables/UFW, ports, Internet FORWARD/NAT)"
-        echo "4) Status / apply / detected network"
-        echo "5) Backup / restore / reset"
-        echo "6) Advanced"
+        echo "1) Firewall backend / profile"
+        echo "2) Standard ocserv rules (ports / FORWARD / base NAT)"
+        echo "3) iptables management"
+        echo "4) UFW management"
+        echo "5) Routing / NAT / port forwarding"
+        echo "6) Managed rules (add / edit / enable / disable / delete)"
+        echo "7) Backup / restore / reset"
+        echo "8) Status / detected network / live rules"
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
-            1) fw_quick_setup_menu "$instance" ;;
-            2) fw_rules_simple_menu "$instance" ;;
-            3)
-                echo; echo "1) Change backend (iptables / UFW)"; echo "2) Base ocserv firewall policy"; echo "0) Back"
-                read -r -p "Select: " choice || true
-                case "$choice" in
-                    1) fw_backend_menu "$instance"; pause ;;
-                    2) fw_base_policy_menu "$instance" ;;
-                    0) : ;;
-                    *) print_warn "Invalid selection." ;;
-                esac
-                ;;
-            4) fw_status_apply_menu "$instance" ;;
-            5) fw_backup_restore_menu "$instance" ;;
-            6) fw_advanced_menu "$instance" ;;
+            1) fw_backend_menu "$instance"; pause ;;
+            2) fw_base_policy_menu "$instance" ;;
+            3) fw_iptables_management_menu "$instance" ;;
+            4) fw_ufw_management_menu "$instance" ;;
+            5) fw_routing_nat_menu "$instance" ;;
+            6) fw_rules_management_menu "$instance" ;;
+            7) fw_backup_restore_menu "$instance" ;;
+            8) fw_status_menu "$instance" ;;
             0) return 0 ;;
             *) print_warn "Invalid selection." ;;
         esac
@@ -13992,7 +14200,7 @@ instance_detail_menu() {
         echo "10) Virtual hosts (SNI)"; echo "11) Diagnostics"; echo "12) Repair"
         echo "13) Clone"; echo "14) Delete instance"; echo "15) Connection stability / mobile roaming / restore"
         echo "16) config-per-user / config-per-group settings"
-        echo "17) Firewall (simple setup + advanced)"
+        echo "17) Firewall Manager (iptables / UFW / NAT / persistence)"
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
@@ -14167,12 +14375,9 @@ backup_menu() {
 }
 
 setup_optional_features_if_needed() {
-    [[ -f "$AUDIT_ENV" ]] || configure_audit_logging
-    if [[ ! -f "$API_ENV" ]]; then
-        echo
-        print_info "Optional JSON status is always available on the command line. A read-only HTTP API can also be enabled for a bot/web panel."
-        if ask_yes_no "Enable the read-only HTTP API now?" "n"; then configure_readonly_api; fi
-    fi
+    # Optional HTTP API and audit features are configured only from their own
+    # explicit main-menu entries. Entering Instances must never prompt for them.
+    return 0
 }
 
 main_menu() {
@@ -14206,7 +14411,7 @@ main_menu() {
         read -r -p "Select: " choice || true
         case "$choice" in
             1) install_or_update_ocserv; pause;;
-            2) setup_optional_features_if_needed; instances_menu;;
+            2) instances_menu;;
             3) instance="$(choose_instance)" && user_management_menu "$instance";;
             4) instance="$(choose_instance)" && group_management_menu "$instance";;
             5) certificate_manager;;
