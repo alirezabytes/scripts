@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Ocserv Manager v2.8.3
+# Ocserv Manager v2.8.4
 # Multi-instance installer and manager for ocserv on Ubuntu/Debian.
 # Designed as a replacement for the original single-instance ocserv.sh.
 
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="2.8.3"
+PROGRAM_VERSION="2.8.4"
 PROGRAM_NAME="Ocserv Manager"
 
 OCSERV_ETC="/etc/ocserv"
@@ -31,7 +31,7 @@ CENTRAL_INTEGRATION_DIR="/etc/ocserv-manager/central"
 CENTRAL_LIB_DIR="/usr/local/lib/ocserv-manager/central"
 CENTRAL_EMBED_STATE="$MANAGER_ETC/central-embedded.env"
 CENTRAL_PROFILE="$CENTRAL_INTEGRATION_DIR/profile.env"
-CENTRAL_EMBEDDED_VERSION="v20.4.3"
+CENTRAL_EMBEDDED_VERSION="v20.4.4"
 TEMPLATE_ROOT="$MANAGER_ETC/templates"
 INSTANCE_BASE_ROOT="$MANAGER_ETC/config-bases"
 STABILITY_BACKUP_ROOT="$BACKUP_ROOT/stability"
@@ -423,12 +423,24 @@ select_ocserv_install_target() {
     latest="$(online_ocserv_tags 2>/dev/null | head -n1 || true)"
     echo "Installed version: ${current:-not installed}" >&2
     echo "Latest upstream tag: ${latest:-unavailable}" >&2
-    choice="$(choose_menu "Choose installation source:" \
-        "Latest stable upstream source (${latest:-online lookup})" \
-        "Choose an upstream version from online list" \
-        "Enter a specific upstream version/tag" \
-        "Ubuntu/Debian distribution package")"
+    echo "Choose installation source:" >&2
+    echo "1) Latest stable upstream source (${latest:-online lookup})" >&2
+    echo "2) Choose an upstream version from online list" >&2
+    echo "3) Enter a specific upstream version/tag" >&2
+    echo "4) Ubuntu/Debian distribution package" >&2
+    echo "0) Back" >&2
+    while true; do
+        read -r -p "Select: " choice || true
+        case "$choice" in
+            0|1|2|3|4) break ;;
+            *) print_warn "Invalid selection." >&2 ;;
+        esac
+    done
     case "$choice" in
+        0)
+            printf 'back|\n'
+            return 0
+            ;;
         1)
             [[ -n "$latest" ]] || { print_err "Could not retrieve upstream versions." >&2; return 1; }
             printf 'source|%s\n' "$latest"
@@ -721,6 +733,10 @@ install_or_update_ocserv() {
     target="$(select_ocserv_install_target)" || return 1
     method="${target%%|*}"
     version="${target#*|}"
+    if [[ "$method" == "back" ]]; then
+        print_info "Install/update cancelled; returning to the main menu."
+        return 0
+    fi
     local keep_update_backup=0
     if ask_yes_no "Create a persistent safety backup before installing/updating ocserv?" "y"; then
         ensure_backup_root
@@ -3050,12 +3066,15 @@ choose_user_groups() {
     echo "$prompt" >&2
     for idx in "${!groups[@]}"; do printf '%d) %s\n' "$((idx+1))" "${groups[$idx]}" >&2; done
     echo "m) Enter group name(s) manually" >&2
-    (( allow_none == 1 )) && echo "0) No group" >&2
+    (( allow_none == 1 )) && echo "0) No explicit group / wildcard (*)" >&2
     echo "You may select multiple existing groups with comma-separated numbers, e.g. 1,3." >&2
     while true; do
         read -r -p "Select group(s): " input || true
         input="${input// /}"
-        if (( allow_none == 1 )) && [[ -z "$input" || "$input" == 0 ]]; then printf '\n'; return 0; fi
+        if (( allow_none == 1 )) && [[ -z "$input" || "$input" == 0 ]]; then
+            printf '*\n'
+            return 0
+        fi
         if [[ "$input" == m || "$input" == M ]]; then
             manual="$(ask_value "Enter group name(s), comma-separated" "")"
             IFS=',' read -r -a selected <<<"$manual"
@@ -3166,15 +3185,26 @@ create_user() {
             print_info "User creation cancelled. You can create users later from the Users menu."
             return 0
         fi
-        valid_username "$username" && break
-        print_warn "Username must be 1-32 characters: English letters, numbers, . _ -"
+        if ! valid_username "$username"; then
+            print_warn "Username must be 1-32 characters: English letters, numbers, . _ -"
+            continue
+        fi
+        if grep -qE "^${username//./\.}:" "$passwd"; then
+            print_warn "User already exists: $username"
+            print_info "Enter a different username, or leave Username blank to return to the Users menu."
+            continue
+        fi
+        break
     done
-    if grep -qE "^${username//./\.}:" "$passwd"; then print_err "User already exists."; return 1; fi
     if ask_yes_no "Assign this user to a group?" "y"; then
         group="$(choose_user_groups "$instance" 0 "Available groups for this instance:")"
         [[ -n "$group" ]] || { print_info "No group selected; user creation cancelled."; return 0; }
+    else
+        # ocpasswd's default no-explicit-group representation is '*'. Keep it
+        # explicit so Manager edits never produce an invalid/ambiguous empty field.
+        group="*"
     fi
-    if [[ -n "$group" ]]; then "$bin" -c "$passwd" -g "$group" "$username"; else "$bin" -c "$passwd" "$username"; fi
+    "$bin" -c "$passwd" -g "$group" "$username"
     audit "user-create instance=$instance username=$username group=$group"
     print_ok "User created only if ocpasswd accepted the password input successfully."
 }
@@ -3212,7 +3242,9 @@ change_user_group() {
     groups="$(choose_user_groups "$instance" 1 "Available groups for this instance:")"
     local g
     IFS=',' read -r -a _groups <<<"$groups"
-    for g in "${_groups[@]}"; do [[ -z "$g" ]] || validate_group_name "$g" || { print_err "Invalid group: $g"; return 1; }; done
+    for g in "${_groups[@]}"; do
+        [[ -z "$g" || "$g" == "*" ]] || validate_group_name "$g" || { print_err "Invalid group: $g"; return 1; }
+    done
     if ask_yes_no "Create a backup of ocpasswd before changing this user's group?" "y"; then
         ensure_backup_root
         cp -a "$passwd" "$BACKUP_ROOT/ocpasswd-$(basename "$passwd")-$(date +%Y%m%d-%H%M%S)"
@@ -3238,7 +3270,12 @@ os.close(fd)
 with open(tmp,'w',encoding='utf-8') as f: f.write('\n'.join(out)+'\n')
 os.chmod(tmp,0o600); os.replace(tmp,p)
 PY
-    audit "user-group-change instance=$instance username=$user groups=$groups"; print_ok "User group changed without changing the password hash."
+    audit "user-group-change instance=$instance username=$user groups=$groups"
+    if [[ "$groups" == "*" ]]; then
+        print_ok "User changed to wildcard/no-explicit-group form: $user:*:<password-hash-preserved>"
+    else
+        print_ok "User group changed without changing the password hash."
+    fi
 }
 
 show_users_file_safe() {
@@ -3329,18 +3366,18 @@ user_management_menu() {
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
-            1) create_user "$instance"; pause ;;
-            2) change_user_password "$instance"; pause ;;
-            3) lock_unlock_user "$instance" lock; pause ;;
-            4) lock_unlock_user "$instance" unlock; pause ;;
-            5) delete_user "$instance"; pause ;;
-            6) change_user_group "$instance"; pause ;;
-            7) show_users_file_safe "$instance"; pause ;;
-            8) show_connected_users "$instance"; pause ;;
+            1) create_user "$instance" || true; pause ;;
+            2) change_user_password "$instance" || true; pause ;;
+            3) lock_unlock_user "$instance" lock || true; pause ;;
+            4) lock_unlock_user "$instance" unlock || true; pause ;;
+            5) delete_user "$instance" || true; pause ;;
+            6) change_user_group "$instance" || true; pause ;;
+            7) show_users_file_safe "$instance" || true; pause ;;
+            8) show_connected_users "$instance" || true; pause ;;
             9) echo "Connected sessions/users reported: $(connected_users_count "$instance")"; pause ;;
-            10) show_session_clients "$instance"; pause ;;
+            10) show_session_clients "$instance" || true; pause ;;
             11) user="$(ask_nonempty "Username")"; if occtl_exec "$instance" disconnect user "$user"; then print_ok "Disconnect requested."; else print_err "Disconnect failed."; fi; pause ;;
-            12) supplemental_config_menu "$instance" ;;
+            12) supplemental_config_menu "$instance" || true ;;
             0) return 0 ;;
             *) print_warn "Invalid selection." ;;
         esac
@@ -4133,7 +4170,7 @@ extract_embedded_central_manager() {
     mkdir -p "$(dirname "$destination")"
     cat > "$destination" <<'__OCSERV_MANAGER_EMBEDDED_CENTRAL_V20_7F3A1D__'
 #!/usr/bin/env bash
-# ocserv-central-manager v20.4.3
+# ocserv-central-manager v20.4.4
 # Native multi-instance source synchronization: each ocserv instance can publish its own ocpasswd authority and occtl session stream.
 # Adds safe in-place program update for Manager, Master API, Node Agent, hooks, and cleanup code without reconfigure.
 # Keeps v18 prune controls, v17 threshold export, v16 real ocpasswd prune/group export, v15 extra-traffic decrease/history, v14 reset recovery, v13 authoritative group refresh, v12 cleanup+VACUUM, v10 exhausted tools, and v8 unlimited groups.
@@ -4163,8 +4200,8 @@ CLEANUP_ENV="/etc/ocserv-central/cleanup.env"
 CLEANUP_SERVICE="/etc/systemd/system/ocserv-central-cleanup.service"
 CLEANUP_TIMER="/etc/systemd/system/ocserv-central-cleanup.timer"
 
-PROGRAM_VERSION="v20.4.3"
-API_VERSION="2.3"
+PROGRAM_VERSION="v20.4.4"
+API_VERSION="2.4"
 UPDATE_BACKUP_ROOT="/root/ocserv-central-update-backups"
 MASTER_VERSION_FILE="/etc/ocserv-central/installed-version"
 NODE_VERSION_FILE="/etc/ocserv-central-node/installed-version"
@@ -4343,7 +4380,29 @@ REMOVE_MISSING_USERS = os.getenv("REMOVE_MISSING_USERS", "0") == "1"
 EXHAUSTED_LOG_DEFAULT = os.getenv("EXHAUSTED_LOG_PATH", "/var/lib/ocserv-central/quota_exhausted_users.jsonl")
 GIB = 1024 * 1024 * 1024
 
-app = FastAPI(title="ocserv-central", version="2.3")
+
+def human_bytes(value: int | None) -> str | None:
+    """Format byte counters with IEC units while preserving exact raw byte fields."""
+    if value is None:
+        return None
+    n = max(0, int(value))
+    units = ("B", "KiB", "MiB", "GiB", "TiB", "PiB")
+    x = float(n)
+    unit = units[0]
+    for unit in units:
+        if x < 1024.0 or unit == units[-1]:
+            break
+        x /= 1024.0
+    if unit == "B":
+        return f"{int(x)} {unit}"
+    if x >= 100:
+        return f"{x:.1f} {unit}"
+    if x >= 10:
+        return f"{x:.2f} {unit}"
+    return f"{x:.3f} {unit}"
+
+
+app = FastAPI(title="ocserv-central", version="2.4")
 
 def now() -> int:
     return int(time.time())
@@ -5206,7 +5265,7 @@ def startup():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "version": "2.3", "time": now(), "multi_instance_sources": True}
+    return {"ok": True, "version": "2.4", "time": now(), "multi_instance_sources": True}
 
 @app.get("/config")
 def get_config(x_api_token: str | None = Header(default=None)):
@@ -5463,10 +5522,24 @@ def user_status(username: str, x_api_token: str | None = Header(default=None)):
     # Backward compatibility:
     # - remaining_bytes used to be 0 for unlimited quota. That was ambiguous.
     # - v11 returns null for unlimited and also adds remaining_bytes_compat=0.
+    session_items = []
+    for row in sessions:
+        item = dict(row)
+        real_ip = str(item.get("ip_real") or "")
+        item["client_ip_reported_by_ocserv"] = item.get("ip_real")
+        item["vpn_assigned_ip"] = item.get("ip_remote")
+        item["ip_real_is_loopback"] = real_ip in ("127.0.0.1", "::1") or real_ip.startswith("127.")
+        if item["ip_real_is_loopback"]:
+            item["ip_real_note"] = "ocserv sees a local proxy/forward as the peer; this is not the original Internet client IP"
+        session_items.append(item)
+
     return {
         "user": dict(user) if user else None,
         "limits": {
             "max_sessions": max_sessions,
+            "quota_human": None if quota_unlimited else human_bytes(int(quota_bytes)),
+            "used_human": human_bytes(used),
+            "remaining_human": None if quota_unlimited else human_bytes(remaining_bytes),
             "quota_bytes": int(quota_bytes),
             "used_bytes": used,
             "remaining_bytes": remaining_bytes,
@@ -5479,7 +5552,7 @@ def user_status(username: str, x_api_token: str | None = Header(default=None)):
         },
         "expired": account_is_expired(username),
         "current_group_authoritative": user["groupname"] if user else None,
-        "active_sessions": [dict(x) for x in sessions]
+        "active_sessions": session_items
     }
 
 @app.get("/users")
@@ -11029,7 +11102,7 @@ main_menu() {
     while true; do
         safe_clear
         echo "=============================================="
-        echo "       Ocserv Central Manager v20.4.3"
+        echo "       Ocserv Central Manager v20.4.4"
         echo "=============================================="
         echo "1) Master server menu"
         echo "2) Local ocserv instances / Node integration (multi-instance, recommended)"
@@ -11112,7 +11185,7 @@ case "${1:-}" in
         ;;
     --help|-h)
         cat <<'EOHELP'
-ocserv-central-manager v20.4.3 (embedded in Ocserv Manager)
+ocserv-central-manager v20.4.4 (embedded in Ocserv Manager)
   --install-master       Install/reconfigure Master
   --install-node         Install/reconfigure legacy single-config Node
   --install-both         Install Master + attach all local ocserv instances as Nodes
@@ -12857,7 +12930,7 @@ Usage: $0 [option]
   --central-instances-status Show local Central attachment/source status
   --central-attach-all-local-master Attach all local instances to the local Master at 127.0.0.1:8088
   --central-sync-local-master-profile Sync current local Master token/profile to already attached local instances
-  --central-import-v19-node [node.env] Import v19 Node API settings into the v20.4.3 source-aware shared instance profile
+  --central-import-v19-node [node.env] Import v19 Node API settings into the v20.4.4 source-aware shared instance profile
   --central-menu            Open the integrated Central Manager console
   --central-update          Update installed Central code/components without reconfigure
   --central-status          Show integrated Central status
