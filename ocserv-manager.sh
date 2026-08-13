@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Ocserv Manager v2.8.4
+# Ocserv Manager v3.0.0
 # Multi-instance installer and manager for ocserv on Ubuntu/Debian.
 # Designed as a replacement for the original single-instance ocserv.sh.
 
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="2.8.4"
+PROGRAM_VERSION="3.0.0"
 PROGRAM_NAME="Ocserv Manager"
 
 OCSERV_ETC="/etc/ocserv"
@@ -35,6 +35,8 @@ CENTRAL_EMBEDDED_VERSION="v20.4.4"
 TEMPLATE_ROOT="$MANAGER_ETC/templates"
 INSTANCE_BASE_ROOT="$MANAGER_ETC/config-bases"
 STABILITY_BACKUP_ROOT="$BACKUP_ROOT/stability"
+FIREWALL_POLICY_ROOT="$MANAGER_ETC/firewall"
+FIREWALL_SNAPSHOT_ROOT="$BACKUP_ROOT/firewall"
 
 C_RESET='\033[0m'
 C_RED='\033[31m'
@@ -76,8 +78,8 @@ ensure_dirs() {
     # Runtime/state directories only. Backup directories are intentionally NOT
     # created merely by launching the manager; they are created lazily only
     # when an operation actually writes a backup.
-    mkdir -p "$MANAGER_ETC" "$INSTANCE_ROOT" "$STATE_ROOT" "$BUILD_ROOT" "$API_DIR" "$CENTRAL_INTEGRATION_DIR" "$CENTRAL_LIB_DIR" "$TEMPLATE_ROOT" "$INSTANCE_BASE_ROOT"
-    chmod 700 "$MANAGER_ETC" "$STATE_ROOT" "$CENTRAL_INTEGRATION_DIR" "$TEMPLATE_ROOT" "$INSTANCE_BASE_ROOT" 2>/dev/null || true
+    mkdir -p "$MANAGER_ETC" "$INSTANCE_ROOT" "$STATE_ROOT" "$BUILD_ROOT" "$API_DIR" "$CENTRAL_INTEGRATION_DIR" "$CENTRAL_LIB_DIR" "$TEMPLATE_ROOT" "$INSTANCE_BASE_ROOT" "$FIREWALL_POLICY_ROOT"
+    chmod 700 "$MANAGER_ETC" "$STATE_ROOT" "$CENTRAL_INTEGRATION_DIR" "$TEMPLATE_ROOT" "$INSTANCE_BASE_ROOT" "$FIREWALL_POLICY_ROOT" 2>/dev/null || true
 }
 
 ensure_backup_root() {
@@ -1737,6 +1739,10 @@ ensure_firewall_boot_persistence_for_existing_instances() {
     install_firewall_reapply_unit
 }
 
+valid_interface_name() {
+    [[ "${1:-}" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]]
+}
+
 apply_firewall_for_instance() {
     local instance="$1" subnet iface comment ipv6 nat6
     subnet="$(state_get "$instance" SUBNET)"
@@ -1801,6 +1807,9 @@ remove_firewall_for_instance() {
     udp="$(state_get "$instance" UDP_PORT 2>/dev/null || true)"
     remove_iptables_ingress_values "$instance" "$tcp" "$udp"
     remove_ufw_managed_rules "$instance"
+    if [[ -n "$subnet" ]]; then
+        comment="$(fw_comment "$instance")"
+        fi
     if [[ -n "$subnet" && -n "$iface" ]]; then
         comment="$(fw_comment "$instance")"
         while iptables -t nat -C POSTROUTING -s "$subnet" -o "$iface" -m comment --comment "$comment" -j MASQUERADE >/dev/null 2>&1; do
@@ -3457,6 +3466,7 @@ create_instance_wizard() {
     configure_network_profile "$instance"
     configure_routing_profile "$instance"
     configure_firewall_mode "$instance"
+    if ask_yes_no "Open the advanced per-instance Firewall Manager now? You can also configure it later." "n"; then firewall_manager_menu "$instance"; fi
     state_set "$instance" CENTRAL_ENABLED 0
     state_set "$instance" MANAGED 1
 
@@ -12081,20 +12091,39 @@ run_instance_diagnostics() {
     if port_is_listening udp "$udp" "$listen"; then print_ok "UDP $udp is listening"; else print_warn "UDP $udp not detected as listening (DTLS may be unavailable)"; fi
     if occtl_exec "$instance" show status >/dev/null 2>&1; then print_ok "occtl socket works: $(instance_socket "$instance")"; else print_err "occtl socket query failed"; ok=0; fi
     if [[ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)" == 1 ]]; then print_ok "IPv4 forwarding enabled"; else print_err "IPv4 forwarding disabled"; ok=0; fi
-    if [[ -n "$subnet" && -n "$iface" ]] && iptables -t nat -C POSTROUTING -s "$subnet" -o "$iface" -m comment --comment "$(fw_comment "$instance")" -j MASQUERADE >/dev/null 2>&1; then print_ok "Scoped NAT rule present"; else print_err "Managed NAT rule missing"; ok=0; fi
-    local fwmode
+    local fwmode natmode ingress forward inchain fwdchain postchain
     fwmode="$(firewall_mode_for_instance "$instance")"
-    print_info "Firewall ingress mode: $fwmode"
-    if [[ "$fwmode" == iptables ]]; then
-        if iptables -C INPUT -p tcp --dport "$tcp" -m comment --comment "$(ingress_fw_comment "$instance")" -j ACCEPT >/dev/null 2>&1 && iptables -C INPUT -p udp --dport "$udp" -m comment --comment "$(ingress_fw_comment "$instance")" -j ACCEPT >/dev/null 2>&1; then
-            print_ok "iptables ingress rules present for TCP $tcp / UDP $udp"
+    natmode="$(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || echo masquerade)"
+    ingress="$(state_get "$instance" FIREWALL_BASE_INGRESS 2>/dev/null || echo 1)"
+    forward="$(state_get "$instance" FIREWALL_BASE_FORWARD 2>/dev/null || echo 1)"
+    inchain="$(firewall_chain_name "$instance" input)"; fwdchain="$(firewall_chain_name "$instance" forward)"; postchain="$(firewall_chain_name "$instance" postrouting)"
+    print_info "Firewall backend: $fwmode"
+    if [[ "$natmode" == none ]]; then
+        print_info "Base IPv4 NAT is intentionally disabled."
+    elif iptables -t nat -S "$postchain" 2>/dev/null | grep -Fq "ocserv-manager:$instance:v3:base-nat"; then
+        print_ok "Managed base IPv4 NAT rule present in $postchain ($natmode)."
+    else
+        print_err "Managed base IPv4 NAT rule missing from $postchain"; ok=0
+    fi
+    if [[ "$forward" == 0 ]]; then
+        print_info "Base VPN FORWARD pair is intentionally disabled."
+    elif iptables -S "$fwdchain" 2>/dev/null | grep -Fq "ocserv-manager:$instance:v3:base-forward-out"; then
+        print_ok "Managed base FORWARD rules present in $fwdchain."
+    else
+        print_err "Managed base FORWARD rule missing from $fwdchain"; ok=0
+    fi
+    if [[ "$ingress" == 0 ]]; then
+        print_info "Managed base ingress is intentionally disabled."
+    elif [[ "$fwmode" == iptables ]]; then
+        if iptables -S "$inchain" 2>/dev/null | grep -Fq "ocserv-manager:$instance:v3:base-tcp" && iptables -S "$inchain" 2>/dev/null | grep -Fq "ocserv-manager:$instance:v3:base-udp"; then
+            print_ok "iptables managed ingress rules present for TCP $tcp / UDP $udp in $inchain"
         else
-            print_err "iptables ingress rule missing"; ok=0
+            print_err "iptables managed ingress rule missing"; ok=0
         fi
     elif command -v ufw >/dev/null 2>&1; then
-        if ufw status 2>/dev/null | grep -Fq "ocserv-manager:$instance"; then print_ok "UFW ingress rules found"; else print_warn "UFW integration selected but managed port rules were not found"; ok=0; fi
+        if ufw status 2>/dev/null | grep -Fq "ocserv-manager:$instance:v3:base-"; then print_ok "UFW managed ingress rules found"; else print_warn "UFW backend selected but managed port rules were not found"; ok=0; fi
     else
-        print_err "UFW integration selected but ufw command is unavailable"; ok=0
+        print_err "UFW backend selected but ufw command is unavailable"; ok=0
     fi
     if [[ -n "$cert" && -r "$cert" ]]; then
         days="$(certificate_days_left "$cert")"; [[ "$days" =~ ^-?[0-9]+$ ]] || days=-1
@@ -12331,7 +12360,8 @@ status_dashboard() {
     echo "ocserv binary: ${binary:-not found}"
     echo "Outbound interface: $(default_route_iface || echo unknown)"
     echo "IPv4 forwarding: $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unknown)"
-    echo "Firewall policy: iptables is the manager default; UFW is per-instance opt-in only and is never auto-enabled."
+    echo "Firewall: per-instance Firewall Manager; iptables is default, UFW is opt-in and never auto-enabled."
+    echo "Advanced NAT/FORWARD/custom rules are isolated in manager-owned per-instance chains."
     echo
     printf '%-18s %-9s %-23s %-18s %-10s %-10s\n' "INSTANCE" "STATE" "LISTEN" "SUBNET" "ONLINE" "CERT-DAYS"
     while read -r i; do
@@ -12391,7 +12421,9 @@ certificate_manager() {
 
 remove_firewall_values() {
     local instance="$1" subnet="$2" iface="$3" comment
-    [[ -n "$subnet" && -n "$iface" ]] || return 0; comment="$(fw_comment "$instance")"
+    [[ -n "$subnet" ]] || return 0
+    comment="$(fw_comment "$instance")"
+    [[ -n "$iface" ]] || return 0
     while iptables -t nat -C POSTROUTING -s "$subnet" -o "$iface" -m comment --comment "$comment" -j MASQUERADE >/dev/null 2>&1; do iptables -t nat -D POSTROUTING -s "$subnet" -o "$iface" -m comment --comment "$comment" -j MASQUERADE; done
     while iptables -C FORWARD -s "$subnet" -o "$iface" -m comment --comment "$comment" -j ACCEPT >/dev/null 2>&1; do iptables -D FORWARD -s "$subnet" -o "$iface" -m comment --comment "$comment" -j ACCEPT; done
     while iptables -C FORWARD -d "$subnet" -i "$iface" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$comment" -j ACCEPT >/dev/null 2>&1; do iptables -D FORWARD -d "$subnet" -i "$iface" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$comment" -j ACCEPT; done
@@ -12415,7 +12447,7 @@ reconfigure_managed_instance() {
     oldtcp="$(state_get "$instance" TCP_PORT 2>/dev/null || echo 443)"; oldudp="$(state_get "$instance" UDP_PORT 2>/dev/null || echo "$oldtcp")"; oldfw="$(firewall_mode_for_instance "$instance")"
     echo "Reconfigure sections. Existing values are preserved unless the selected section is changed."
     while true; do
-        choice="$(choose_menu "Select section:" "Listen IP and TCP/UDP ports" "VPN subnet" "Server certificate" "Authentication" "DNS" "Client/session and ban limits" "MTU/DPD/keepalive/IPv6 network profile" "Full/split routing, DNS leak and bypass" "Firewall integration (iptables default / optional UFW)" "Finish and apply" "Cancel")"
+        choice="$(choose_menu "Select section:" "Listen IP and TCP/UDP ports" "VPN subnet" "Server certificate" "Authentication" "DNS" "Client/session and ban limits" "MTU/DPD/keepalive/IPv6 network profile" "Full/split routing, DNS leak and bypass" "Firewall integration (iptables default / optional UFW)" "Open advanced per-instance Firewall Manager" "Finish and apply" "Cancel")"
         case "$choice" in
             1)
                 listen="$(choose_listen_host)"; tcp="$(choose_available_tcp_port "$instance" "$listen" "$(state_get "$instance" TCP_PORT)")"; udp="$(choose_available_udp_port "$instance" "$listen" "$tcp")"; state_set "$instance" LISTEN_HOST "$listen"; state_set "$instance" TCP_PORT "$tcp"; state_set "$instance" UDP_PORT "$udp" ;;
@@ -12427,8 +12459,9 @@ reconfigure_managed_instance() {
             7) configure_network_profile "$instance" ;;
             8) configure_routing_profile "$instance" ;;
             9) configure_firewall_mode "$instance" ;;
-            10) break ;;
-            11) cp -a "$backup_state" "$state"; print_info "Changes cancelled."; return 0 ;;
+            10) firewall_manager_menu "$instance" ;;
+            11) break ;;
+            12) cp -a "$backup_state" "$state"; print_info "Changes cancelled."; return 0 ;;
         esac
     done
     tmp="$(mktemp)"; generate_ocserv_config "$instance" "$tmp"
@@ -12604,6 +12637,1033 @@ api_menu() {
 }
 
 # -----------------------------------------------------------------------------
+# Firewall Manager v3.0 - per-instance managed policy and isolated chains
+# -----------------------------------------------------------------------------
+firewall_policy_file() { printf '%s/%s.json\n' "$FIREWALL_POLICY_ROOT" "$1"; }
+firewall_chain_hash() { printf '%s' "$1" | sha256sum | awk '{print toupper(substr($1,1,8))}'; }
+firewall_chain_name() {
+    local instance="$1" role="$2" h
+    h="$(firewall_chain_hash "$instance")"
+    case "$role" in
+        input) echo "OCM${h}I" ;;
+        forward) echo "OCM${h}F" ;;
+        output) echo "OCM${h}O" ;;
+        prerouting) echo "OCM${h}P" ;;
+        postrouting) echo "OCM${h}N" ;;
+        *) return 1 ;;
+    esac
+}
+
+ensure_firewall_v3_defaults() {
+    local instance="$1" mode
+    mode="$(firewall_mode_for_instance "$instance")"
+    [[ -n "$(state_get "$instance" FIREWALL_BASE_INGRESS 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_BASE_INGRESS 1
+    [[ -n "$(state_get "$instance" FIREWALL_BASE_FORWARD 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_BASE_FORWARD 1
+    [[ -n "$(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_BASE_NAT_MODE masquerade
+    [[ -n "$(state_get "$instance" FIREWALL_BASE_SNAT_IP 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_BASE_SNAT_IP ""
+    [[ -n "$(state_get "$instance" FIREWALL_PRIMARY_ROUTE 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_PRIMARY_ROUTE ""
+    [[ -n "$(state_get "$instance" FIREWALL_MODE 2>/dev/null || true)" ]] || state_set "$instance" FIREWALL_MODE "$mode"
+}
+
+ensure_firewall_policy_file() {
+    local instance="$1" file tun iface id tmp
+    ensure_dirs
+    ensure_firewall_v3_defaults "$instance"
+    file="$(firewall_policy_file "$instance")"
+    if [[ ! -f "$file" ]]; then
+        printf '{\n  "version": 1,\n  "instance": %s,\n  "rules": []\n}\n' "$(jq -Rn --arg v "$instance" '$v')" > "$file"
+        chmod 600 "$file"
+        # Preserve v2.9 extra-interface forwarding behavior by converting it into ordinary
+        # managed stateful FORWARD rules. This is configuration migration, not a backup.
+        tun="$(state_get "$instance" TUN_FORWARD_IFACES 2>/dev/null || true)"
+        tun="${tun//,/ }"
+        for iface in $tun; do
+            valid_interface_name "$iface" || continue
+            id="migrated-forward-$(printf '%s' "$iface" | sha256sum | cut -c1-8)"
+            tmp="$(mktemp)"
+            jq --arg id "$id" --arg out "$iface" \
+               '.rules += [{id:$id,enabled:true,kind:"forward_pair",family:"ipv4",source:"@vpn",destination:"any",in_iface:"",out_iface:$out,action:"ACCEPT",return_established:true,description:("Migrated v2.9 extra forwarding via " + $out)}]' \
+               "$file" > "$tmp" && mv "$tmp" "$file"
+            if [[ -d "$(vhost_dir "$instance" 2>/dev/null || true)" ]]; then
+                local vf vsub vid
+                for vf in "$(vhost_dir "$instance")"/*.conf; do
+                    [[ -f "$vf" ]] || continue
+                    vsub="$(config_ipv4_cidr "$vf" 2>/dev/null || true)"; [[ -n "$vsub" ]] || continue
+                    vid="migrated-vhost-$(printf '%s|%s' "$vsub" "$iface" | sha256sum | cut -c1-8)"; tmp="$(mktemp)"
+                    jq --arg id "$vid" --arg out "$iface" --arg src "$vsub" '.rules += [{id:$id,enabled:true,kind:"forward_pair",family:"ipv4",source:$src,destination:"any",in_iface:"",out_iface:$out,action:"ACCEPT",return_established:true,description:("Migrated v2.9 vhost extra forwarding via " + $out)}]' "$file" > "$tmp" && mv "$tmp" "$file"
+                done
+            fi
+        done
+    fi
+    jq -e '.version == 1 and (.rules|type=="array")' "$file" >/dev/null 2>&1 || {
+        print_err "Invalid firewall policy file: $file"
+        return 1
+    }
+}
+
+firewall_rule_comment() { printf 'ocserv-manager:%s:v3:%s' "$1" "$2"; }
+firewall_hook_comment() { printf 'ocserv-manager:%s:v3:hook:%s' "$1" "$2"; }
+
+fw_cmd_for_family() {
+    case "$1" in
+        ipv6) command -v ip6tables >/dev/null 2>&1 && echo ip6tables || return 1 ;;
+        *) command -v iptables >/dev/null 2>&1 && echo iptables || return 1 ;;
+    esac
+}
+
+fw_chain_exists() {
+    local cmd="$1" table="$2" chain="$3"
+    "$cmd" -t "$table" -S "$chain" >/dev/null 2>&1
+}
+
+fw_ensure_chain_hook() {
+    local family="$1" table="$2" builtin="$3" chain="$4" instance="$5" role="$6" position="${7:-append}" cmd comment
+    cmd="$(fw_cmd_for_family "$family")" || return 0
+    fw_chain_exists "$cmd" "$table" "$chain" || "$cmd" -t "$table" -N "$chain"
+    comment="$(firewall_hook_comment "$instance" "$role")"
+    if ! "$cmd" -t "$table" -C "$builtin" -m comment --comment "$comment" -j "$chain" >/dev/null 2>&1; then
+        if [[ "$position" == insert ]]; then
+            "$cmd" -t "$table" -I "$builtin" 1 -m comment --comment "$comment" -j "$chain"
+        else
+            "$cmd" -t "$table" -A "$builtin" -m comment --comment "$comment" -j "$chain"
+        fi
+    fi
+}
+
+fw_ensure_instance_chains() {
+    local instance="$1" family="$2" in fwd out pre post
+    in="$(firewall_chain_name "$instance" input)"
+    fwd="$(firewall_chain_name "$instance" forward)"
+    out="$(firewall_chain_name "$instance" output)"
+    pre="$(firewall_chain_name "$instance" prerouting)"
+    post="$(firewall_chain_name "$instance" postrouting)"
+    fw_ensure_chain_hook "$family" filter INPUT "$in" "$instance" input insert
+    fw_ensure_chain_hook "$family" filter FORWARD "$fwd" "$instance" forward insert
+    fw_ensure_chain_hook "$family" filter OUTPUT "$out" "$instance" output append
+    fw_ensure_chain_hook "$family" nat PREROUTING "$pre" "$instance" prerouting insert || true
+    fw_ensure_chain_hook "$family" nat POSTROUTING "$post" "$instance" postrouting append || true
+    # Expert rules may use mangle/raw for MARK/CONNMARK/NOTRACK-style workflows.
+    fw_ensure_chain_hook "$family" mangle PREROUTING "$pre" "$instance" mangle-prerouting insert || true
+    fw_ensure_chain_hook "$family" mangle INPUT "$in" "$instance" mangle-input insert || true
+    fw_ensure_chain_hook "$family" mangle FORWARD "$fwd" "$instance" mangle-forward insert || true
+    fw_ensure_chain_hook "$family" mangle OUTPUT "$out" "$instance" mangle-output append || true
+    fw_ensure_chain_hook "$family" mangle POSTROUTING "$post" "$instance" mangle-postrouting append || true
+    fw_ensure_chain_hook "$family" raw PREROUTING "$pre" "$instance" raw-prerouting insert || true
+    fw_ensure_chain_hook "$family" raw OUTPUT "$out" "$instance" raw-output append || true
+}
+
+fw_flush_instance_chains() {
+    local instance="$1" family="$2" cmd role chain table
+    cmd="$(fw_cmd_for_family "$family")" || return 0
+    for role in input forward output; do
+        chain="$(firewall_chain_name "$instance" "$role")"
+        fw_chain_exists "$cmd" filter "$chain" && "$cmd" -t filter -F "$chain" || true
+    done
+    for role in prerouting postrouting; do
+        chain="$(firewall_chain_name "$instance" "$role")"
+        fw_chain_exists "$cmd" nat "$chain" && "$cmd" -t nat -F "$chain" || true
+    done
+    for role in prerouting input forward output postrouting; do
+        chain="$(firewall_chain_name "$instance" "$role")"
+        fw_chain_exists "$cmd" mangle "$chain" && "$cmd" -t mangle -F "$chain" || true
+    done
+    for role in prerouting output; do
+        chain="$(firewall_chain_name "$instance" "$role")"
+        fw_chain_exists "$cmd" raw "$chain" && "$cmd" -t raw -F "$chain" || true
+    done
+}
+
+fw_remove_chain_hook_and_chain() {
+    local family="$1" table="$2" builtin="$3" chain="$4" instance="$5" role="$6" cmd comment
+    cmd="$(fw_cmd_for_family "$family")" || return 0
+    comment="$(firewall_hook_comment "$instance" "$role")"
+    while "$cmd" -t "$table" -C "$builtin" -m comment --comment "$comment" -j "$chain" >/dev/null 2>&1; do
+        "$cmd" -t "$table" -D "$builtin" -m comment --comment "$comment" -j "$chain" || break
+    done
+    if fw_chain_exists "$cmd" "$table" "$chain"; then
+        "$cmd" -t "$table" -F "$chain" >/dev/null 2>&1 || true
+        "$cmd" -t "$table" -X "$chain" >/dev/null 2>&1 || true
+    fi
+}
+
+fw_remove_instance_chains() {
+    local instance="$1" family="$2"
+    fw_remove_chain_hook_and_chain "$family" filter INPUT "$(firewall_chain_name "$instance" input)" "$instance" input
+    fw_remove_chain_hook_and_chain "$family" filter FORWARD "$(firewall_chain_name "$instance" forward)" "$instance" forward
+    fw_remove_chain_hook_and_chain "$family" filter OUTPUT "$(firewall_chain_name "$instance" output)" "$instance" output
+    fw_remove_chain_hook_and_chain "$family" nat PREROUTING "$(firewall_chain_name "$instance" prerouting)" "$instance" prerouting
+    fw_remove_chain_hook_and_chain "$family" nat POSTROUTING "$(firewall_chain_name "$instance" postrouting)" "$instance" postrouting
+    fw_remove_chain_hook_and_chain "$family" mangle PREROUTING "$(firewall_chain_name "$instance" prerouting)" "$instance" mangle-prerouting
+    fw_remove_chain_hook_and_chain "$family" mangle INPUT "$(firewall_chain_name "$instance" input)" "$instance" mangle-input
+    fw_remove_chain_hook_and_chain "$family" mangle FORWARD "$(firewall_chain_name "$instance" forward)" "$instance" mangle-forward
+    fw_remove_chain_hook_and_chain "$family" mangle OUTPUT "$(firewall_chain_name "$instance" output)" "$instance" mangle-output
+    fw_remove_chain_hook_and_chain "$family" mangle POSTROUTING "$(firewall_chain_name "$instance" postrouting)" "$instance" mangle-postrouting
+    fw_remove_chain_hook_and_chain "$family" raw PREROUTING "$(firewall_chain_name "$instance" prerouting)" "$instance" raw-prerouting
+    fw_remove_chain_hook_and_chain "$family" raw OUTPUT "$(firewall_chain_name "$instance" output)" "$instance" raw-output
+}
+
+fw_remove_ufw_rules_by_prefix() {
+    local instance="$1" prefix="ocserv-manager:$instance" nums n
+    command -v ufw >/dev/null 2>&1 || return 0
+    nums="$(ufw status numbered 2>/dev/null | grep -F "$prefix" | sed -nE 's/^\[[[:space:]]*([0-9]+)\].*/\1/p' | sort -rn || true)"
+    for n in $nums; do yes | ufw delete "$n" >/dev/null 2>&1 || true; done
+}
+
+fw_remove_legacy_tun_rules_for_subnet() {
+    local instance="$1" subnet="$2" base_comment="$3" ifaces="$4" tun comment
+    [[ -n "$subnet" ]] || return 0
+    ifaces="${ifaces//,/ }"
+    for tun in $ifaces; do
+        valid_interface_name "$tun" || continue
+        comment="$base_comment:tun:$tun"
+        while iptables -C FORWARD -s "$subnet" -o "$tun" -m comment --comment "$comment" -j ACCEPT >/dev/null 2>&1; do iptables -D FORWARD -s "$subnet" -o "$tun" -m comment --comment "$comment" -j ACCEPT; done
+        while iptables -C FORWARD -d "$subnet" -i "$tun" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$comment" -j ACCEPT >/dev/null 2>&1; do iptables -D FORWARD -d "$subnet" -i "$tun" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$comment" -j ACCEPT; done
+    done
+    return 0
+}
+
+fw_remove_legacy_v29_rules() {
+    local instance="$1" subnet iface comment ipv6 nat6 tcp udp tun vf vsub domain
+    [[ "$(state_get "$instance" FIREWALL_V3_MIGRATED 2>/dev/null || true)" == 1 ]] && return 0
+    subnet="$(state_get "$instance" SUBNET 2>/dev/null || true)"
+    iface="$(state_get "$instance" OUT_IFACE 2>/dev/null || true)"
+    [[ -n "$iface" ]] || iface="$(default_route_iface)"
+    comment="$(fw_comment "$instance")"
+    ipv6="$(state_get "$instance" IPV6_NETWORK 2>/dev/null || true)"
+    nat6="$(state_get "$instance" IPV6_NAT 2>/dev/null || echo 0)"
+    tcp="$(state_get "$instance" TCP_PORT 2>/dev/null || true)"
+    udp="$(state_get "$instance" UDP_PORT 2>/dev/null || true)"
+    tun="$(state_get "$instance" TUN_FORWARD_IFACES 2>/dev/null || true)"
+    remove_iptables_ingress_values "$instance" "$tcp" "$udp" || true
+    remove_ufw_managed_rules "$instance" "$tcp" "$udp" || true
+    if [[ -n "$subnet" && -n "$iface" ]] && command -v iptables >/dev/null 2>&1; then
+        while iptables -t nat -C POSTROUTING -s "$subnet" -o "$iface" -m comment --comment "$comment" -j MASQUERADE >/dev/null 2>&1; do iptables -t nat -D POSTROUTING -s "$subnet" -o "$iface" -m comment --comment "$comment" -j MASQUERADE; done
+        while iptables -C FORWARD -s "$subnet" -o "$iface" -m comment --comment "$comment" -j ACCEPT >/dev/null 2>&1; do iptables -D FORWARD -s "$subnet" -o "$iface" -m comment --comment "$comment" -j ACCEPT; done
+        while iptables -C FORWARD -d "$subnet" -i "$iface" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$comment" -j ACCEPT >/dev/null 2>&1; do iptables -D FORWARD -d "$subnet" -i "$iface" -m conntrack --ctstate RELATED,ESTABLISHED -m comment --comment "$comment" -j ACCEPT; done
+        fw_remove_legacy_tun_rules_for_subnet "$instance" "$subnet" "$comment" "$tun" || true
+        if [[ -d "$(vhost_dir "$instance" 2>/dev/null || true)" ]]; then
+            for vf in "$(vhost_dir "$instance")"/*.conf; do
+                [[ -f "$vf" ]] || continue
+                domain="$(basename "$vf" .conf)"; vsub="$(config_ipv4_cidr "$vf" 2>/dev/null || true)"
+                [[ -n "$vsub" ]] && fw_remove_legacy_tun_rules_for_subnet "$instance" "$vsub" "$(vhost_fw_comment "$instance" "$domain")" "$tun" || true
+            done
+        fi
+    fi
+    [[ -n "$ipv6" && -n "$iface" ]] && remove_ipv6_firewall_values "$instance" "$ipv6" "$iface" "$nat6" || true
+    state_set "$instance" FIREWALL_V3_MIGRATED 1
+    return 0
+}
+
+fw_primary_out_iface() {
+    local instance="$1" iface
+    iface="$(state_get "$instance" OUT_IFACE 2>/dev/null || true)"
+    if [[ -z "$iface" ]] || ! ip link show "$iface" >/dev/null 2>&1; then iface="$(default_route_iface)"; fi
+    printf '%s\n' "$iface"
+}
+
+fw_resolve_token() {
+    local instance="$1" value="$2" family="${3:-ipv4}"
+    case "$value" in
+        @vpn) state_get "$instance" SUBNET 2>/dev/null || true ;;
+        @vpn6) state_get "$instance" IPV6_NETWORK 2>/dev/null || true ;;
+        any|'') echo "" ;;
+        *) echo "$value" ;;
+    esac
+}
+
+fw_append_addr_match() {
+    local -n arr="$1"; local flag="$2" value="$3"
+    [[ -n "$value" && "$value" != any ]] && arr+=("$flag" "$value")
+    return 0
+}
+
+fw_append_iface_match() {
+    local -n arr="$1"; local flag="$2" value="$3"
+    [[ -n "$value" && "$value" != any ]] && arr+=("$flag" "$value")
+    return 0
+}
+
+fw_add_rule_to_chain() {
+    local family="$1" table="$2" chain="$3" instance="$4" rid="$5"; shift 5
+    local cmd comment i jump=-1
+    local -a all=("$@") pre=() post=()
+    cmd="$(fw_cmd_for_family "$family")" || return 0
+    comment="$(firewall_rule_comment "$instance" "$rid")"
+    for ((i=0;i<${#all[@]};i++)); do
+        if [[ "${all[$i]}" == -j || "${all[$i]}" == --jump ]]; then jump=$i; break; fi
+    done
+    if (( jump >= 0 )); then
+        pre=("${all[@]:0:jump}")
+        post=("${all[@]:jump}")
+    else
+        pre=("${all[@]}")
+    fi
+    "$cmd" -t "$table" -A "$chain" "${pre[@]}" -m comment --comment "$comment" "${post[@]}"
+}
+
+fw_advanced_token_forbidden() {
+    case "$1" in
+        -A|--append|-C|--check|-D|--delete|-I|--insert|-R|--replace|-L|--list|-S|--list-rules|-F|--flush|-Z|--zero|-N|--new-chain|-X|--delete-chain|-P|--policy|-E|--rename-chain|-t|--table|-j|--jump) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+fw_apply_structured_rule() {
+    local instance="$1" rule="$2" kind family rid source dest inif outif action proto dport tosrc todst ret chain table cmd
+    kind="$(jq -r '.kind' <<<"$rule")"
+    family="$(jq -r '.family // "ipv4"' <<<"$rule")"
+    rid="$(jq -r '.id' <<<"$rule")"
+    source="$(fw_resolve_token "$instance" "$(jq -r '.source // "any"' <<<"$rule")" "$family")"
+    dest="$(fw_resolve_token "$instance" "$(jq -r '.destination // "any"' <<<"$rule")" "$family")"
+    inif="$(jq -r '.in_iface // ""' <<<"$rule")"
+    outif="$(jq -r '.out_iface // ""' <<<"$rule")"
+    action="$(jq -r '.action // "ACCEPT"' <<<"$rule")"
+    proto="$(jq -r '.protocol // "all"' <<<"$rule")"
+    dport="$(jq -r '.dport // ""' <<<"$rule")"
+    tosrc="$(jq -r '.to_source // ""' <<<"$rule")"
+    todst="$(jq -r '.to_destination // ""' <<<"$rule")"
+    ret="$(jq -r '.return_established // false' <<<"$rule")"
+    local -a args=()
+    case "$kind" in
+        forward_pair|forward)
+            chain="$(firewall_chain_name "$instance" forward)"
+            fw_append_addr_match args -s "$source"; fw_append_addr_match args -d "$dest"
+            fw_append_iface_match args -i "$inif"; fw_append_iface_match args -o "$outif"
+            args+=( -j "$action" )
+            fw_add_rule_to_chain "$family" filter "$chain" "$instance" "$rid" "${args[@]}"
+            if [[ "$kind" == forward_pair && "$ret" == true && "$action" == ACCEPT ]]; then
+                args=()
+                fw_append_addr_match args -s "$dest"; fw_append_addr_match args -d "$source"
+                fw_append_iface_match args -i "$outif"; fw_append_iface_match args -o "$inif"
+                args+=( -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT )
+                fw_add_rule_to_chain "$family" filter "$chain" "$instance" "${rid}-return" "${args[@]}"
+            fi
+            ;;
+        nat_masquerade)
+            chain="$(firewall_chain_name "$instance" postrouting)"; args=()
+            fw_append_addr_match args -s "$source"; fw_append_addr_match args -d "$dest"; fw_append_iface_match args -o "$outif"
+            args+=( -j MASQUERADE )
+            fw_add_rule_to_chain "$family" nat "$chain" "$instance" "$rid" "${args[@]}"
+            ;;
+        nat_snat)
+            [[ -n "$tosrc" ]] || return 0
+            chain="$(firewall_chain_name "$instance" postrouting)"; args=()
+            fw_append_addr_match args -s "$source"; fw_append_addr_match args -d "$dest"; fw_append_iface_match args -o "$outif"
+            args+=( -j SNAT --to-source "$tosrc" )
+            fw_add_rule_to_chain "$family" nat "$chain" "$instance" "$rid" "${args[@]}"
+            ;;
+        dnat)
+            [[ -n "$todst" ]] || return 0
+            chain="$(firewall_chain_name "$instance" prerouting)"; args=()
+            fw_append_addr_match args -s "$source"; fw_append_addr_match args -d "$dest"; fw_append_iface_match args -i "$inif"
+            [[ "$proto" != all ]] && args+=( -p "$proto" )
+            [[ -n "$dport" ]] && args+=( --dport "$dport" )
+            args+=( -j DNAT --to-destination "$todst" )
+            fw_add_rule_to_chain "$family" nat "$chain" "$instance" "$rid" "${args[@]}"
+            ;;
+        input|output)
+            # Custom INPUT/OUTPUT rules always use the isolated manager-owned
+            # netfilter chains so address family and advanced matching stay exact.
+            # In UFW backend only the base ocserv ingress ports are delegated to UFW.
+            chain="$(firewall_chain_name "$instance" "$kind")"; args=()
+            fw_append_addr_match args -s "$source"; fw_append_addr_match args -d "$dest"
+            if [[ "$kind" == input ]]; then fw_append_iface_match args -i "$inif"; else fw_append_iface_match args -o "$outif"; fi
+            [[ "$proto" != all ]] && args+=( -p "$proto" )
+            [[ -n "$dport" ]] && args+=( --dport "$dport" )
+            args+=( -j "$action" )
+            fw_add_rule_to_chain "$family" filter "$chain" "$instance" "$rid" "${args[@]}"
+            ;;
+        advanced)
+            table="$(jq -r '.table // "filter"' <<<"$rule")"
+            local builtin="$(jq -r '.chain // "FORWARD"' <<<"$rule")" target="$(jq -r '.target // "ACCEPT"' <<<"$rule")"
+            case "$table:$builtin" in
+                filter:INPUT|mangle:INPUT) chain="$(firewall_chain_name "$instance" input)" ;;
+                filter:FORWARD|mangle:FORWARD) chain="$(firewall_chain_name "$instance" forward)" ;;
+                filter:OUTPUT|mangle:OUTPUT|raw:OUTPUT) chain="$(firewall_chain_name "$instance" output)" ;;
+                nat:PREROUTING|mangle:PREROUTING|raw:PREROUTING) chain="$(firewall_chain_name "$instance" prerouting)" ;;
+                nat:POSTROUTING|mangle:POSTROUTING) chain="$(firewall_chain_name "$instance" postrouting)" ;;
+                *) print_warn "Skipping invalid advanced rule $rid ($table/$builtin)"; return 0 ;;
+            esac
+            args=()
+            local enc a
+            while IFS= read -r enc; do
+                [[ -n "$enc" ]] || continue
+                a="$(printf '%s' "$enc" | base64 -d)"
+                if fw_advanced_token_forbidden "$a"; then
+                    print_warn "Skipping forbidden command-level token in advanced rule $rid: $a"; return 0
+                fi
+                args+=("$a")
+            done < <(jq -r '.match_args[]? | @base64' <<<"$rule")
+            args+=( -j "$target" )
+            while IFS= read -r enc; do
+                [[ -n "$enc" ]] || continue
+                a="$(printf '%s' "$enc" | base64 -d)"
+                if fw_advanced_token_forbidden "$a"; then print_warn "Skipping forbidden command-level target token in advanced rule $rid: $a"; return 0; fi
+                args+=("$a")
+            done < <(jq -r '.target_args[]? | @base64' <<<"$rule")
+            fw_add_rule_to_chain "$family" "$table" "$chain" "$instance" "$rid" "${args[@]}"
+            ;;
+    esac
+}
+
+fw_apply_ufw_custom_input() {
+    local instance="$1" rule="$2" rid action proto dport source inif comment
+    command -v ufw >/dev/null 2>&1 || return 0
+    [[ "$(jq -r '.kind' <<<"$rule")" == input ]] || return 0
+    [[ "$(jq -r '.family // "ipv4"' <<<"$rule")" == ipv4 ]] || return 0
+    rid="$(jq -r '.id' <<<"$rule")"; action="$(jq -r '.action // "ACCEPT"' <<<"$rule")"
+    proto="$(jq -r '.protocol // "all"' <<<"$rule")"; dport="$(jq -r '.dport // ""' <<<"$rule")"
+    source="$(fw_resolve_token "$instance" "$(jq -r '.source // "any"' <<<"$rule")")"; inif="$(jq -r '.in_iface // ""' <<<"$rule")"
+    comment="$(firewall_rule_comment "$instance" "$rid")"
+    local verb=allow; [[ "$action" == DROP ]] && verb=deny; [[ "$action" == REJECT ]] && verb=reject
+    local -a cmd=(ufw "$verb" in)
+    [[ -n "$inif" ]] && cmd+=(on "$inif")
+    [[ "$proto" != all ]] && cmd+=(proto "$proto")
+    [[ -n "$source" ]] && cmd+=(from "$source") || cmd+=(from any)
+    cmd+=(to any)
+    [[ -n "$dport" ]] && cmd+=(port "$dport")
+    cmd+=(comment "$comment")
+    "${cmd[@]}" >/dev/null
+}
+
+fw_apply_base_rules() {
+    local instance="$1" subnet iface ipv6 nat6 ingress forward natmode snat tcp udp mode inchain fwdchain postchain
+    subnet="$(state_get "$instance" SUBNET 2>/dev/null || true)"; [[ -n "$subnet" ]] || return 0
+    iface="$(fw_primary_out_iface "$instance")"; [[ -n "$iface" ]] || { print_err "Could not detect primary outbound interface."; return 1; }
+    state_set "$instance" OUT_IFACE "$iface"
+    ingress="$(state_get "$instance" FIREWALL_BASE_INGRESS 2>/dev/null || echo 1)"
+    forward="$(state_get "$instance" FIREWALL_BASE_FORWARD 2>/dev/null || echo 1)"
+    natmode="$(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || echo masquerade)"
+    snat="$(state_get "$instance" FIREWALL_BASE_SNAT_IP 2>/dev/null || true)"
+    tcp="$(state_get "$instance" TCP_PORT 2>/dev/null || echo 443)"; udp="$(state_get "$instance" UDP_PORT 2>/dev/null || echo "$tcp")"
+    mode="$(firewall_mode_for_instance "$instance")"
+    inchain="$(firewall_chain_name "$instance" input)"; fwdchain="$(firewall_chain_name "$instance" forward)"; postchain="$(firewall_chain_name "$instance" postrouting)"
+
+    if [[ "$ingress" == 1 ]]; then
+        if [[ "$mode" == ufw ]]; then
+            if [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" == 1 ]]; then
+                # UFW persists its own base ingress rules. Never call ufw from the
+                # boot/UFW reapply hook, otherwise /etc/ufw/after.init could recurse.
+                :
+            elif command -v ufw >/dev/null 2>&1; then
+                ufw allow "$tcp/tcp" comment "ocserv-manager:$instance:v3:base-tcp" >/dev/null || return 1
+                ufw allow "$udp/udp" comment "ocserv-manager:$instance:v3:base-udp" >/dev/null || return 1
+                ensure_ufw_reapply_hook || return 1
+            else
+                print_err "UFW backend selected but ufw is unavailable."; return 1
+            fi
+        else
+            fw_add_rule_to_chain ipv4 filter "$inchain" "$instance" base-tcp -p tcp --dport "$tcp" -j ACCEPT
+            fw_add_rule_to_chain ipv4 filter "$inchain" "$instance" base-udp -p udp --dport "$udp" -j ACCEPT
+        fi
+    fi
+    if [[ "$forward" == 1 ]]; then
+        fw_add_rule_to_chain ipv4 filter "$fwdchain" "$instance" base-forward-out -s "$subnet" -o "$iface" -j ACCEPT
+        fw_add_rule_to_chain ipv4 filter "$fwdchain" "$instance" base-forward-return -d "$subnet" -i "$iface" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+    fi
+    case "$natmode" in
+        masquerade) fw_add_rule_to_chain ipv4 nat "$postchain" "$instance" base-nat -s "$subnet" -o "$iface" -j MASQUERADE ;;
+        snat)
+            if [[ -n "$snat" ]]; then fw_add_rule_to_chain ipv4 nat "$postchain" "$instance" base-nat -s "$subnet" -o "$iface" -j SNAT --to-source "$snat"; else print_warn "Base SNAT selected but no source IP is configured."; fi
+            ;;
+        none) : ;;
+    esac
+
+    ipv6="$(state_get "$instance" IPV6_NETWORK 2>/dev/null || true)"; nat6="$(state_get "$instance" IPV6_NAT 2>/dev/null || echo 0)"
+    if [[ -n "$ipv6" ]] && command -v ip6tables >/dev/null 2>&1; then
+        inchain="$(firewall_chain_name "$instance" input)"; fwdchain="$(firewall_chain_name "$instance" forward)"; postchain="$(firewall_chain_name "$instance" postrouting)"
+        if [[ "$mode" == iptables && "$ingress" == 1 ]]; then
+            fw_add_rule_to_chain ipv6 filter "$inchain" "$instance" base6-tcp -p tcp --dport "$tcp" -j ACCEPT
+            fw_add_rule_to_chain ipv6 filter "$inchain" "$instance" base6-udp -p udp --dport "$udp" -j ACCEPT
+        fi
+        if [[ "$forward" == 1 ]]; then
+            fw_add_rule_to_chain ipv6 filter "$fwdchain" "$instance" base6-forward-out -s "$ipv6" -o "$iface" -j ACCEPT
+            fw_add_rule_to_chain ipv6 filter "$fwdchain" "$instance" base6-forward-return -d "$ipv6" -i "$iface" -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+        fi
+        if [[ "$nat6" == 1 ]]; then fw_add_rule_to_chain ipv6 nat "$postchain" "$instance" base6-nat -s "$ipv6" -o "$iface" -j MASQUERADE || true; fi
+    fi
+}
+
+fw_apply_ufw_native_rule() {
+    local instance="$1" rule="$2" rid action direction proto dport source dest inif outif comment
+    [[ "$(firewall_mode_for_instance "$instance")" == ufw ]] || { print_warn "Skipping native UFW rule because backend is not UFW: $(jq -r '.id' <<<"$rule")"; return 0; }
+    [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" == 1 ]] && return 0
+    command -v ufw >/dev/null 2>&1 || { print_err "Native UFW rule exists but ufw is unavailable."; return 1; }
+    rid="$(jq -r '.id' <<<"$rule")"; action="$(jq -r '.ufw_action // "allow"' <<<"$rule")"; direction="$(jq -r '.direction // "in"' <<<"$rule")"
+    proto="$(jq -r '.protocol // "all"' <<<"$rule")"; dport="$(jq -r '.dport // ""' <<<"$rule")"
+    source="$(fw_resolve_token "$instance" "$(jq -r '.source // "any"' <<<"$rule")")"; dest="$(fw_resolve_token "$instance" "$(jq -r '.destination // "any"' <<<"$rule")")"
+    inif="$(jq -r '.in_iface // ""' <<<"$rule")"; outif="$(jq -r '.out_iface // ""' <<<"$rule")"; comment="$(firewall_rule_comment "$instance" "$rid")"
+    local -a cmd=(ufw)
+    [[ "$direction" == route ]] && cmd+=(route)
+    cmd+=("$action")
+    case "$direction" in
+        in) cmd+=(in); [[ -n "$inif" ]] && cmd+=(on "$inif") ;;
+        out) cmd+=(out); [[ -n "$outif" ]] && cmd+=(on "$outif") ;;
+        route) [[ -n "$inif" ]] && cmd+=(in on "$inif"); [[ -n "$outif" ]] && cmd+=(out on "$outif") ;;
+    esac
+    [[ "$proto" != all ]] && cmd+=(proto "$proto")
+    [[ -n "$source" ]] && cmd+=(from "$source") || cmd+=(from any)
+    [[ -n "$dest" ]] && cmd+=(to "$dest") || cmd+=(to any)
+    [[ -n "$dport" ]] && cmd+=(port "$dport")
+    cmd+=(comment "$comment")
+    "${cmd[@]}" >/dev/null
+}
+
+fw_apply_custom_rules() {
+    local instance="$1" file rule
+    file="$(firewall_policy_file "$instance")"
+    [[ -f "$file" ]] || return 0
+    while IFS= read -r rule; do
+        [[ -n "$rule" ]] || continue
+        if [[ "$(jq -r '.kind' <<<"$rule")" == ufw_native ]]; then
+            fw_apply_ufw_native_rule "$instance" "$rule" || return 1
+        else
+            fw_apply_structured_rule "$instance" "$rule" || return 1
+        fi
+    done < <(jq -c '.rules[] | select(.enabled != false)' "$file")
+}
+
+# v3 override: all base/custom rules are rebuilt inside isolated per-instance chains.
+apply_firewall_for_instance() {
+    local instance="$1" mode subnet iface
+    ensure_firewall_policy_file "$instance" || return 1
+    fw_remove_legacy_v29_rules "$instance" || true
+    enable_ip_forwarding
+    [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" == 1 ]] || install_available_packages iptables
+    mode="$(firewall_mode_for_instance "$instance")"
+    if [[ "$mode" == ufw && ! -x "$(command -v ufw 2>/dev/null || true)" ]]; then
+        print_err "UFW backend is selected for $instance, but ufw is not installed."; return 1
+    fi
+    fw_ensure_instance_chains "$instance" ipv4
+    fw_flush_instance_chains "$instance" ipv4
+    if command -v ip6tables >/dev/null 2>&1; then fw_ensure_instance_chains "$instance" ipv6; fw_flush_instance_chains "$instance" ipv6; fi
+    if [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" != 1 || "$mode" != ufw ]]; then
+        fw_remove_ufw_rules_by_prefix "$instance"
+    fi
+    fw_apply_base_rules "$instance" || return 1
+    fw_apply_custom_rules "$instance" || return 1
+    install_firewall_reapply_unit
+    subnet="$(state_get "$instance" SUBNET 2>/dev/null || true)"; iface="$(fw_primary_out_iface "$instance")"
+    audit "firewall-v3-applied instance=$instance backend=$mode subnet=$subnet primary_out=$iface custom_rules=$(jq '.rules|length' "$(firewall_policy_file "$instance")" 2>/dev/null || echo 0)"
+    [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" == 1 ]] || print_ok "Firewall policy applied for $instance (backend=$mode, primary outbound=${iface:-none})."
+}
+
+remove_firewall_for_instance() {
+    local instance="$1"
+    remove_all_vhost_firewalls "$instance" 2>/dev/null || true
+    fw_remove_ufw_rules_by_prefix "$instance" || true
+    fw_remove_instance_chains "$instance" ipv4 || true
+    fw_remove_instance_chains "$instance" ipv6 || true
+    fw_remove_legacy_v29_rules "$instance" || true
+    audit "firewall-v3-removed instance=$instance"
+}
+
+reapply_all_firewall_rules() {
+    local instance f domain subnet
+    command -v iptables >/dev/null 2>&1 || { print_err "iptables is unavailable; cannot reapply ocserv firewall rules."; return 1; }
+    export OCSERV_MANAGER_BOOT_REAPPLY=1
+    enable_ip_forwarding
+    while read -r instance; do
+        [[ -n "$instance" && -f "$(instance_state_file "$instance")" ]] || continue
+        apply_firewall_for_instance "$instance" || print_warn "Could not reapply firewall policy for $instance"
+        if [[ -d "$(vhost_dir "$instance")" ]]; then
+            for f in "$(vhost_dir "$instance")"/*.conf; do
+                [[ -f "$f" ]] || continue
+                domain="$(basename "$f" .conf)"; subnet="$(config_ipv4_cidr "$f" 2>/dev/null || true)"
+                [[ -n "$subnet" ]] && apply_firewall_for_vhost "$instance" "$domain" "$subnet" || true
+            done
+        fi
+    done < <(list_instances | sort -u)
+}
+
+fw_show_detected_network() {
+    echo "==== Detected interfaces ===="
+    ip -o link show 2>/dev/null | awk -F': ' '{name=$2; sub(/@.*/,"",name); printf "- %s\n", name}' || true
+    echo; echo "==== Local IPv4 addresses ===="
+    ip -o -4 addr show 2>/dev/null | awk '{printf "- %s  %s  scope=%s\n", $2, $4, $6}' || true
+    echo; echo "==== Local IPv6 addresses ===="
+    ip -o -6 addr show 2>/dev/null | awk '{printf "- %s  %s  scope=%s\n", $2, $4, $6}' || true
+    echo; echo "==== IPv4 routes / policy tables ===="
+    ip -4 route show table all 2>/dev/null | sed 's/^/- /' || true
+    echo; echo "==== IPv6 routes / policy tables ===="
+    ip -6 route show table all 2>/dev/null | sed 's/^/- /' || true
+    echo; echo "==== Policy rules ===="
+    ip rule show 2>/dev/null | sed 's/^/- /' || true
+}
+
+fw_choose_interface() {
+    local prompt="$1" default="${2:-}" allow_any="${3:-0}" line name state addr i choice
+    local -a items=() states=() addrs=()
+    while IFS= read -r line; do
+        name="$(awk -F': ' '{print $2}' <<<"$line" | sed 's/@.*//')"; [[ -n "$name" ]] || continue
+        state="$(awk '{for(i=1;i<=NF;i++) if($i=="state") print $(i+1)}' <<<"$line")"
+        addr="$(ip -o -4 addr show dev "$name" 2>/dev/null | awk '{print $4}' | paste -sd, -)"
+        items+=("$name"); states+=("${state:-?}"); addrs+=("${addr:-no-ipv4}")
+    done < <(ip -o link show 2>/dev/null)
+    echo "$prompt" >&2
+    [[ "$allow_any" == 1 ]] && echo "0) Any interface" >&2
+    for ((i=0;i<${#items[@]};i++)); do printf '%d) %s  state=%s  ipv4=%s\n' "$((i+1))" "${items[$i]}" "${states[$i]}" "${addrs[$i]}" >&2; done
+    echo "m) Enter interface manually" >&2
+    while true; do
+        read -r -p "Select${default:+ [$default]}: " choice || true
+        choice="${choice:-$default}"
+        [[ "$allow_any" == 1 && "$choice" == 0 ]] && { echo ""; return 0; }
+        if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#items[@]})); then echo "${items[$((choice-1))]}"; return 0; fi
+        if [[ "$choice" == m || "$choice" == M ]]; then
+            name="$(ask_value "Interface name" "")"; valid_interface_name "$name" && { echo "$name"; return 0; }; print_warn "Invalid interface name." >&2
+        else print_warn "Invalid selection." >&2; fi
+    done
+}
+
+valid_ipv4() {
+    python3 - "$1" <<'PYIP' >/dev/null 2>&1
+import ipaddress, sys
+try:
+    ipaddress.IPv4Address(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+PYIP
+}
+
+fw_choose_local_ipv4() {
+    local prompt="$1" line iface cidr ip i choice
+    local -a ips=() ifs=()
+    while read -r iface cidr; do [[ -n "$iface" && -n "$cidr" ]] || continue; ip="${cidr%%/*}"; [[ "$ip" == 127.* ]] && continue; ips+=("$ip"); ifs+=("$iface"); done < <(ip -o -4 addr show 2>/dev/null | awk '{print $2, $4}')
+    echo "$prompt" >&2
+    for ((i=0;i<${#ips[@]};i++)); do printf '%d) %s on %s\n' "$((i+1))" "${ips[$i]}" "${ifs[$i]}" >&2; done
+    echo "m) Enter IPv4 manually" >&2
+    while true; do
+        read -r -p "Select: " choice || true
+        if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#ips[@]})); then echo "${ips[$((choice-1))]}"; return 0; fi
+        if [[ "$choice" == m || "$choice" == M ]]; then ip="$(ask_value "IPv4 address" "")"; valid_ipv4 "$ip" && { echo "$ip"; return 0; }; print_warn "Invalid IPv4." >&2; else print_warn "Invalid selection." >&2; fi
+    done
+}
+
+fw_route_records() {
+    local family="${1:-ipv4}"
+    if [[ "$family" == ipv6 ]]; then
+        ip -6 route show table all 2>/dev/null
+    else
+        ip -4 route show table all 2>/dev/null
+    fi | awk '
+    {
+      dest=$1; dev=""; via=""; src=""; table="main";
+      for(i=1;i<=NF;i++){if($i=="dev")dev=$(i+1); else if($i=="via")via=$(i+1); else if($i=="src")src=$(i+1); else if($i=="table")table=$(i+1)}
+      if(dev!="") printf "%s|%s|%s|%s|%s|%s\n", dest,dev,via,src,table,$0;
+    }' | awk '!seen[$0]++'
+}
+
+fw_choose_route() {
+    local prompt="$1" family="${2:-ipv4}" r i choice
+    local -a recs=()
+    while IFS= read -r r; do [[ -n "$r" ]] && recs+=("$r"); done < <(fw_route_records "$family")
+    echo "$prompt" >&2
+    for ((i=0;i<${#recs[@]};i++)); do IFS='|' read -r d dev via src table raw <<<"${recs[$i]}"; printf '%d) dest=%s dev=%s via=%s src=%s table=%s\n' "$((i+1))" "$d" "$dev" "${via:--}" "${src:--}" "$table" >&2; done
+    echo "0) Cancel" >&2
+    while true; do read -r -p "Select route: " choice || true; [[ "$choice" == 0 ]] && return 1; if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#recs[@]})); then echo "${recs[$((choice-1))]}"; return 0; fi; print_warn "Invalid selection." >&2; done
+}
+
+fw_choose_source() {
+    local instance="$1" family="${2:-ipv4}" choice value
+    echo "Source selector:" >&2
+    if [[ "$family" == ipv6 ]]; then echo "1) Instance IPv6 VPN pool (@vpn6)" >&2; else echo "1) Instance IPv4 VPN pool (@vpn)" >&2; fi
+    echo "2) Any source" >&2; echo "3) Custom IP/CIDR" >&2
+    read -r -p "Select [1]: " choice || true; choice="${choice:-1}"
+    case "$choice" in 1) [[ "$family" == ipv6 ]] && echo @vpn6 || echo @vpn ;; 2) echo any ;; 3) value="$(ask_value "Source IP/CIDR" "")"; echo "$value" ;; *) echo any ;; esac
+}
+
+fw_choose_destination() {
+    local family="${1:-ipv4}" choice rec dest
+    echo "Destination selector:" >&2; echo "1) Any destination" >&2; echo "2) Choose from detected routing table" >&2; echo "3) Custom IP/CIDR" >&2
+    read -r -p "Select [1]: " choice || true; choice="${choice:-1}"
+    case "$choice" in
+        1) echo any ;;
+        2)
+            rec="$(fw_choose_route "Detected routes:" "$family" || true)"; [[ -n "$rec" ]] || { echo any; return; }
+            dest="${rec%%|*}"; [[ "$dest" == default ]] && dest=any; echo "$dest"
+            ;;
+        3) ask_value "Destination IP/CIDR" "" ;;
+        *) echo any ;;
+    esac
+}
+
+fw_select_primary_outbound() {
+    local instance="$1" choice iface rec dest dev via src table raw
+    echo "Primary outbound selection:"; echo "1) Auto-detect current default route"; echo "2) Choose an interface"; echo "3) Choose from detected routes"
+    read -r -p "Select [1]: " choice || true; choice="${choice:-1}"
+    case "$choice" in
+        1) iface="$(default_route_iface)"; state_set "$instance" OUT_IFACE "$iface"; state_set "$instance" FIREWALL_PRIMARY_ROUTE "default(auto)" ;;
+        2) iface="$(fw_choose_interface "Choose primary outbound interface" "" 0)"; state_set "$instance" OUT_IFACE "$iface"; state_set "$instance" FIREWALL_PRIMARY_ROUTE "interface:$iface" ;;
+        3) rec="$(fw_choose_route "Choose primary outbound route")" || return 0; IFS='|' read -r dest dev via src table raw <<<"$rec"; state_set "$instance" OUT_IFACE "$dev"; state_set "$instance" FIREWALL_PRIMARY_ROUTE "$raw" ;;
+        *) return 0 ;;
+    esac
+    print_ok "Primary outbound set to $(state_get "$instance" OUT_IFACE)."
+}
+
+fw_policy_summary() {
+    local instance="$1" file count enabled disabled
+    ensure_firewall_policy_file "$instance" || return 1
+    file="$(firewall_policy_file "$instance")"; count="$(jq '.rules|length' "$file")"; enabled="$(jq '[.rules[]|select(.enabled!=false)]|length' "$file")"; disabled=$((count-enabled))
+    echo "Backend: $(firewall_mode_for_instance "$instance")"
+    echo "Base ingress: $(state_get "$instance" FIREWALL_BASE_INGRESS 2>/dev/null || echo 1)"
+    echo "Base forward: $(state_get "$instance" FIREWALL_BASE_FORWARD 2>/dev/null || echo 1)"
+    echo "Base IPv4 NAT: $(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || echo masquerade)"
+    echo "Primary outbound: $(fw_primary_out_iface "$instance")"
+    echo "Saved route hint: $(state_get "$instance" FIREWALL_PRIMARY_ROUTE 2>/dev/null || true)"
+    echo "Custom rules: total=$count enabled=$enabled disabled=$disabled"
+}
+
+fw_list_rules() {
+    local instance="$1" file
+    ensure_firewall_policy_file "$instance" || return 1; file="$(firewall_policy_file "$instance")"
+    if [[ "$(jq '.rules|length' "$file")" == 0 ]]; then print_info "No custom firewall rules for $instance."; return 0; fi
+    jq -r '.rules | to_entries[] | "\(.key+1)) [\(if .value.enabled==false then "disabled" else "enabled" end)] id=\(.value.id) kind=\(.value.kind) family=\(.value.family // "ipv4")  \(.value.description // "")"' "$file"
+}
+
+fw_rule_json_by_index() {
+    local instance="$1" idx="$2" file; file="$(firewall_policy_file "$instance")"; jq -c --argjson i "$((idx-1))" '.rules[$i] // empty' "$file"
+}
+
+fw_new_rule_id() { printf 'r%s-%04x\n' "$(date +%s)" "$((RANDOM & 65535))"; }
+
+fw_validate_port_optional() { [[ -z "$1" || "$1" =~ ^[0-9]+$ && "$1" -ge 1 && "$1" -le 65535 ]]; }
+
+fw_rule_wizard() {
+    local instance="$1" replace_index="${2:-}" existing="${3:-}" type kind family source dest inif outif action proto dport tosrc todst desc ret id table chain target match targetargs rec rdest rdev rvia rsrc rtable rraw
+    id="$(jq -r '.id // empty' <<<"${existing:-{}}" 2>/dev/null || true)"; [[ -n "$id" ]] || id="$(fw_new_rule_id)"
+    echo "Rule type:" >&2
+    echo "1) Stateful FORWARD pair (outbound + established return)" >&2
+    echo "2) One-way FORWARD rule" >&2
+    echo "3) NAT MASQUERADE" >&2
+    echo "4) NAT SNAT to a local/source IP" >&2
+    echo "5) DNAT / port forward" >&2
+    echo "6) INPUT allow/deny/reject" >&2
+    echo "7) OUTPUT allow/deny/reject" >&2
+    echo "8) Advanced managed netfilter rule (filter/nat/mangle/raw; no flush/policy commands)" >&2
+    echo "9) Native UFW rule (in / out / route; UFW backend only)" >&2
+    echo "0) Cancel" >&2
+    read -r -p "Select: " type || true
+    [[ "$type" == 0 ]] && return 1
+    case "$type" in 1) kind=forward_pair ;; 2) kind=forward ;; 3) kind=nat_masquerade ;; 4) kind=nat_snat ;; 5) kind=dnat ;; 6) kind=input ;; 7) kind=output ;; 8) kind=advanced ;; 9) kind=ufw_native ;; *) print_warn "Invalid selection." >&2; return 1 ;; esac
+    family="$(choose_menu "Address family:" "IPv4" "IPv6")"; [[ "$family" == 2 ]] && family=ipv6 || family=ipv4
+    desc="$(ask_value "Description (optional)" "")"
+    source=any; dest=any; inif=""; outif=""; action=ACCEPT; proto=all; dport=""; tosrc=""; todst=""; ret=false
+    case "$kind" in
+        forward_pair|forward)
+            source="$(fw_choose_source "$instance" "$family")"; dest="$(fw_choose_destination "$family")"
+            echo "Inbound interface is optional." >&2; inif="$(fw_choose_interface "Choose inbound interface" "" 1)"
+            echo "Outbound interface can be selected directly or from a route." >&2; echo "1) Interface" >&2; echo "2) Detected route" >&2
+            read -r -p "Select [1]: " type || true; type="${type:-1}"
+            if [[ "$type" == 2 ]]; then rec="$(fw_choose_route "Choose route" "$family")" || return 1; IFS='|' read -r rdest rdev rvia rsrc rtable rraw <<<"$rec"; outif="$rdev"; [[ "$dest" == any && "$rdest" != default ]] && dest="$rdest"; else outif="$(fw_choose_interface "Choose outbound interface" "" 0)"; fi
+            echo "Action: 1) ACCEPT  2) DROP  3) REJECT" >&2; read -r -p "Select [1]: " type || true; case "${type:-1}" in 2) action=DROP;;3) action=REJECT;;*) action=ACCEPT;; esac
+            [[ "$kind" == forward_pair && "$action" == ACCEPT ]] && ret=true
+            ;;
+        nat_masquerade|nat_snat)
+            source="$(fw_choose_source "$instance" "$family")"; dest="$(fw_choose_destination "$family")"
+            echo "1) Select output interface" >&2; echo "2) Select detected route" >&2; read -r -p "Select [2]: " type || true; type="${type:-2}"
+            if [[ "$type" == 2 ]]; then rec="$(fw_choose_route "Choose route used by this NAT rule" "$family")" || return 1; IFS='|' read -r rdest rdev rvia rsrc rtable rraw <<<"$rec"; outif="$rdev"; [[ "$dest" == any && "$rdest" != default ]] && dest="$rdest"; else outif="$(fw_choose_interface "Choose output interface" "" 0)"; fi
+            if [[ "$kind" == nat_snat ]]; then [[ "$family" == ipv4 ]] && tosrc="$(fw_choose_local_ipv4 "Choose the local/source IPv4 used for SNAT")" || tosrc="$(ask_value "IPv6 source address for SNAT" "")"; fi
+            ;;
+        dnat)
+            source="$(fw_choose_source "$instance" "$family")"; dest="$(fw_choose_destination "$family")"; inif="$(fw_choose_interface "Choose inbound interface (0=any)" "" 1)"
+            echo "Protocol: 1) TCP  2) UDP  3) Any" >&2; read -r -p "Select [1]: " type || true; case "${type:-1}" in 2) proto=udp;;3) proto=all;;*) proto=tcp;; esac
+            if [[ "$proto" != all ]]; then dport="$(ask_value "Destination port to match (blank=any)" "")"; fw_validate_port_optional "$dport" || { print_warn "Invalid port." >&2; return 1; }; fi
+            todst="$(ask_nonempty "DNAT destination (IP or IP:port)")"
+            ;;
+        input|output)
+            source="$(fw_choose_source "$instance" "$family")"; dest="$(fw_choose_destination "$family")"
+            if [[ "$kind" == input ]]; then inif="$(fw_choose_interface "Choose inbound interface (0=any)" "" 1)"; else outif="$(fw_choose_interface "Choose outbound interface (0=any)" "" 1)"; fi
+            echo "Protocol: 1) TCP  2) UDP  3) Any" >&2; read -r -p "Select [3]: " type || true; case "${type:-3}" in 1) proto=tcp;;2) proto=udp;;*) proto=all;; esac
+            if [[ "$proto" != all ]]; then dport="$(ask_value "Destination port (blank=any)" "")"; fw_validate_port_optional "$dport" || { print_warn "Invalid port." >&2; return 1; }; fi
+            echo "Action: 1) ACCEPT  2) DROP  3) REJECT" >&2; read -r -p "Select [1]: " type || true; case "${type:-1}" in 2) action=DROP;;3) action=REJECT;;*) action=ACCEPT;; esac
+            ;;
+        ufw_native)
+            if [[ "$(firewall_mode_for_instance "$instance")" != ufw ]]; then
+                print_warn "Native UFW rules require the instance backend to be UFW. Change backend first." >&2
+                return 1
+            fi
+            local direction ufwaction
+            echo "Direction: 1) in  2) out  3) route/forward" >&2; read -r -p "Select [1]: " type || true
+            case "${type:-1}" in 2) direction=out;;3) direction=route;;*) direction=in;; esac
+            echo "UFW action: 1) allow  2) deny  3) reject  4) limit" >&2; read -r -p "Select [1]: " type || true
+            case "${type:-1}" in 2) ufwaction=deny;;3) ufwaction=reject;;4) ufwaction=limit;;*) ufwaction=allow;; esac
+            source="$(fw_choose_source "$instance" "$family")"; dest="$(fw_choose_destination "$family")"
+            case "$direction" in
+                in) inif="$(fw_choose_interface "Choose inbound interface (0=any)" "" 1)" ;;
+                out) outif="$(fw_choose_interface "Choose outbound interface (0=any)" "" 1)" ;;
+                route) inif="$(fw_choose_interface "Choose inbound interface (0=any)" "" 1)"; outif="$(fw_choose_interface "Choose outbound interface (0=any)" "" 1)" ;;
+            esac
+            echo "Protocol: 1) TCP  2) UDP  3) Any" >&2; read -r -p "Select [3]: " type || true; case "${type:-3}" in 1) proto=tcp;;2) proto=udp;;*) proto=all;; esac
+            if [[ "$proto" != all ]]; then dport="$(ask_value "Destination port (blank=any)" "")"; fw_validate_port_optional "$dport" || { print_warn "Invalid port." >&2; return 1; }; fi
+            jq -n --arg id "$id" --arg family "$family" --arg desc "$desc" --arg direction "$direction" --arg action "$ufwaction" --arg source "$source" --arg destination "$dest" --arg in_iface "$inif" --arg out_iface "$outif" --arg protocol "$proto" --arg dport "$dport" '{id:$id,enabled:true,kind:"ufw_native",family:$family,description:$desc,direction:$direction,ufw_action:$action,source:$source,destination:$destination,in_iface:$in_iface,out_iface:$out_iface,protocol:$protocol,dport:$dport}'
+            return 0
+            ;;
+        advanced)
+            print_warn "Expert mode can still break this instance's traffic. Global flush/policy/chain-delete operations are blocked." >&2
+            echo "Table: 1) filter  2) nat  3) mangle  4) raw" >&2; read -r -p "Select [1]: " type || true
+            case "${type:-1}" in 2) table=nat;;3) table=mangle;;4) table=raw;;*) table=filter;; esac
+            case "$table" in
+                filter) echo "Chain: 1) INPUT 2) FORWARD 3) OUTPUT" >&2; read -r -p "Select [2]: " type || true; case "${type:-2}" in 1) chain=INPUT;;3) chain=OUTPUT;;*) chain=FORWARD;; esac ;;
+                nat) echo "Chain: 1) PREROUTING 2) POSTROUTING" >&2; read -r -p "Select [2]: " type || true; [[ "${type:-2}" == 1 ]] && chain=PREROUTING || chain=POSTROUTING ;;
+                mangle) echo "Chain: 1) PREROUTING 2) INPUT 3) FORWARD 4) OUTPUT 5) POSTROUTING" >&2; read -r -p "Select [3]: " type || true; case "${type:-3}" in 1) chain=PREROUTING;;2) chain=INPUT;;4) chain=OUTPUT;;5) chain=POSTROUTING;;*) chain=FORWARD;; esac ;;
+                raw) echo "Chain: 1) PREROUTING 2) OUTPUT" >&2; read -r -p "Select [1]: " type || true; [[ "${type:-1}" == 2 ]] && chain=OUTPUT || chain=PREROUTING ;;
+            esac
+            match="$(ask_value "Match arguments, e.g. -s 10.10.0.0/16 -o eth1 -p tcp --dport 443" "")"
+            target="$(ask_nonempty "Target, e.g. ACCEPT, DROP, REJECT, MASQUERADE, SNAT, DNAT")"
+            targetargs="$(ask_value "Target arguments (optional), e.g. --to-source 1.2.3.4" "")"
+            # Parse shell-like arguments without eval; store as JSON arrays.
+            local match_json target_json
+            match_json="$(python3 - "$match" <<'PY'
+import json, shlex, sys
+print(json.dumps(shlex.split(sys.argv[1])))
+PY
+)" || return 1
+            target_json="$(python3 - "$targetargs" <<'PY'
+import json, shlex, sys
+print(json.dumps(shlex.split(sys.argv[1])))
+PY
+)" || return 1
+            jq -n --arg id "$id" --arg family "$family" --arg desc "$desc" --arg table "$table" --arg chain "$chain" --arg target "$target" --argjson ma "$match_json" --argjson ta "$target_json" '{id:$id,enabled:true,kind:"advanced",family:$family,description:$desc,table:$table,chain:$chain,match_args:$ma,target:$target,target_args:$ta}'
+            return 0
+            ;;
+    esac
+    jq -n --arg id "$id" --arg kind "$kind" --arg family "$family" --arg source "$source" --arg destination "$dest" --arg in_iface "$inif" --arg out_iface "$outif" --arg action "$action" --arg protocol "$proto" --arg dport "$dport" --arg to_source "$tosrc" --arg to_destination "$todst" --arg description "$desc" --argjson ret "$ret" '{id:$id,enabled:true,kind:$kind,family:$family,source:$source,destination:$destination,in_iface:$in_iface,out_iface:$out_iface,action:$action,protocol:$protocol,dport:$dport,to_source:$to_source,to_destination:$to_destination,return_established:$ret,description:$description}'
+}
+fw_snapshot_dir_for_instance() { printf '%s/%s\n' "$FIREWALL_SNAPSHOT_ROOT" "$1"; }
+fw_create_snapshot() {
+    local instance="$1" label="${2:-manual}" dir root policy state
+    if ! ask_yes_no "Create a persistent firewall snapshot for $instance now?" "y"; then print_info "Persistent firewall snapshot skipped by request."; return 1; fi
+    ensure_backup_root; root="$(fw_snapshot_dir_for_instance "$instance")"; mkdir -p "$root"; chmod 700 "$root"
+    dir="$root/$(date +%Y%m%d-%H%M%S)-${label//[^A-Za-z0-9_.-]/_}-$RANDOM"; mkdir -p "$dir"
+    policy="$(firewall_policy_file "$instance")"; state="$(instance_state_file "$instance")"
+    [[ -f "$policy" ]] && cp -a "$policy" "$dir/policy.json"; [[ -f "$state" ]] && cp -a "$state" "$dir/state.env"
+    { echo "instance=$instance"; echo "created=$(date -Is)"; echo "label=$label"; } > "$dir/meta.env"
+    fw_show_live_rules "$instance" > "$dir/live-rules.txt" 2>&1 || true
+    print_ok "Firewall snapshot saved: $dir"
+}
+
+fw_temp_rollback_bundle() {
+    local instance="$1" dir; dir="$(mktemp -d /tmp/ocserv-manager-firewall-rollback.XXXXXX)"
+    [[ -f "$(firewall_policy_file "$instance")" ]] && cp -a "$(firewall_policy_file "$instance")" "$dir/policy.json"
+    [[ -f "$(instance_state_file "$instance")" ]] && cp -a "$(instance_state_file "$instance")" "$dir/state.env"
+    echo "$dir"
+}
+
+fw_restore_temp_bundle() {
+    local instance="$1" dir="$2"
+    [[ -f "$dir/policy.json" ]] && cp -a "$dir/policy.json" "$(firewall_policy_file "$instance")"
+    [[ -f "$dir/state.env" ]] && cp -a "$dir/state.env" "$(instance_state_file "$instance")"
+    apply_firewall_for_instance "$instance" >/dev/null 2>&1 || true
+}
+
+fw_prepare_change() {
+    local instance="$1" label="$2" dir
+    dir="$(fw_temp_rollback_bundle "$instance")"
+    if ask_yes_no "Create a persistent firewall snapshot before '$label'?" "y"; then
+        # The user already confirmed; create directly without a second prompt.
+        ensure_backup_root; local root snap policy state; root="$(fw_snapshot_dir_for_instance "$instance")"; mkdir -p "$root"; chmod 700 "$root"
+        snap="$root/$(date +%Y%m%d-%H%M%S)-before-${label//[^A-Za-z0-9_.-]/_}-$RANDOM"; mkdir -p "$snap"
+        policy="$(firewall_policy_file "$instance")"; state="$(instance_state_file "$instance")"
+        [[ -f "$policy" ]] && cp -a "$policy" "$snap/policy.json"; [[ -f "$state" ]] && cp -a "$state" "$snap/state.env"
+        { echo "instance=$instance"; echo "created=$(date -Is)"; echo "label=before-$label"; } > "$snap/meta.env"
+        fw_show_live_rules "$instance" > "$snap/live-rules.txt" 2>&1 || true
+        print_ok "Firewall snapshot saved: $snap" >&2
+    else
+        print_info "No persistent snapshot will be kept; a temporary rollback copy exists only for this change." >&2
+    fi
+    echo "$dir"
+}
+
+fw_commit_or_rollback() {
+    local instance="$1" rollback="$2"
+    if apply_firewall_for_instance "$instance"; then rm -rf "$rollback"; return 0; fi
+    print_err "Applying the new firewall policy failed; restoring the previous saved policy."
+    fw_restore_temp_bundle "$instance" "$rollback"; rm -rf "$rollback"; return 1
+}
+
+fw_policy_add_rule() {
+    local instance="$1" rollback rule file tmp
+    ensure_firewall_policy_file "$instance" || return 1
+    rollback="$(fw_prepare_change "$instance" add-rule)"
+    rule="$(fw_rule_wizard "$instance" || true)"; [[ -n "$rule" ]] || { rm -rf "$rollback"; return 0; }
+    file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"; jq --argjson r "$rule" '.rules += [$r]' "$file" > "$tmp" && mv "$tmp" "$file"
+    fw_commit_or_rollback "$instance" "$rollback"
+}
+
+fw_choose_rule_index() {
+    local instance="$1" count choice
+    fw_list_rules "$instance" >&2; count="$(jq '.rules|length' "$(firewall_policy_file "$instance")")"; ((count>0)) || return 1
+    while true; do read -r -p "Select rule number (0=cancel): " choice || true; [[ "$choice" == 0 ]] && return 1; [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=count)) && { echo "$choice"; return 0; }; print_warn "Invalid selection." >&2; done
+}
+
+fw_policy_edit_rule() {
+    local instance="$1" idx old rollback rule file tmp oldid
+    ensure_firewall_policy_file "$instance" || return 1; idx="$(fw_choose_rule_index "$instance" || true)"; [[ -n "$idx" ]] || return 0
+    old="$(fw_rule_json_by_index "$instance" "$idx")"; oldid="$(jq -r '.id' <<<"$old")"; rollback="$(fw_prepare_change "$instance" edit-rule)"
+    print_info "Rebuild the selected rule. Its stable ID will be preserved: $oldid"
+    rule="$(fw_rule_wizard "$instance" "$idx" "$old" || true)"; [[ -n "$rule" ]] || { rm -rf "$rollback"; return 0; }
+    rule="$(jq --arg id "$oldid" '.id=$id' <<<"$rule")"; file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"
+    jq --argjson i "$((idx-1))" --argjson r "$rule" '.rules[$i]=$r' "$file" > "$tmp" && mv "$tmp" "$file"
+    fw_commit_or_rollback "$instance" "$rollback"
+}
+
+fw_policy_toggle_rule() {
+    local instance="$1" idx rollback file tmp
+    idx="$(fw_choose_rule_index "$instance" || true)"; [[ -n "$idx" ]] || return 0; rollback="$(fw_prepare_change "$instance" toggle-rule)"; file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"
+    jq --argjson i "$((idx-1))" '.rules[$i].enabled = (if .rules[$i].enabled==false then true else false end)' "$file" > "$tmp" && mv "$tmp" "$file"
+    fw_commit_or_rollback "$instance" "$rollback"
+}
+
+fw_policy_delete_rule() {
+    local instance="$1" idx rollback file tmp id
+    idx="$(fw_choose_rule_index "$instance" || true)"; [[ -n "$idx" ]] || return 0; id="$(jq -r --argjson i "$((idx-1))" '.rules[$i].id' "$(firewall_policy_file "$instance")")"
+    ask_yes_no "Delete firewall rule $id?" "n" || return 0; rollback="$(fw_prepare_change "$instance" delete-rule)"; file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"
+    jq --argjson i "$((idx-1))" 'del(.rules[$i])' "$file" > "$tmp" && mv "$tmp" "$file"
+    fw_commit_or_rollback "$instance" "$rollback"
+}
+
+fw_policy_clone_rule() {
+    local instance="$1" idx rollback file tmp rule newid
+    idx="$(fw_choose_rule_index "$instance" || true)"; [[ -n "$idx" ]] || return 0; rollback="$(fw_prepare_change "$instance" clone-rule)"; file="$(firewall_policy_file "$instance")"; rule="$(fw_rule_json_by_index "$instance" "$idx")"; newid="$(fw_new_rule_id)"; rule="$(jq --arg id "$newid" '.id=$id | .description=((.description // "") + " (clone)")' <<<"$rule")"; tmp="$(mktemp)"; jq --argjson r "$rule" '.rules += [$r]' "$file" > "$tmp" && mv "$tmp" "$file"; fw_commit_or_rollback "$instance" "$rollback"
+}
+
+fw_base_policy_menu() {
+    local instance="$1" choice rollback mode ip
+    ensure_firewall_policy_file "$instance" || return 1
+    while true; do
+        echo; echo "==== Base ocserv firewall policy: $instance ===="
+        echo "1) Toggle managed TCP/UDP ingress (current: $(state_get "$instance" FIREWALL_BASE_INGRESS 2>/dev/null || echo 1))"
+        echo "2) Toggle base VPN FORWARD pair (current: $(state_get "$instance" FIREWALL_BASE_FORWARD 2>/dev/null || echo 1))"
+        echo "3) IPv4 NAT mode (current: $(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || echo masquerade))"
+        echo "4) Primary outbound interface / detected route (current: $(fw_primary_out_iface "$instance"))"
+        echo "5) IPv6 NAT66 toggle (current: $(state_get "$instance" IPV6_NAT 2>/dev/null || echo 0))"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
+        case "$choice" in
+            1) rollback="$(fw_prepare_change "$instance" base-ingress)"; [[ "$(state_get "$instance" FIREWALL_BASE_INGRESS 2>/dev/null || echo 1)" == 1 ]] && state_set "$instance" FIREWALL_BASE_INGRESS 0 || state_set "$instance" FIREWALL_BASE_INGRESS 1; fw_commit_or_rollback "$instance" "$rollback" ;;
+            2) rollback="$(fw_prepare_change "$instance" base-forward)"; [[ "$(state_get "$instance" FIREWALL_BASE_FORWARD 2>/dev/null || echo 1)" == 1 ]] && state_set "$instance" FIREWALL_BASE_FORWARD 0 || state_set "$instance" FIREWALL_BASE_FORWARD 1; fw_commit_or_rollback "$instance" "$rollback" ;;
+            3)
+                echo "1) MASQUERADE (recommended for dynamic/default egress)"; echo "2) SNAT to a selected local IP"; echo "3) No base IPv4 NAT"
+                read -r -p "Select: " mode || true; rollback="$(fw_prepare_change "$instance" base-nat)"
+                case "$mode" in 1) state_set "$instance" FIREWALL_BASE_NAT_MODE masquerade; state_set "$instance" FIREWALL_BASE_SNAT_IP "" ;; 2) ip="$(fw_choose_local_ipv4 "Choose local IPv4 for base SNAT")"; state_set "$instance" FIREWALL_BASE_NAT_MODE snat; state_set "$instance" FIREWALL_BASE_SNAT_IP "$ip" ;; 3) state_set "$instance" FIREWALL_BASE_NAT_MODE none ;; *) rm -rf "$rollback"; continue ;; esac
+                fw_commit_or_rollback "$instance" "$rollback"
+                ;;
+            4) rollback="$(fw_prepare_change "$instance" primary-outbound)"; fw_select_primary_outbound "$instance"; fw_commit_or_rollback "$instance" "$rollback" ;;
+            5) rollback="$(fw_prepare_change "$instance" ipv6-nat)"; [[ "$(state_get "$instance" IPV6_NAT 2>/dev/null || echo 0)" == 1 ]] && state_set "$instance" IPV6_NAT 0 || state_set "$instance" IPV6_NAT 1; fw_commit_or_rollback "$instance" "$rollback" ;;
+            0) return 0 ;;
+            *) print_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+fw_backend_menu() {
+    local instance="$1" rollback old
+    old="$(firewall_mode_for_instance "$instance")"; rollback="$(fw_prepare_change "$instance" backend-change)"
+    configure_firewall_mode "$instance" || { rm -rf "$rollback"; return 0; }
+    if [[ "$old" != "$(firewall_mode_for_instance "$instance")" ]]; then fw_commit_or_rollback "$instance" "$rollback"; else rm -rf "$rollback"; fi
+}
+
+fw_show_live_rules() {
+    local instance="$1" family cmd role table chain
+    for family in ipv4 ipv6; do
+        cmd="$(fw_cmd_for_family "$family" 2>/dev/null || true)"; [[ -n "$cmd" ]] || continue
+        echo "==== $family manager-owned chains: $instance ===="
+        for role in input forward output; do chain="$(firewall_chain_name "$instance" "$role")"; echo "-- filter/$role ($chain)"; "$cmd" -t filter -S "$chain" 2>/dev/null || echo "(not present)"; done
+        for role in prerouting postrouting; do chain="$(firewall_chain_name "$instance" "$role")"; echo "-- nat/$role ($chain)"; "$cmd" -t nat -S "$chain" 2>/dev/null || echo "(not present)"; done
+        for role in prerouting input forward output postrouting; do chain="$(firewall_chain_name "$instance" "$role")"; echo "-- mangle/$role ($chain)"; "$cmd" -t mangle -S "$chain" 2>/dev/null || echo "(not present)"; done
+        for role in prerouting output; do chain="$(firewall_chain_name "$instance" "$role")"; echo "-- raw/$role ($chain)"; "$cmd" -t raw -S "$chain" 2>/dev/null || echo "(not present)"; done
+    done
+    if command -v ufw >/dev/null 2>&1; then echo "==== UFW rules tagged for $instance ===="; ufw status numbered 2>/dev/null | grep -F "ocserv-manager:$instance" || echo "(none)"; fi
+}
+
+fw_restore_snapshot_menu() {
+    local instance="$1" root d i choice rollback
+    local -a snaps=()
+    root="$(fw_snapshot_dir_for_instance "$instance")"; [[ -d "$root" ]] || { print_warn "No persistent firewall snapshots exist for $instance."; return 0; }
+    while IFS= read -r d; do [[ -d "$d" ]] && snaps+=("$d"); done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%p\n' | sort -r)
+    ((${#snaps[@]})) || { print_warn "No snapshots found."; return 0; }
+    echo "Firewall snapshots:"; for ((i=0;i<${#snaps[@]};i++)); do printf '%d) %s\n' "$((i+1))" "${snaps[$i]}"; done; echo "0) Cancel"
+    read -r -p "Select: " choice || true; [[ "$choice" == 0 ]] && return 0; [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#snaps[@]})) || { print_warn "Invalid selection."; return 0; }
+    d="${snaps[$((choice-1))]}"; ask_yes_no "Restore firewall policy/state from $d?" "n" || return 0
+    rollback="$(fw_prepare_change "$instance" restore-snapshot)"
+    [[ -f "$d/policy.json" ]] && cp -a "$d/policy.json" "$(firewall_policy_file "$instance")"
+    [[ -f "$d/state.env" ]] && cp -a "$d/state.env" "$(instance_state_file "$instance")"
+    fw_commit_or_rollback "$instance" "$rollback"
+}
+
+fw_reset_defaults() {
+    local instance="$1" rollback mode file tmp
+    echo "Reset options:"; echo "1) Reset base/custom policy but keep current backend"; echo "2) Full Manager firewall defaults (iptables + base ingress/forward/MASQUERADE + no custom rules)"; echo "0) Cancel"
+    read -r -p "Select: " mode || true; [[ "$mode" == 0 ]] && return 0
+    ask_yes_no "Reset the saved firewall policy for $instance?" "n" || return 0; rollback="$(fw_prepare_change "$instance" reset-defaults)"
+    state_set "$instance" FIREWALL_BASE_INGRESS 1; state_set "$instance" FIREWALL_BASE_FORWARD 1; state_set "$instance" FIREWALL_BASE_NAT_MODE masquerade; state_set "$instance" FIREWALL_BASE_SNAT_IP ""; state_set "$instance" OUT_IFACE "$(default_route_iface)"; state_set "$instance" FIREWALL_PRIMARY_ROUTE "default(auto)"
+    [[ "$mode" == 2 ]] && state_set "$instance" FIREWALL_MODE iptables
+    file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"; jq '.rules=[]' "$file" > "$tmp" && mv "$tmp" "$file"
+    fw_commit_or_rollback "$instance" "$rollback"
+}
+
+fw_show_host_firewall_readonly() {
+    echo "==== Full host firewall (read-only) ===="
+    if command -v iptables-save >/dev/null 2>&1; then echo; echo "---- iptables-save ----"; iptables-save 2>/dev/null || true; fi
+    if command -v ip6tables-save >/dev/null 2>&1; then echo; echo "---- ip6tables-save ----"; ip6tables-save 2>/dev/null || true; fi
+    if command -v ufw >/dev/null 2>&1; then echo; echo "---- UFW status numbered ----"; ufw status numbered 2>/dev/null || true; fi
+    if command -v nft >/dev/null 2>&1; then echo; echo "---- nftables ruleset ----"; nft list ruleset 2>/dev/null || true; fi
+    print_info "This view is read-only. Firewall Manager edits only rules owned by the selected ocserv instance."
+}
+
+firewall_manager_menu() {
+    local instance="$1" choice rollback file tmp
+    ensure_firewall_policy_file "$instance" || return 1
+    while true; do
+        echo; echo "==== Firewall Manager: $instance ===="
+        fw_policy_summary "$instance"
+        echo
+        echo "1) Select/change backend (iptables / UFW)"
+        echo "2) Base ocserv firewall policy (ingress / forward / primary route / NAT)"
+        echo "3) List custom managed rules"
+        echo "4) Add managed rule"
+        echo "5) Edit managed rule"
+        echo "6) Enable/disable managed rule"
+        echo "7) Delete managed rule"
+        echo "8) Clone managed rule"
+        echo "9) Detect/show interfaces, local IPs, routes and policy rules"
+        echo "10) Apply/reapply current saved firewall policy"
+        echo "11) Show live manager-owned firewall rules"
+        echo "12) Create firewall snapshot"
+        echo "13) Restore firewall snapshot / previous saved state"
+        echo "14) Reset to Manager firewall defaults"
+        echo "15) Remove all custom rules (keep base policy)"
+        echo "16) Show full host firewall (read-only; iptables/UFW/nftables)"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
+        case "$choice" in
+            1) fw_backend_menu "$instance"; pause ;;
+            2) fw_base_policy_menu "$instance" ;;
+            3) fw_list_rules "$instance"; pause ;;
+            4) fw_policy_add_rule "$instance"; pause ;;
+            5) fw_policy_edit_rule "$instance"; pause ;;
+            6) fw_policy_toggle_rule "$instance"; pause ;;
+            7) fw_policy_delete_rule "$instance"; pause ;;
+            8) fw_policy_clone_rule "$instance"; pause ;;
+            9) fw_show_detected_network; pause ;;
+            10) apply_firewall_for_instance "$instance"; pause ;;
+            11) fw_show_live_rules "$instance"; pause ;;
+            12) fw_create_snapshot "$instance" manual || true; pause ;;
+            13) fw_restore_snapshot_menu "$instance"; pause ;;
+            14) fw_reset_defaults "$instance"; pause ;;
+            15)
+                ask_yes_no "Delete all custom firewall rules for $instance?" "n" || continue
+                rollback="$(fw_prepare_change "$instance" clear-custom-rules)"; file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"; jq '.rules=[]' "$file" > "$tmp" && mv "$tmp" "$file"; fw_commit_or_rollback "$instance" "$rollback"; pause
+                ;;
+            16) fw_show_host_firewall_readonly; pause ;;
+            0) return 0 ;;
+            *) print_warn "Invalid selection." ;;
+        esac
+    done
+}
+
+
+# -----------------------------------------------------------------------------
 # Instance management menus
 # -----------------------------------------------------------------------------
 instance_detail_menu() {
@@ -12615,6 +13675,7 @@ instance_detail_menu() {
         echo "10) Virtual hosts (SNI)"; echo "11) Diagnostics"; echo "12) Repair"
         echo "13) Clone"; echo "14) Delete instance"; echo "15) Connection stability / mobile roaming / restore"
         echo "16) config-per-user / config-per-group settings"
+        echo "17) Firewall Manager (iptables / UFW / routes / NAT / custom rules / restore)"
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
@@ -12626,6 +13687,7 @@ instance_detail_menu() {
             14) delete_instance "$instance"; return;;
             15) connection_stability_menu "$instance";;
             16) supplemental_config_menu "$instance";;
+            17) firewall_manager_menu "$instance";;
             0) return;; *) print_warn "Invalid selection.";;
         esac
     done
