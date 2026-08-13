@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="2.8.1"
+PROGRAM_VERSION="2.8.2"
 PROGRAM_NAME="Ocserv Manager"
 
 OCSERV_ETC="/etc/ocserv"
@@ -31,7 +31,7 @@ CENTRAL_INTEGRATION_DIR="/etc/ocserv-manager/central"
 CENTRAL_LIB_DIR="/usr/local/lib/ocserv-manager/central"
 CENTRAL_EMBED_STATE="$MANAGER_ETC/central-embedded.env"
 CENTRAL_PROFILE="$CENTRAL_INTEGRATION_DIR/profile.env"
-CENTRAL_EMBEDDED_VERSION="v20.4.1"
+CENTRAL_EMBEDDED_VERSION="v20.4.2"
 TEMPLATE_ROOT="$MANAGER_ETC/templates"
 INSTANCE_BASE_ROOT="$MANAGER_ETC/config-bases"
 STABILITY_BACKUP_ROOT="$BACKUP_ROOT/stability"
@@ -3706,11 +3706,20 @@ central_register_detected_instances_for_attach() {
 # Exact modern equivalent of the old v19 "Install both master and node on this server":
 # use the local Master and attach every local ocserv instance as its own source-aware Node.
 central_attach_all_local_master() {
-    local token i failed=0 count=0
+    local token i failed=0 count=0 token_preview
     token="$(detect_local_central_token)"
     [[ -n "$token" ]] || { print_err "Local Central Master token was not detected. Install/start the Master first."; return 1; }
     central_register_detected_instances_for_attach
     central_write_profile_values "http://127.0.0.1:8088" "$token" 30 5 closed 1 || return 1
+    token_preview="${token:0:8}...${token: -4}"
+    echo
+    print_info "Local Central API/Node profile selected automatically:"
+    echo "  API URL: http://127.0.0.1:8088"
+    echo "  API token: $token_preview (masked)"
+    echo "  Live check interval: 30 seconds"
+    echo "  API timeout: 5 seconds"
+    echo "  Failure policy: fail-closed"
+    echo "  Auto-attach new local instances: enabled"
     while read -r i; do
         [[ -n "$i" ]] || continue
         count=$((count+1))
@@ -3722,6 +3731,38 @@ central_attach_all_local_master() {
         return 1
     fi
     print_ok "Local Master + $count ocserv Node instance(s) are integrated. API: http://127.0.0.1:8088"
+}
+
+central_sync_local_master_profile() {
+    local token i failed=0 updated=0
+    token="$(detect_local_central_token)"
+    [[ -n "$token" ]] || { print_err "Local Central Master token was not detected."; return 1; }
+    [[ -f "$CENTRAL_PROFILE" ]] || return 0
+    central_profile_load
+    case "${API_URL:-}" in
+        http://127.0.0.1:8088|http://localhost:8088)
+            central_write_profile_values "http://127.0.0.1:8088" "$token" "${INTERVAL:-30}" "${API_TIMEOUT:-5}" "${FAIL_MODE:-closed}" "${AUTO_ATTACH:-0}" || return 1
+            ;;
+        *)
+            # A deliberately remote profile must not be silently replaced by the local Master.
+            return 0
+            ;;
+    esac
+    while read -r i; do
+        [[ -n "$i" ]] || continue
+        [[ "$(state_get "$i" CENTRAL_ENABLED 2>/dev/null || echo 0)" == 1 ]] || continue
+        updated=$((updated+1))
+        central_attach_instance_from_profile "$i" 0 || failed=$((failed+1))
+    done < <(list_instances | sort -u)
+    if (( updated > 0 )); then
+        if (( failed == 0 )); then
+            print_ok "Local Central API token/profile synchronized to $updated attached instance(s)."
+        else
+            print_warn "$failed of $updated attached instance(s) could not be synchronized to the local Master profile."
+            return 1
+        fi
+    fi
+    return 0
 }
 
 central_read_env_value() {
@@ -3770,7 +3811,7 @@ central_profile_load() {
 }
 
 central_profile_configure() {
-    local api token interval timeout fail auto=0 local_token
+    local api token interval timeout fail auto=0 local_token i attached=0 failed=0
     install_runtime_dependencies; install_available_packages curl jq python3
     local_token="$(detect_local_central_token)"
     if systemctl is-active --quiet ocserv-central 2>/dev/null && [[ -n "$local_token" ]]; then
@@ -3785,17 +3826,32 @@ central_profile_configure() {
     timeout="$(ask_integer "Central API timeout seconds" "5" 1 60)"
     if ask_yes_no "If Central API is unreachable, temporarily allow new VPN connections? (fail-open weakens enforcement)" "n"; then fail=open; else fail=closed; fi
     if ask_yes_no "Automatically attach NEW ocserv instances to Central using this profile?" "n"; then auto=1; fi
-    mkdir -p "$CENTRAL_INTEGRATION_DIR"
-    cat > "$CENTRAL_PROFILE" <<EOF
-API_URL="$api"
-API_TOKEN="$token"
-INTERVAL="$interval"
-API_TIMEOUT="$timeout"
-FAIL_MODE="$fail"
-AUTO_ATTACH="$auto"
-EOF
-    chmod 600 "$CENTRAL_PROFILE"
-    print_ok "Shared Central connection profile saved. Existing instances are not changed until you attach them."
+    central_write_profile_values "$api" "$token" "$interval" "$timeout" "$fail" "$auto" || return 1
+    print_ok "Shared Central connection profile saved."
+
+    while read -r i; do
+        [[ -n "$i" ]] || continue
+        [[ "$(state_get "$i" CENTRAL_ENABLED 2>/dev/null || echo 0)" == 1 ]] && attached=$((attached+1))
+    done < <(list_instances | sort -u)
+
+    if (( attached > 0 )); then
+        echo
+        print_info "$attached local ocserv instance(s) are already attached to Central."
+        if ask_yes_no "Apply the new API/agent profile to all currently attached instances now?" "y"; then
+            while read -r i; do
+                [[ -n "$i" ]] || continue
+                [[ "$(state_get "$i" CENTRAL_ENABLED 2>/dev/null || echo 0)" == 1 ]] || continue
+                central_attach_instance_from_profile "$i" 0 || failed=$((failed+1))
+            done < <(list_instances | sort -u)
+            if (( failed == 0 )); then
+                print_ok "New Central API/agent settings applied to all attached instances."
+            else
+                print_warn "$failed attached instance(s) could not be updated. Check their agent logs."
+            fi
+        else
+            print_warn "Profile was saved, but existing attached instances keep their previous env until you re-attach/apply it."
+        fi
+    fi
 }
 
 central_auto_attach_enabled() {
@@ -3974,9 +4030,15 @@ central_instances_status() {
     done < <(list_instances | sort -u)
     (( any == 1 )) || echo "No ocserv instances found."
     if [[ -f "$CENTRAL_PROFILE" ]]; then
+        local token_preview
         central_profile_load
+        token_preview="${API_TOKEN:0:8}...${API_TOKEN: -4}"
         echo
-        echo "Shared API: $API_URL"
+        echo "Shared API URL: $API_URL"
+        echo "Shared API token: $token_preview (masked)"
+        echo "Live check interval: ${INTERVAL:-30} seconds"
+        echo "API timeout: ${API_TIMEOUT:-5} seconds"
+        echo "Failure policy: ${FAIL_MODE:-closed}"
         echo "Auto-attach new instances: ${AUTO_ATTACH:-0}"
     fi
 }
@@ -4029,7 +4091,7 @@ central_instances_menu() {
         echo "Every attached instance has its own occtl socket, Node ID, source ID and ocpasswd authority."
         echo "The Master receives user/group snapshots from each instance; a single Master-side OCPASSWD_PATH is no longer required for these attached sources."
         echo "1) List instances / attachment status"
-        echo "2) Configure shared Central API profile"
+        echo "2) Configure shared Central API/agent profile (URL/token/interval/timeout/fail-mode)"
         echo "3) Attach one instance"
         echo "4) Attach ALL discovered instances"
         echo "5) Detach one instance"
@@ -4071,7 +4133,7 @@ extract_embedded_central_manager() {
     mkdir -p "$(dirname "$destination")"
     cat > "$destination" <<'__OCSERV_MANAGER_EMBEDDED_CENTRAL_V20_7F3A1D__'
 #!/usr/bin/env bash
-# ocserv-central-manager v20.4.1
+# ocserv-central-manager v20.4.2
 # Native multi-instance source synchronization: each ocserv instance can publish its own ocpasswd authority and occtl session stream.
 # Adds safe in-place program update for Manager, Master API, Node Agent, hooks, and cleanup code without reconfigure.
 # Keeps v18 prune controls, v17 threshold export, v16 real ocpasswd prune/group export, v15 extra-traffic decrease/history, v14 reset recovery, v13 authoritative group refresh, v12 cleanup+VACUUM, v10 exhausted tools, and v8 unlimited groups.
@@ -4101,7 +4163,7 @@ CLEANUP_ENV="/etc/ocserv-central/cleanup.env"
 CLEANUP_SERVICE="/etc/systemd/system/ocserv-central-cleanup.service"
 CLEANUP_TIMER="/etc/systemd/system/ocserv-central-cleanup.timer"
 
-PROGRAM_VERSION="v20.4.1"
+PROGRAM_VERSION="v20.4.2"
 API_VERSION="2.3"
 UPDATE_BACKUP_ROOT="/root/ocserv-central-update-backups"
 MASTER_VERSION_FILE="/etc/ocserv-central/installed-version"
@@ -6188,6 +6250,10 @@ install_master() {
     print_info "Remote nodes may replace 127.0.0.1 with this Master server's reachable IP/hostname."
     print_info "API token: $token"
     print_warn "Keep this token safe. Use it on all nodes."
+    if [[ -x /usr/local/sbin/ocserv-manager ]] && /usr/local/sbin/ocserv-manager --central-capability >/dev/null 2>&1; then
+        /usr/local/sbin/ocserv-manager --central-sync-local-master-profile || \
+            print_warn "Master is healthy, but one or more existing local attached instances could not be synchronized to the current API token/profile."
+    fi
 }
 
 write_node_files() {
@@ -6634,9 +6700,22 @@ master_curl() {
 }
 
 master_status() {
+    local envline token ttl remove token_preview
     echo
     print_info "Master service:"
     systemctl status ocserv-central --no-pager || true
+    envline="$(systemctl show ocserv-central -p Environment --value 2>/dev/null || true)"
+    token="$(printf '%s\n' "$envline" | tr ' ' '\n' | sed -n 's/^API_TOKEN=//p' | tail -n1)"
+    ttl="$(printf '%s\n' "$envline" | tr ' ' '\n' | sed -n 's/^SESSION_TTL=//p' | tail -n1)"
+    remove="$(printf '%s\n' "$envline" | tr ' ' '\n' | sed -n 's/^REMOVE_MISSING_USERS=//p' | tail -n1)"
+    token_preview="${token:0:8}...${token: -4}"
+    echo
+    print_info "Master API settings:"
+    echo "Local API URL: http://127.0.0.1:8088"
+    echo "Listener: 0.0.0.0:8088 (remote reachability still depends on host/network firewall)"
+    [[ -n "$token" ]] && echo "API token: $token_preview (masked)"
+    echo "Session TTL: ${ttl:-120} seconds"
+    echo "Remove missing ocpasswd users: ${remove:-0}"
     echo
     print_info "Health:"
     curl -sS http://127.0.0.1:8088/health 2>/dev/null | jq . || print_warn "API not responding."
@@ -10695,7 +10774,7 @@ master_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Master Menu ===="
-        echo "1) Install / reconfigure master"
+        echo "1) Install / reconfigure master (API token / TTL / prune / features)"
         echo "2) Configure features: session limit / quota"
         echo "3) Configure group limits from synchronized authority sources"
         echo "4) Sync ocpasswd now"
@@ -10933,7 +11012,7 @@ main_menu() {
     while true; do
         safe_clear
         echo "=============================================="
-        echo "       Ocserv Central Manager v20.4.1"
+        echo "       Ocserv Central Manager v20.4.2"
         echo "=============================================="
         echo "1) Master server menu"
         echo "2) Local ocserv instances / Node integration (multi-instance, recommended)"
@@ -11016,7 +11095,7 @@ case "${1:-}" in
         ;;
     --help|-h)
         cat <<'EOHELP'
-ocserv-central-manager v20.4.1 (embedded in Ocserv Manager)
+ocserv-central-manager v20.4.2 (embedded in Ocserv Manager)
   --install-master       Install/reconfigure Master
   --install-node         Install/reconfigure legacy single-config Node
   --install-both         Install Master + attach all local ocserv instances as Nodes
@@ -12722,6 +12801,10 @@ case "${1:-}" in
         need_root; ensure_dirs; central_attach_all_local_master
         exit $?
         ;;
+    --central-sync-local-master-profile)
+        need_root; ensure_dirs; central_sync_local_master_profile
+        exit $?
+        ;;
     --central-import-v19-node)
         need_root; ensure_dirs; central_import_v19_node_env "${2:-/etc/ocserv-central-node/node.env}"
         exit $?
@@ -12756,7 +12839,8 @@ Usage: $0 [option]
   --central-instances       Manage all local ocserv instances from Central (native multi-instance)
   --central-instances-status Show local Central attachment/source status
   --central-attach-all-local-master Attach all local instances to the local Master at 127.0.0.1:8088
-  --central-import-v19-node [node.env] Import v19 Node API settings into the v20.4.1 source-aware shared instance profile
+  --central-sync-local-master-profile Sync current local Master token/profile to already attached local instances
+  --central-import-v19-node [node.env] Import v19 Node API settings into the v20.4.2 source-aware shared instance profile
   --central-menu            Open the integrated Central Manager console
   --central-update          Update installed Central code/components without reconfigure
   --central-status          Show integrated Central status
