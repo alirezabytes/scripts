@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Ocserv Manager v3.6.0
+# Ocserv Manager v3.6.1
 # Multi-instance installer and manager for ocserv on Ubuntu/Debian.
 # Designed as a replacement for the original single-instance ocserv.sh.
 
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="3.6.0"
+PROGRAM_VERSION="3.6.1"
 PROGRAM_NAME="Ocserv Manager"
 
 OCSERV_ETC="/etc/ocserv"
@@ -19,6 +19,7 @@ MANAGER_BIN="/usr/local/sbin/ocserv-manager"
 SYSTEMD_DEFAULT="/etc/systemd/system/ocserv.service"
 SYSTEMD_TEMPLATE="/etc/systemd/system/ocserv@.service"
 SYSCTL_FILE="/etc/sysctl.d/90-ocserv-manager-forwarding.conf"
+NETWORK_ENV="$MANAGER_ETC/network.env"
 FIREWALL_REAPPLY_SERVICE="/etc/systemd/system/ocserv-manager-firewall.service"
 AUDIT_LOG_DIR="/var/log/ocserv-manager"
 AUDIT_LOG="$AUDIT_LOG_DIR/audit.log"
@@ -1417,20 +1418,117 @@ choose_subnet() {
     fi
 }
 
-enable_ip_forwarding() {
-    local need_v6=0 f
-    mkdir -p "$(dirname "$SYSCTL_FILE")"
+network_state_get() {
+    local key="$1"
+    [[ -f "$NETWORK_ENV" ]] || return 1
+    sed -n "s/^${key}=//p" "$NETWORK_ENV" | tail -n1
+}
+
+network_state_set() {
+    local key="$1" value="$2" tmp
+    mkdir -p "$(dirname "$NETWORK_ENV")"
+    touch "$NETWORK_ENV"
+    chmod 600 "$NETWORK_ENV"
+    tmp="$(mktemp)"
+    grep -vE "^${key}=" "$NETWORK_ENV" > "$tmp" || true
+    printf '%s=%s\n' "$key" "$value" >> "$tmp"
+    mv -f "$tmp" "$NETWORK_ENV"
+    chmod 600 "$NETWORK_ENV"
+}
+
+ipv4_forwarding_policy() {
+    local value
+    value="$(network_state_get IPV4_FORWARDING 2>/dev/null || true)"
+    case "$value" in
+        0|disabled|off) echo 0 ;;
+        *) echo 1 ;;
+    esac
+}
+
+forwarding_need_ipv6() {
+    local f
     shopt -s nullglob
     for f in "$STATE_ROOT"/*.env; do
-        grep -qE '^IPV6_NETWORK=.+$' "$f" && { need_v6=1; break; }
+        if grep -qE '^IPV6_NETWORK=.+$' "$f"; then
+            shopt -u nullglob
+            return 0
+        fi
     done
     shopt -u nullglob
+    return 1
+}
+
+apply_ip_forwarding_policy() {
+    local desired need_v6=0
+    desired="$(ipv4_forwarding_policy)"
+    forwarding_need_ipv6 && need_v6=1 || true
+    mkdir -p "$(dirname "$SYSCTL_FILE")"
     {
-        echo '# Managed by ocserv-manager. Performance/BBR tuning intentionally lives elsewhere.'
-        echo 'net.ipv4.ip_forward = 1'
+        echo '# Managed by ocserv-manager. IPv4 forwarding is global for the server.'
+        echo '# Performance/BBR tuning intentionally lives elsewhere.'
+        printf 'net.ipv4.ip_forward = %s\n' "$desired"
         (( need_v6 == 1 )) && echo 'net.ipv6.conf.all.forwarding = 1'
     } > "$SYSCTL_FILE"
-    sysctl -p "$SYSCTL_FILE" >/dev/null
+    chmod 644 "$SYSCTL_FILE"
+    sysctl -w "net.ipv4.ip_forward=$desired" >/dev/null
+    if (( need_v6 == 1 )); then
+        sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+    fi
+}
+
+enable_ip_forwarding() {
+    network_state_set IPV4_FORWARDING 1
+    apply_ip_forwarding_policy
+}
+
+disable_ip_forwarding() {
+    network_state_set IPV4_FORWARDING 0
+    apply_ip_forwarding_policy
+}
+
+ensure_ip_forwarding_default() {
+    if [[ ! -f "$NETWORK_ENV" ]] || ! grep -q '^IPV4_FORWARDING=' "$NETWORK_ENV" 2>/dev/null; then
+        network_state_set IPV4_FORWARDING 1
+    fi
+    apply_ip_forwarding_policy
+}
+
+ipv4_forwarding_menu() {
+    local choice live desired persistent
+    while true; do
+        live="$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unknown)"
+        desired="$(ipv4_forwarding_policy)"
+        if grep -Eq '^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=[[:space:]]*1([[:space:]]*(#.*)?)?$' "$SYSCTL_FILE" 2>/dev/null; then
+            persistent=enabled
+        elif grep -Eq '^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=[[:space:]]*0([[:space:]]*(#.*)?)?$' "$SYSCTL_FILE" 2>/dev/null; then
+            persistent=disabled
+        else
+            persistent='not managed yet'
+        fi
+        echo
+        echo "==== IPv4 forwarding (global server setting) ===="
+        echo "Kernel now: $([[ "$live" == 1 ]] && echo enabled || [[ "$live" == 0 ]] && echo disabled || echo "$live")"
+        echo "Saved Manager policy: $([[ "$desired" == 1 ]] && echo enabled || echo disabled)"
+        echo "Persistent sysctl: $persistent"
+        echo
+        echo "1) Enable and persist"
+        echo "2) Reapply saved setting"
+        echo "3) Disable and persist (not recommended for a VPN router)"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
+        case "$choice" in
+            1) enable_ip_forwarding; print_ok "IPv4 forwarding is enabled now and will persist after reboot."; pause ;;
+            2) apply_ip_forwarding_policy; print_ok "Saved IPv4 forwarding policy reapplied."; pause ;;
+            3)
+                if ask_yes_no "Disabling IPv4 forwarding can stop VPN clients from reaching routed networks/Internet. Disable it globally?" "n"; then
+                    disable_ip_forwarding
+                    print_warn "IPv4 forwarding is disabled globally and persistently."
+                fi
+                pause ;;
+            0) return 0 ;;
+            *) print_warn "Invalid selection." ;;
+        esac
+    done
 }
 
 fw_comment() { printf 'ocserv-manager:%s' "$1"; }
@@ -1497,6 +1595,7 @@ fw_install_iptables_persistent_simple() {
 }
 
 fw_apply_plain_iptables_persistent() {
+    ensure_ip_forwarding_default || return 1
     # Legacy/plain mode deliberately mirrors the old installer firewall behavior.
     # It does not create Manager INPUT/FORWARD/NAT chains and it does not use the
     # Manager boot reapply service. The only firewall mutation is the broad
@@ -1794,7 +1893,7 @@ reapply_all_firewall_rules() {
     local instance f domain subnet
     command -v iptables >/dev/null 2>&1 || { print_err "iptables is unavailable; cannot reapply ocserv firewall rules."; return 1; }
     export OCSERV_MANAGER_BOOT_REAPPLY=1
-    enable_ip_forwarding
+    ensure_ip_forwarding_default
     while read -r instance; do
         [[ -n "$instance" ]] || continue
         [[ -f "$(instance_state_file "$instance")" ]] || continue
@@ -3548,6 +3647,7 @@ create_instance_wizard() {
     configure_limits_and_bans "$instance"
     configure_network_profile "$instance"
     configure_routing_profile "$instance"
+    ensure_ip_forwarding_default
     configure_firewall_mode "$instance"
     if ask_yes_no "Open per-instance Firewall setup now? You can also configure it later." "n"; then firewall_manager_menu "$instance"; fi
     state_set "$instance" CENTRAL_ENABLED 0
@@ -11798,7 +11898,7 @@ adopt_imported_instance() {
     state_set "$instance" CONFIG "$managed_conf"
     while ! configure_server_certificate "$instance"; do :; done
     configure_authentication "$instance"
-    choose_dns_servers "$instance"; configure_limits_and_bans "$instance"; configure_network_profile "$instance"; configure_routing_profile "$instance"
+    choose_dns_servers "$instance"; configure_limits_and_bans "$instance"; configure_network_profile "$instance"; configure_routing_profile "$instance"; ensure_ip_forwarding_default
     state_set "$instance" CENTRAL_ENABLED 0; state_set "$instance" MANAGED 1
     tmp="$(mktemp)"; generate_ocserv_config "$instance" "$tmp"; transactional_replace_config "$instance" "$tmp"; rm -f "$tmp"
     apply_firewall_for_instance "$instance"; write_systemd_units
@@ -11839,7 +11939,7 @@ migrate_default_to_named_instance() {
     if [[ "$(state_get default MANAGED 2>/dev/null || echo 0)" != 1 ]]; then
         print_info "The source was not manager-owned; configure the new copy now."
         while ! configure_server_certificate "$target"; do :; done
-        configure_authentication "$target"; choose_dns_servers "$target"; configure_limits_and_bans "$target"; configure_network_profile "$target"; configure_routing_profile "$target"; state_set "$target" CENTRAL_ENABLED 0
+        configure_authentication "$target"; choose_dns_servers "$target"; configure_limits_and_bans "$target"; configure_network_profile "$target"; configure_routing_profile "$target"; ensure_ip_forwarding_default; state_set "$target" CENTRAL_ENABLED 0
     fi
     tmp="$(mktemp)"; generate_ocserv_config "$target" "$tmp"; transactional_replace_config "$target" "$tmp"; rm -f "$tmp"
     apply_firewall_for_instance "$target"; write_systemd_units
@@ -11966,7 +12066,7 @@ apply_firewall_for_vhost() {
     [[ -n "$iface" ]] || iface="$(default_route_iface)"
     [[ -n "$iface" ]] || { print_err "Could not detect outbound interface for vhost $domain."; return 1; }
     comment="$(vhost_fw_comment "$instance" "$domain")"
-    enable_ip_forwarding
+    ensure_ip_forwarding_default
     [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" == 1 ]] || install_available_packages iptables
     firewall_rule_add nat POSTROUTING -s "$subnet" -o "$iface" -m comment --comment "$comment" -j MASQUERADE
     filter_rule_add FORWARD -s "$subnet" -o "$iface" -m comment --comment "$comment" -j ACCEPT
@@ -12457,7 +12557,7 @@ status_dashboard() {
     echo "ocserv version: ${version:-not installed}"
     echo "ocserv binary: ${binary:-not found}"
     echo "Outbound interface: $(default_route_iface || echo unknown)"
-    echo "IPv4 forwarding: $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unknown)"
+    echo "IPv4 forwarding: $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unknown) (saved policy=$(ipv4_forwarding_policy))"
     echo "Firewall: per-instance simple setup; iptables is default, UFW is opt-in and never auto-enabled."
     echo "Advanced rules remain available under Firewall -> Advanced and stay isolated in manager-owned chains."
     echo
@@ -12594,7 +12694,7 @@ configuration_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Configuration: $instance ===="
-        echo "1) Show config"; echo "2) Validate config"; echo "3) Guided reconfigure (patches the preserved original config structure)"; echo "4) Advanced raw edit (switches to preservation mode)"; echo "5) Restore exact version sample as base, then reapply selected values"; echo "6) config-per-user / config-per-group settings"; echo "0) Back"
+        echo "1) Show config"; echo "2) Validate config"; echo "3) Guided reconfigure (patches the preserved original config structure)"; echo "4) Advanced raw edit (switches to preservation mode)"; echo "5) Restore exact version sample as base, then reapply selected values"; echo "6) config-per-user / config-per-group settings"; echo "7) IPv4 forwarding (global server setting)"; echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
             1) cat "$(instance_config "$instance")"; pause;;
@@ -12603,6 +12703,7 @@ configuration_menu() {
             4) advanced_edit_config "$instance"; pause;;
             5) if ask_yes_no "Replace the preserved base with the official sample for the installed ocserv version? Current config is safety-backed up transactionally." "n"; then rebase_instance_on_stock_config "$instance"; fi; pause;;
             6) supplemental_config_menu "$instance";;
+            7) ipv4_forwarding_menu;;
             0) return;;
             *) print_warn "Invalid selection.";;
         esac
@@ -13525,7 +13626,7 @@ apply_firewall_for_instance() {
 
     # Standard/advanced profiles are Manager-owned and may create scoped rules.
     fw_remove_legacy_v29_rules "$instance" || true
-    enable_ip_forwarding
+    ensure_ip_forwarding_default
     [[ "${OCSERV_MANAGER_BOOT_REAPPLY:-0}" == 1 ]] || install_available_packages iptables
     if [[ "$mode" == ufw && ! -x "$(command -v ufw 2>/dev/null || true)" ]]; then
         print_err "UFW backend is selected for $instance, but ufw is not installed."; return 1
@@ -13562,7 +13663,7 @@ reapply_all_firewall_rules() {
     local instance f domain subnet
     command -v iptables >/dev/null 2>&1 || { print_err "iptables is unavailable; cannot reapply ocserv firewall rules."; return 1; }
     export OCSERV_MANAGER_BOOT_REAPPLY=1
-    enable_ip_forwarding
+    ensure_ip_forwarding_default
     while read -r instance; do
         [[ -n "$instance" && -f "$(instance_state_file "$instance")" ]] || continue
         if [[ "$(fw_profile_for_instance "$instance")" == iptables-persistent-simple ]]; then
