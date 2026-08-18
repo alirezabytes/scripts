@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Ocserv Manager v3.6.1
+# Ocserv Manager v3.6.2
 # Multi-instance installer and manager for ocserv on Ubuntu/Debian.
 # Designed as a replacement for the original single-instance ocserv.sh.
 
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="3.6.1"
+PROGRAM_VERSION="3.6.2"
 PROGRAM_NAME="Ocserv Manager"
 
 OCSERV_ETC="/etc/ocserv"
@@ -1353,69 +1353,102 @@ PY
 }
 
 choose_subnet() {
-    local instance="$1" family prefix pool suggested custom choice collision
-    choice="$(choose_menu "Choose private IPv4 address family/network:" \
-        "10.10.0.0/16 (preset)" \
-        "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "Custom private CIDR")"
-    case "$choice" in
-        1)
-            custom="10.10.0.0/16"
-            if collision="$(subnet_collides "$custom" "$instance" 2>/dev/null)"; then
-                print_warn "Preset subnet overlaps $collision"
-                ask_yes_no "Use 10.10.0.0/16 anyway?" "n" || return 1
-            fi
-            echo "$custom"
-            return 0
-            ;;
-        2) pool="10.0.0.0/8" ;;
-        3) pool="172.16.0.0/12" ;;
-        4) pool="192.168.0.0/16" ;;
-        5)
-            while true; do
-                custom="$(ask_nonempty "VPN IPv4 network in CIDR, e.g. 10.30.0.0/24")"
-                if valid_ipv4_cidr "$custom"; then
-                    custom="$(normalize_cidr "$custom")"
-                    is_rfc1918_cidr "$custom" || { print_warn "Use an RFC1918 private range."; continue; }
-                    if collision="$(subnet_collides "$custom" "$instance" 2>/dev/null)"; then
-                        print_warn "Subnet overlaps $collision"
-                        ask_yes_no "Use it anyway?" "n" && { echo "$custom"; return 0; }
-                    else
-                        echo "$custom"; return 0
-                    fi
-                else
-                    print_warn "Invalid IPv4 CIDR."
+    local instance="$1" family prefix pool suggested custom choice collision collision_choice
+    while true; do
+        choice="$(choose_menu "Choose private IPv4 address family/network:" \
+            "10.10.0.0/16 (preset)" \
+            "10.0.0.0/8" "172.16.0.0/12" "192.168.0.0/16" "Custom private CIDR")"
+        case "$choice" in
+            1)
+                custom="10.10.0.0/16"
+                if collision="$(subnet_collides "$custom" "$instance" 2>/dev/null)"; then
+                    print_warn "Selected subnet $custom overlaps $collision"
+                    print_warn "Two simultaneously active ocserv instances on the same host should normally use different VPN subnets."
+                    collision_choice="$(choose_menu "Subnet conflict:" \
+                        "Choose another subnet/range (recommended)" \
+                        "Use $custom anyway (advanced; overlapping addresses/routing may conflict)")"
+                    [[ "$collision_choice" == 2 ]] || continue
                 fi
-            done
-            ;;
-    esac
-    prefix="$(choose_menu "Choose subnet size:" "/24 (recommended for most installations)" "/23" "/22" "/20" "/16" "Custom prefix")"
-    case "$prefix" in
-        1) prefix=24 ;; 2) prefix=23 ;; 3) prefix=22 ;; 4) prefix=20 ;; 5) prefix=16 ;;
-        6)
-            while true; do
-                prefix="$(ask_integer "Prefix length" "24" "8" "30")"
-                local pool_pfx="${pool#*/}"
-                (( prefix >= pool_pfx )) && break
-                print_warn "Prefix /$prefix is larger than selected pool $pool."
-            done
-            ;;
-    esac
-    suggested="$(suggest_private_subnet "$pool" "$prefix" "$instance")"
-    [[ -n "$suggested" ]] || { print_err "No free subnet suggestion found in $pool/$prefix."; return 1; }
-    print_info "Suggested free subnet: $suggested" >&2
-    if ask_yes_no "Use $suggested?" "y"; then echo "$suggested"; else
+                echo "$custom"
+                return 0
+                ;;
+            2) pool="10.0.0.0/8" ;;
+            3) pool="172.16.0.0/12" ;;
+            4) pool="192.168.0.0/16" ;;
+            5)
+                while true; do
+                    custom="$(ask_nonempty "VPN IPv4 network in CIDR, e.g. 10.30.0.0/24")"
+                    if valid_ipv4_cidr "$custom"; then
+                        custom="$(normalize_cidr "$custom")"
+                        is_rfc1918_cidr "$custom" || { print_warn "Use an RFC1918 private range."; continue; }
+                        if collision="$(subnet_collides "$custom" "$instance" 2>/dev/null)"; then
+                            print_warn "Selected subnet $custom overlaps $collision"
+                            print_warn "Different simultaneously active instances should normally use non-overlapping VPN subnets."
+                            collision_choice="$(choose_menu "Subnet conflict:" \
+                                "Enter another CIDR (recommended)" \
+                                "Use $custom anyway (advanced; overlapping addresses/routing may conflict)")"
+                            [[ "$collision_choice" == 2 ]] || continue
+                        fi
+                        echo "$custom"
+                        return 0
+                    else
+                        print_warn "Invalid IPv4 CIDR."
+                    fi
+                done
+                ;;
+        esac
+
+        prefix="$(choose_menu "Choose subnet size:" "/24 (recommended for most installations)" "/23" "/22" "/20" "/16" "Custom prefix")"
+        case "$prefix" in
+            1) prefix=24 ;; 2) prefix=23 ;; 3) prefix=22 ;; 4) prefix=20 ;; 5) prefix=16 ;;
+            6)
+                while true; do
+                    prefix="$(ask_integer "Prefix length" "24" "8" "30")"
+                    local pool_pfx="${pool#*/}"
+                    (( prefix >= pool_pfx )) && break
+                    print_warn "Prefix /$prefix is larger than selected pool $pool."
+                done
+                ;;
+        esac
+        suggested="$(suggest_private_subnet "$pool" "$prefix" "$instance")"
+        if [[ -z "$suggested" ]]; then
+            print_warn "No non-overlapping subnet suggestion was found in $pool with prefix /$prefix."
+            print_info "Choose another private range, a smaller subnet, or enter a custom CIDR."
+            continue
+        fi
+        print_info "Suggested free subnet: $suggested" >&2
+        if ask_yes_no "Use $suggested?" "y"; then
+            echo "$suggested"
+            return 0
+        fi
         while true; do
             custom="$(ask_nonempty "Custom IPv4 CIDR")"
             valid_ipv4_cidr "$custom" || { print_warn "Invalid CIDR."; continue; }
             custom="$(normalize_cidr "$custom")"
             is_rfc1918_cidr "$custom" || { print_warn "Use an RFC1918 private range."; continue; }
             if collision="$(subnet_collides "$custom" "$instance" 2>/dev/null)"; then
-                print_warn "Subnet overlaps $collision"
-                ask_yes_no "Use it anyway?" "n" || continue
+                print_warn "Selected subnet $custom overlaps $collision"
+                collision_choice="$(choose_menu "Subnet conflict:" \
+                    "Enter another CIDR (recommended)" \
+                    "Use $custom anyway (advanced; overlapping addresses/routing may conflict)")"
+                [[ "$collision_choice" == 2 ]] || continue
             fi
-            echo "$custom"; return 0
+            echo "$custom"
+            return 0
         done
-    fi
+    done
+}
+
+choose_subnet_safe() {
+    local instance="$1" selected
+    while true; do
+        if selected="$(choose_subnet "$instance")"; then
+            [[ -n "$selected" ]] || { print_warn "Subnet selection returned an empty value; choose again."; continue; }
+            printf '%s\n' "$selected"
+            return 0
+        fi
+        print_warn "Subnet selection was not completed. Returning to the subnet menu instead of exiting the Manager."
+    done
 }
 
 network_state_get() {
@@ -3633,7 +3666,7 @@ create_instance_wizard() {
     listen="$(choose_listen_host)"
     tcp="$(choose_available_tcp_port "$instance" "$listen" 443)"
     udp="$(choose_available_udp_port "$instance" "$listen" "$tcp")"
-    subnet="$(choose_subnet "$instance")"
+    subnet="$(choose_subnet_safe "$instance")"
     # Register early so all later helper functions resolve correct paths.
     passwd="$(instance_passwd "$instance")"
     register_instance "$instance" "$conf" "$passwd" "$subnet" "$tcp" "$udp" "$listen" "pending"
@@ -11916,7 +11949,7 @@ migrate_default_to_named_instance() {
     newdir="$(instance_dir "$target")"; mkdir -p "$newdir"
     cp -a /etc/ocserv/ocpasswd "$newdir/ocpasswd" 2>/dev/null || touch "$newdir/ocpasswd"
     listen="$(state_get default LISTEN_HOST 2>/dev/null || echo 0.0.0.0)"
-    tcp="$(choose_available_tcp_port "$target" "$listen" 8443)"; udp="$(choose_available_udp_port "$target" "$listen" "$tcp")"; newsub="$(choose_subnet "$target")"
+    tcp="$(choose_available_tcp_port "$target" "$listen" 8443)"; udp="$(choose_available_udp_port "$target" "$listen" "$tcp")"; newsub="$(choose_subnet_safe "$target")"
     cp -a "$(instance_state_file default)" "$(instance_state_file "$target")"
     ensure_supplemental_config_state default
     local source_cpu source_cpg source_cpu_dir source_cpg_dir
@@ -11964,7 +11997,7 @@ clone_instance() {
     listen="$(choose_listen_host)"
     tcp="$(choose_available_tcp_port "$target" "$listen" 8443)"
     udp="$(choose_available_udp_port "$target" "$listen" "$tcp")"
-    subnet="$(choose_subnet "$target")"
+    subnet="$(choose_subnet_safe "$target")"
     state_set "$target" NAME "$target"; state_set "$target" CONFIG "$(standard_instance_config "$target")"; state_set "$target" LISTEN_HOST "$listen"; state_set "$target" TCP_PORT "$tcp"; state_set "$target" UDP_PORT "$udp"; state_set "$target" SUBNET "$subnet"; state_set "$target" IPV6_NETWORK ""; state_set "$target" IPV6_NAT 0; state_set "$target" SERVICE "$(instance_service "$target")"; state_set "$target" OCCTL_SOCKET "$(instance_socket "$target")"
     state_set "$target" CENTRAL_ENABLED 0; state_set "$target" CENTRAL_HOOK ""
     if ask_yes_no "Share the source user database with the clone?" "y"; then
@@ -12175,7 +12208,7 @@ create_vhost() {
     print_info "Virtual hosts share the process listen IP and TCP/UDP ports; ocserv selects them by TLS SNI."
     pair="$(vhost_certificate_pair "$instance" "$domain")" || return 1; cert="${pair%%|*}"; key="${pair#*|}"
     auth="$(vhost_auth_block "$instance")"
-    subnet="$(choose_subnet "__vhost_${instance}")"
+    subnet="$(choose_subnet_safe "__vhost_${instance}")"
     dns="$(ask_value "VHost DNS servers" "$(state_get "$instance" DNS_SERVERS)")"
     if ask_yes_no "Full tunnel for this vhost?" "y"; then routes=default; if ask_yes_no "Tunnel all DNS for this vhost?" "y"; then tunnel=true; else tunnel=false; fi
     else routes="$(ask_nonempty "VHost route CIDRs separated by spaces")"; tunnel=false; fi
@@ -12649,7 +12682,7 @@ reconfigure_managed_instance() {
         case "$choice" in
             1)
                 listen="$(choose_listen_host)"; tcp="$(choose_available_tcp_port "$instance" "$listen" "$(state_get "$instance" TCP_PORT)")"; udp="$(choose_available_udp_port "$instance" "$listen" "$tcp")"; state_set "$instance" LISTEN_HOST "$listen"; state_set "$instance" TCP_PORT "$tcp"; state_set "$instance" UDP_PORT "$udp" ;;
-            2) subnet="$(choose_subnet "$instance")"; state_set "$instance" SUBNET "$subnet" ;;
+            2) subnet="$(choose_subnet_safe "$instance")"; state_set "$instance" SUBNET "$subnet" ;;
             3) while ! configure_server_certificate "$instance"; do :; done ;;
             4) configure_authentication "$instance" ;;
             5) choose_dns_servers "$instance" ;;
