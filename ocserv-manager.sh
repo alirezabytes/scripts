@@ -6,7 +6,7 @@
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="3.6.2"
+PROGRAM_VERSION="3.7.0"
 PROGRAM_NAME="Ocserv Manager"
 
 OCSERV_ETC="/etc/ocserv"
@@ -2606,10 +2606,12 @@ refresh_bypass_domains() {
 configure_network_profile() {
     local instance="$1" mtu dpd mobile keepalive discovery ipv6="" ipv6_prefix=128 nat6=0 is_ula=0
     mtu="$(ask_integer "VPN MTU (0 = let ocserv choose)" "0" 0 9000)"
-    keepalive="$(ask_integer "Keepalive seconds (32400 = upstream default; use the Connection Stability menu later for an aggressive 30s keepalive)" "32400" 0 86400)"
-    dpd="$(ask_integer "DPD seconds" "90" 0 86400)"
-    mobile="$(ask_integer "Mobile DPD seconds" "1800" 0 86400)"
-    if ask_yes_no "Enable MTU discovery?" "n"; then discovery=true; else discovery=false; fi
+    print_info "Manager recommended connection-health defaults favor fast stale-session release for services with simultaneous-connection limits."
+    print_info "Upstream/battery-friendly timers remain available from Connection Stability -> upstream/default profile."
+    keepalive="$(ask_integer "Keepalive seconds" "30" 0 86400)"
+    dpd="$(ask_integer "DPD seconds" "30" 0 86400)"
+    mobile="$(ask_integer "Mobile DPD seconds" "60" 0 86400)"
+    if ask_yes_no "Enable MTU discovery?" "y"; then discovery=true; else discovery=false; fi
     if ask_yes_no "Configure an IPv6 VPN pool too?" "n"; then
         while true; do
             ipv6="$(ask_nonempty "IPv6 network, e.g. fd42:100::/64")"
@@ -12401,6 +12403,12 @@ show_connection_stability_values() {
     echo "- idle-timeout: $(state_get "$instance" IDLE_TIMEOUT)"
     echo "- mobile-idle-timeout: $(state_get "$instance" MOBILE_IDLE_TIMEOUT)"
     echo "- rekey-time/method: $(state_get "$instance" REKEY_TIME) / $(state_get "$instance" REKEY_METHOD)"
+    local _dpd _mdpd
+    _dpd="$(state_get "$instance" DPD 2>/dev/null || echo 0)"
+    _mdpd="$(state_get "$instance" MOBILE_DPD 2>/dev/null || echo 0)"
+    if [[ "$_dpd" =~ ^[0-9]+$ && "$_mdpd" =~ ^[0-9]+$ && "$_dpd" -gt 0 && "$_mdpd" -gt 0 ]]; then
+        echo "- approximate hard DPD teardown ceiling: regular ~$((_dpd*3))s / mobile ~$((_mdpd*3))s, plus scheduler/sync delay"
+    fi
 }
 
 apply_connection_stability_profile() {
@@ -12433,13 +12441,15 @@ apply_connection_stability_profile() {
             state_set "$instance" REKEY_METHOD ssl
             ;;
         mobile-stable)
-            # Opt-in aggressive keepalive for problematic mobile/NAT paths; upstream default remains 32400.
+            # Manager recommended service profile: favor timely stale-session cleanup.
+            # ocserv checks DPD periodically and tears down TCP after repeated missed DPDs,
+            # so 30/60 is intentionally much shorter than the upstream mobile-dpd=1800.
             state_set "$instance" KEEPALIVE 30
-            state_set "$instance" DPD 90
-            state_set "$instance" MOBILE_DPD 1800
+            state_set "$instance" DPD 30
+            state_set "$instance" MOBILE_DPD 60
             state_set "$instance" SWITCH_TO_TCP_TIMEOUT 25
             state_set "$instance" MTU_DISCOVERY true
-            state_set "$instance" COOKIE_TIMEOUT 1800
+            state_set "$instance" COOKIE_TIMEOUT 300
             state_set "$instance" PERSISTENT_COOKIES false
             state_set "$instance" DENY_ROAMING false
             state_set "$instance" IDLE_TIMEOUT disabled
@@ -12515,8 +12525,8 @@ custom_connection_stability_settings() {
     fi
     ensure_connection_state_defaults "$instance"
     state_set "$instance" KEEPALIVE "$(ask_integer "Keepalive seconds" "$(state_get "$instance" KEEPALIVE 2>/dev/null || echo 30)" 0 86400)"
-    state_set "$instance" DPD "$(ask_integer "DPD seconds" "$(state_get "$instance" DPD 2>/dev/null || echo 90)" 0 86400)"
-    state_set "$instance" MOBILE_DPD "$(ask_integer "Mobile DPD seconds" "$(state_get "$instance" MOBILE_DPD 2>/dev/null || echo 1800)" 0 86400)"
+    state_set "$instance" DPD "$(ask_integer "DPD seconds" "$(state_get "$instance" DPD 2>/dev/null || echo 30)" 0 86400)"
+    state_set "$instance" MOBILE_DPD "$(ask_integer "Mobile DPD seconds" "$(state_get "$instance" MOBILE_DPD 2>/dev/null || echo 60)" 0 86400)"
     state_set "$instance" SWITCH_TO_TCP_TIMEOUT "$(ask_integer "Switch-to-TCP recovery timeout seconds" "$(state_get "$instance" SWITCH_TO_TCP_TIMEOUT)" 0 86400)"
     state_set "$instance" COOKIE_TIMEOUT "$(ask_integer "Reconnect cookie timeout seconds" "$(state_get "$instance" COOKIE_TIMEOUT)" 0 604800)"
     if ask_yes_no "Enable persistent-cookies? This improves recovery for some broken/mobile clients but weakens logout semantics." "n"; then state_set "$instance" PERSISTENT_COOKIES true; else state_set "$instance" PERSISTENT_COOKIES false; fi
@@ -12530,12 +12540,75 @@ custom_connection_stability_settings() {
     fi
 }
 
+apply_recommended_stale_session_profile_cli_one() {
+    local instance="$1" tmp old_state old_conf service was_active=0
+    [[ "$(state_get "$instance" MANAGED 2>/dev/null || echo 0)" == 1 ]] || { print_err "Instance is not manager-owned: $instance"; return 1; }
+    old_state="$(mktemp /tmp/ocserv-stale-state.${instance}.XXXXXX)"
+    old_conf="$(mktemp /tmp/ocserv-stale-conf.${instance}.XXXXXX)"
+    [[ -f "$(instance_state_file "$instance")" ]] && cp -a "$(instance_state_file "$instance")" "$old_state" || : > "$old_state"
+    [[ -f "$(instance_config "$instance")" ]] && cp -a "$(instance_config "$instance")" "$old_conf" || : > "$old_conf"
+    service="$(instance_service "$instance")"
+    systemctl is-active --quiet "$service" 2>/dev/null && was_active=1 || true
+
+    ensure_connection_state_defaults "$instance"
+    state_set "$instance" KEEPALIVE 30
+    state_set "$instance" DPD 30
+    state_set "$instance" MOBILE_DPD 60
+    state_set "$instance" SWITCH_TO_TCP_TIMEOUT 25
+    state_set "$instance" MTU_DISCOVERY true
+    state_set "$instance" COOKIE_TIMEOUT 300
+    state_set "$instance" PERSISTENT_COOKIES false
+    state_set "$instance" DENY_ROAMING false
+    state_set "$instance" IDLE_TIMEOUT disabled
+    state_set "$instance" MOBILE_IDLE_TIMEOUT disabled
+    state_set "$instance" REKEY_TIME 172800
+    state_set "$instance" REKEY_METHOD ssl
+
+    tmp="$(mktemp)"
+    if ! generate_ocserv_config "$instance" "$tmp" || ! validate_config "$tmp" >/dev/null 2>&1; then
+        print_err "Could not generate/validate the recommended connection profile for $instance."
+        [[ -s "$old_state" ]] && cp -a "$old_state" "$(instance_state_file "$instance")"
+        rm -f "$tmp" "$old_state" "$old_conf"
+        return 1
+    fi
+    install -m 600 "$tmp" "$(instance_config "$instance")"
+    rm -f "$tmp"
+    if (( was_active == 1 )) && ! restart_service_bounded "$service" 15; then
+        print_err "Service restart failed; restoring the previous connection settings for $instance."
+        [[ -s "$old_state" ]] && cp -a "$old_state" "$(instance_state_file "$instance")"
+        [[ -s "$old_conf" ]] && cp -a "$old_conf" "$(instance_config "$instance")"
+        restart_service_bounded "$service" 15 >/dev/null 2>&1 || true
+        rm -f "$old_state" "$old_conf"
+        return 1
+    fi
+    rm -f "$old_state" "$old_conf"
+    audit "stale-session-fix instance=$instance keepalive=30 dpd=30 mobile_dpd=60"
+    print_ok "$instance: recommended stale-session detection applied (keepalive=30, dpd=30, mobile-dpd=60)."
+    return 0
+}
+
+apply_recommended_stale_session_profile_cli() {
+    local target="${1:-default}" i failed=0 found=0
+    if [[ "$target" == all ]]; then
+        while IFS= read -r i; do
+            [[ -n "$i" ]] || continue
+            found=1
+            apply_recommended_stale_session_profile_cli_one "$i" || failed=$((failed+1))
+        done < <(list_instances | sort -u)
+        (( found == 1 )) || { print_err "No ocserv instances found."; return 1; }
+        (( failed == 0 )) || { print_err "$failed instance(s) could not be updated."; return 1; }
+        return 0
+    fi
+    instance_exists "$target" || { print_err "Unknown instance: $target"; return 1; }
+    apply_recommended_stale_session_profile_cli_one "$target"
+}
+
 connection_stability_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Connection Stability / Mobile Roaming: $instance ===="
         echo "1) Show current connection timers/settings"
-        echo "2) Apply Mobile/NAT stable profile (30s keepalive; persistent cookies OFF)"
+        echo "2) Apply RECOMMENDED service profile (fast stale-session detection: keepalive 30 / DPD 30 / mobile-DPD 60)"
         echo "3) Apply Aggressive roaming profile (persistent cookies ON; security tradeoff)"
         echo "4) Apply upstream/default connection profile"
         echo "5) Custom connection stability settings"
@@ -14873,6 +14946,10 @@ case "${1:-}" in
         need_root; ensure_dirs; fw_network_path_report "${2:-default}"
         exit $?
         ;;
+    --fix-stale-sessions)
+        need_root; ensure_dirs; apply_recommended_stale_session_profile_cli "${2:-default}"
+        exit $?
+        ;;
     --json-status)
         need_root; ensure_dirs
         command -v jq >/dev/null 2>&1 || { print_err "jq is required for JSON status. Run the interactive manager once or install jq."; exit 1; }
@@ -14937,6 +15014,7 @@ $PROGRAM_NAME $PROGRAM_VERSION
 Usage: $0 [option]
   --version                 Show manager version
   --network-report [instance]  Read-only policy-route/nftables/DNS/firewall report
+  --fix-stale-sessions [instance|all] Apply recommended 30/30/60 connection timers without full reconfigure
   --reapply-firewall        Reapply only manager-owned scoped firewall rules (normally used by systemd)
   --json-status [instance]  Print read-only JSON status
   --validate-all            Validate all registered ocserv configs
