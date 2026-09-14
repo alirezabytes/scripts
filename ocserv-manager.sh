@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
-# Ocserv Manager v3.6.2
+# Ocserv Manager v3.9.1
 # Multi-instance installer and manager for ocserv on Ubuntu/Debian.
 # Designed as a replacement for the original single-instance ocserv.sh.
 
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="3.7.0"
+PROGRAM_VERSION="3.9.1"
 PROGRAM_NAME="Ocserv Manager"
+OCSERV_SILENT_CLIENT_FIX_VERSION="1.5.0"
+OCSERV_PASSWORD_RETRY_FIXED="1.4.2"
+OCSERV_BAN_TIME_RENAME_VERSION="1.4.1"
 
 OCSERV_ETC="/etc/ocserv"
 MANAGER_ETC="/etc/ocserv-manager"
@@ -50,6 +53,7 @@ C_CYAN='\033[36m'
 CURRENT_TXN_BACKUP=""
 CURRENT_TXN_SERVICE=""
 CURRENT_TXN_CONFIG=""
+CURRENT_TXN_APPLY_MODE="restart"
 
 print_ok()   { echo -e "${C_GREEN}[OK]${C_RESET} $*"; }
 print_warn() { echo -e "${C_YELLOW}[WARN]${C_RESET} $*"; }
@@ -63,7 +67,11 @@ on_error() {
         print_warn "A transactional config change was in progress; restoring the previous config."
         cp -a "$CURRENT_TXN_BACKUP" "$CURRENT_TXN_CONFIG" 2>/dev/null || true
         if [[ -n "$CURRENT_TXN_SERVICE" ]]; then
-            systemctl restart "$CURRENT_TXN_SERVICE" >/dev/null 2>&1 || true
+            if [[ "$CURRENT_TXN_APPLY_MODE" == "reload" ]]; then
+                systemctl reload "$CURRENT_TXN_SERVICE" >/dev/null 2>&1 || systemctl restart "$CURRENT_TXN_SERVICE" >/dev/null 2>&1 || true
+            else
+                systemctl restart "$CURRENT_TXN_SERVICE" >/dev/null 2>&1 || true
+            fi
         fi
     fi
     return "$rc"
@@ -409,6 +417,18 @@ installed_ocserv_version() {
     return 0
 }
 
+
+version_core() {
+    printf '%s\n' "${1:-}" | grep -Eo '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true
+}
+
+version_ge() {
+    local a b
+    a="$(version_core "${1:-}")"; b="$(version_core "${2:-}")"
+    [[ -n "$a" && -n "$b" ]] || return 1
+    dpkg --compare-versions "$a" ge "$b" 2>/dev/null
+}
+
 installed_ocserv_features() {
     local b
     b="$(ocserv_bin)"
@@ -416,16 +436,35 @@ installed_ocserv_features() {
     "$b" --version 2>&1 | sed -n '1,3p'
 }
 
+online_ocserv_releases() {
+    # Latest *stable release* comes from GitLab Releases, not from a hard-coded
+    # version and not merely from whichever repository tag sorts highest.
+    # Only plain x.y.z release tags are accepted; prerelease-like tags are ignored.
+    curl -fsSL --retry 3 --connect-timeout 10 --max-time 25 \
+      'https://gitlab.com/api/v4/projects/openconnect%2Focserv/releases?per_page=100' \
+      | jq -r '.[].tag_name' \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+      | sort -V -r
+}
+
+online_ocserv_latest_stable() {
+    online_ocserv_releases | head -n1
+}
+
 online_ocserv_tags() {
-    curl -fsSL --retry 3 --connect-timeout 10 \
+    # Used for explicit source-version selection. Tags are queried live from the
+    # official repository and numerically sorted; no version list is embedded.
+    curl -fsSL --retry 3 --connect-timeout 10 --max-time 25 \
       'https://gitlab.com/api/v4/projects/openconnect%2Focserv/repository/tags?per_page=100' \
-      | jq -r '.[].name' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V -r
+      | jq -r '.[].name' \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' \
+      | sort -V -r
 }
 
 select_ocserv_install_target() {
     local choice current latest tags_count i selection custom
     current="$(installed_ocserv_version)"
-    latest="$(online_ocserv_tags 2>/dev/null | head -n1 || true)"
+    latest="$(online_ocserv_latest_stable 2>/dev/null || true)"
     echo "Installed version: ${current:-not installed}" >&2
     echo "Latest upstream tag: ${latest:-unavailable}" >&2
     echo "Choose installation source:" >&2
@@ -1055,8 +1094,76 @@ validate_all_configs() {
     (( failed == 0 ))
 }
 
+config_reload_classification() {
+    # Prints one of: no-change, reload, restart.
+    # Safety policy:
+    # - Any active top-level change before ocserv's SIGHUP marker => restart.
+    # - Any active virtual-host section change => restart (some vhost options are non-reloadable).
+    # - Changes confined to the documented reloadable top-level region => reload.
+    local old="$1" new="$2"
+    [[ -f "$old" && -f "$new" ]] || { echo restart; return 0; }
+    cmp -s "$old" "$new" && { echo no-change; return 0; }
+    python3 - "$old" "$new" <<'PYRELOAD'
+import re,sys
+from pathlib import Path
+marker=re.compile(r'all\s+configuration\s+options\s+below\s+this\s+line\s+are\s+reloaded\s+on\s+a\s+sighup',re.I)
+vhost=re.compile(r'^\s*\[vhost:',re.I)
+
+def active(line):
+    x=line.strip()
+    if not x or x.startswith('#'): return None
+    # Drop trailing comments only when they begin after whitespace. Values in quotes are kept intact.
+    x=re.sub(r'\s+#.*$','',x).strip()
+    return re.sub(r'\s+',' ',x)
+
+NONRELOAD={
+ 'auth','enable-auth','acct','listen-host','udp-listen-host','listen-netns',
+ 'tcp-port','udp-port','listen-clear-file','run-as-user','run-as-group',
+ 'occtl-socket-file','socket-file','chroot-dir','server-cert','server-key',
+ 'dh-params','pin-file','srk-pin-file','key-pin','srk-pin','ca-cert','sec-mod-scale',
+ # Current upstream also marks these as global non-reloadable even though they
+ # appear below the main SIGHUP marker in sample.config. Keep them explicit so
+ # Advanced/raw edits cannot accidentally be applied with a reload.
+ 'server-stats-reset-time','pid-file','log-level','syslog-facility',
+ # legacy/global startup controls kept conservative for older supported versions
+ 'use-dbus'
+}
+
+def sig(path):
+    lines=Path(path).read_text(encoding='utf-8',errors='ignore').splitlines()
+    mi=next((i for i,l in enumerate(lines) if marker.search(l)),None)
+    if mi is None:
+        return None,None,None
+    before=[]
+    for l in lines[:mi]:
+        a=active(l)
+        if a: before.append(a)
+    # Be conservative with vhosts: any active vhost content change requires restart.
+    vh=[]; in_vh=False
+    top_nonreload=[]
+    for l in lines:
+        if vhost.match(l): in_vh=True
+        a=active(l)
+        if in_vh:
+            if a: vh.append(a)
+            continue
+        if a and '=' in a:
+            key=a.split('=',1)[0].strip().lower()
+            if key in NONRELOAD: top_nonreload.append(a)
+    return before,vh,top_nonreload
+
+a,b,nr1=sig(sys.argv[1]); c,d,nr2=sig(sys.argv[2])
+if a is None or c is None:
+    print('restart')
+elif a!=c or b!=d or nr1!=nr2:
+    print('restart')
+else:
+    print('reload')
+PYRELOAD
+}
+
 transactional_replace_config() {
-    local instance="$1" newfile="$2" conf service rollback_file="" persistent_backup="" keep_backup=0
+    local instance="$1" newfile="$2" conf service rollback_file="" persistent_backup="" keep_backup=0 apply_mode="restart" connected=0
     conf="$(instance_config "$instance")"
     service="$(instance_service "$instance")"
 
@@ -1066,6 +1173,11 @@ transactional_replace_config() {
     fi
 
     if [[ -f "$conf" ]]; then
+        apply_mode="$(config_reload_classification "$conf" "$newfile")"
+        if [[ "$apply_mode" == "no-change" ]]; then
+            print_info "Generated configuration is identical to the active configuration; nothing to apply."
+            return 0
+        fi
         if ask_yes_no "Create a persistent backup of the current $instance ocserv.conf before applying this change?" "y"; then
             ensure_backup_root
             persistent_backup="$BACKUP_ROOT/config-$instance-$(date +%Y%m%d-%H%M%S).conf"
@@ -1083,23 +1195,40 @@ transactional_replace_config() {
     CURRENT_TXN_BACKUP="$rollback_file"
     CURRENT_TXN_CONFIG="$conf"
     CURRENT_TXN_SERVICE="$service"
+    CURRENT_TXN_APPLY_MODE="$apply_mode"
     install -m 600 "$newfile" "$conf"
 
     if systemctl is-active --quiet "$service" 2>/dev/null; then
-        if ! restart_service_bounded "$service" 15; then
-            print_err "Restart failed or timed out; restoring previous config."
-            if [[ -n "$rollback_file" && -f "$rollback_file" ]]; then
-                cp -a "$rollback_file" "$conf"
-                restart_service_bounded "$service" 15 >/dev/null 2>&1 || true
+        if [[ "$apply_mode" == "reload" ]]; then
+            print_info "Only reload-safe ocserv directives changed; applying with SIGHUP/systemd reload so existing VPN sessions are not intentionally dropped."
+            if ! reload_instance "$instance"; then
+                print_err "Reload failed; restoring previous config."
+                if [[ -n "$rollback_file" && -f "$rollback_file" ]]; then
+                    cp -a "$rollback_file" "$conf"
+                    reload_instance "$instance" >/dev/null 2>&1 || restart_service_bounded "$service" 15 >/dev/null 2>&1 || true
+                fi
+                (( keep_backup == 0 )) && rm -f "$rollback_file" 2>/dev/null || true
+                CURRENT_TXN_BACKUP=""; CURRENT_TXN_CONFIG=""; CURRENT_TXN_SERVICE=""; CURRENT_TXN_APPLY_MODE="restart"
+                return 1
             fi
-            (( keep_backup == 0 )) && rm -f "$rollback_file" 2>/dev/null || true
-            CURRENT_TXN_BACKUP=""; CURRENT_TXN_CONFIG=""; CURRENT_TXN_SERVICE=""
-            return 1
+        else
+            connected="$(connected_users_count "$instance" 2>/dev/null || echo 0)"
+            print_warn "A non-reloadable/top-level or virtual-host directive changed; ocserv restart is required. Active sessions reported before restart: ${connected:-0}."
+            if ! restart_service_bounded "$service" 15; then
+                print_err "Restart failed or timed out; restoring previous config."
+                if [[ -n "$rollback_file" && -f "$rollback_file" ]]; then
+                    cp -a "$rollback_file" "$conf"
+                    restart_service_bounded "$service" 15 >/dev/null 2>&1 || true
+                fi
+                (( keep_backup == 0 )) && rm -f "$rollback_file" 2>/dev/null || true
+                CURRENT_TXN_BACKUP=""; CURRENT_TXN_CONFIG=""; CURRENT_TXN_SERVICE=""; CURRENT_TXN_APPLY_MODE="restart"
+                return 1
+            fi
         fi
     fi
-    CURRENT_TXN_BACKUP=""; CURRENT_TXN_CONFIG=""; CURRENT_TXN_SERVICE=""
-    audit "config-updated instance=$instance backup=${persistent_backup:-declined}"
-    print_ok "Configuration applied transactionally."
+    CURRENT_TXN_BACKUP=""; CURRENT_TXN_CONFIG=""; CURRENT_TXN_SERVICE=""; CURRENT_TXN_APPLY_MODE="restart"
+    audit "config-updated instance=$instance apply_mode=$apply_mode backup=${persistent_backup:-declined}"
+    print_ok "Configuration applied transactionally using: $apply_mode."
     if (( keep_backup == 1 )); then
         print_info "Persistent backup: $persistent_backup"
     else
@@ -2644,6 +2773,23 @@ PY6
     state_set "$instance" IPV6_NETWORK "$ipv6"; state_set "$instance" IPV6_SUBNET_PREFIX "$ipv6_prefix"; state_set "$instance" IPV6_NAT "$nat6"
 }
 
+
+set_recommended_stability_state() {
+    local instance="$1"
+    state_set "$instance" KEEPALIVE 30
+    state_set "$instance" DPD 30
+    state_set "$instance" MOBILE_DPD 60
+    state_set "$instance" SWITCH_TO_TCP_TIMEOUT 25
+    state_set "$instance" MTU_DISCOVERY true
+    state_set "$instance" COOKIE_TIMEOUT 86400
+    state_set "$instance" PERSISTENT_COOKIES false
+    state_set "$instance" DENY_ROAMING false
+    state_set "$instance" IDLE_TIMEOUT disabled
+    state_set "$instance" MOBILE_IDLE_TIMEOUT disabled
+    state_set "$instance" REKEY_TIME 172800
+    state_set "$instance" REKEY_METHOD ssl
+}
+
 configure_limits_and_bans() {
     local instance="$1" max_clients max_same score ban_time reset
     max_clients="$(ask_integer "Maximum total clients (0 = ocserv automatic/high default, about 8k; not literally unlimited)" "0" 0 100000)"
@@ -2872,7 +3018,7 @@ generate_ocserv_config() {
     settings="$(mktemp)"
 
     local listen tcp udp subnet cert key auth_b64 ca cert_oid group_oid max_clients max_same score ban_time ban_reset dns mtu keepalive dpd mobile discovery routes no_routes tunnel splitdns ipv6 ipv6_prefix dir sock pid central=0 central_hook
-    local cookie persistent roaming rekey_time rekey_method idle mobile_idle switch_tcp cpu_enabled cpg_enabled cpu_dir cpg_dir
+    local cookie persistent roaming rekey_time rekey_method idle mobile_idle switch_tcp cpu_enabled cpg_enabled cpu_dir cpg_dir ocserv_version
     listen="$(state_get "$instance" LISTEN_HOST 2>/dev/null || echo 0.0.0.0)"
     tcp="$(state_get "$instance" TCP_PORT 2>/dev/null || echo 443)"; udp="$(state_get "$instance" UDP_PORT 2>/dev/null || echo "$tcp")"
     subnet="$(state_get "$instance" SUBNET)"; cert="$(state_get "$instance" SERVER_CERT)"; key="$(state_get "$instance" SERVER_KEY)"
@@ -2891,6 +3037,7 @@ generate_ocserv_config() {
     rekey_time="$(state_get "$instance" REKEY_TIME)"; rekey_method="$(state_get "$instance" REKEY_METHOD)"; idle="$(state_get "$instance" IDLE_TIMEOUT)"; mobile_idle="$(state_get "$instance" MOBILE_IDLE_TIMEOUT)"; switch_tcp="$(state_get "$instance" SWITCH_TO_TCP_TIMEOUT)"
     cpu_enabled="$(state_get "$instance" CONFIG_PER_USER_ENABLED 2>/dev/null || echo 0)"; cpg_enabled="$(state_get "$instance" CONFIG_PER_GROUP_ENABLED 2>/dev/null || echo 0)"
     cpu_dir="$(state_get "$instance" CONFIG_PER_USER_DIR 2>/dev/null || echo "$dir/config-per-user/")"; cpg_dir="$(state_get "$instance" CONFIG_PER_GROUP_DIR 2>/dev/null || echo "$dir/config-per-group/")"
+    ocserv_version="$(installed_ocserv_version)"
 
     jq -n \
       --arg instance "$instance" --arg listen "$listen" --arg tcp "$tcp" --arg udp "$udp" --arg subnet "$subnet" \
@@ -2901,8 +3048,8 @@ generate_ocserv_config() {
       --arg dir "$dir" --arg sock "$sock" --arg pid "$pid" --arg central "$central" --arg central_hook "$central_hook" \
       --arg cookie "$cookie" --arg persistent "$persistent" --arg roaming "$roaming" --arg rekey_time "$rekey_time" --arg rekey_method "$rekey_method" \
       --arg idle "$idle" --arg mobile_idle "$mobile_idle" --arg switch_tcp "$switch_tcp" \
-      --arg cpu_enabled "$cpu_enabled" --arg cpg_enabled "$cpg_enabled" --arg cpu_dir "$cpu_dir" --arg cpg_dir "$cpg_dir" \
-      '{instance:$instance,listen:$listen,tcp:$tcp,udp:$udp,subnet:$subnet,cert:$cert,key:$key,auth_b64:$auth_b64,ca:$ca,cert_oid:$cert_oid,group_oid:$group_oid,max_clients:$max_clients,max_same:$max_same,score:$score,ban_time:$ban_time,ban_reset:$ban_reset,dns:$dns,mtu:$mtu,keepalive:$keepalive,dpd:$dpd,mobile:$mobile,discovery:$discovery,routes:$routes,no_routes:$no_routes,tunnel:$tunnel,splitdns:$splitdns,ipv6:$ipv6,ipv6_prefix:$ipv6_prefix,dir:$dir,sock:$sock,pid:$pid,central:$central,central_hook:$central_hook,cookie:$cookie,persistent:$persistent,roaming:$roaming,rekey_time:$rekey_time,rekey_method:$rekey_method,idle:$idle,mobile_idle:$mobile_idle,switch_tcp:$switch_tcp,cpu_enabled:$cpu_enabled,cpg_enabled:$cpg_enabled,cpu_dir:$cpu_dir,cpg_dir:$cpg_dir}' > "$settings"
+      --arg cpu_enabled "$cpu_enabled" --arg cpg_enabled "$cpg_enabled" --arg cpu_dir "$cpu_dir" --arg cpg_dir "$cpg_dir" --arg ocserv_version "$ocserv_version" \
+      '{instance:$instance,listen:$listen,tcp:$tcp,udp:$udp,subnet:$subnet,cert:$cert,key:$key,auth_b64:$auth_b64,ca:$ca,cert_oid:$cert_oid,group_oid:$group_oid,max_clients:$max_clients,max_same:$max_same,score:$score,ban_time:$ban_time,ban_reset:$ban_reset,dns:$dns,mtu:$mtu,keepalive:$keepalive,dpd:$dpd,mobile:$mobile,discovery:$discovery,routes:$routes,no_routes:$no_routes,tunnel:$tunnel,splitdns:$splitdns,ipv6:$ipv6,ipv6_prefix:$ipv6_prefix,dir:$dir,sock:$sock,pid:$pid,central:$central,central_hook:$central_hook,cookie:$cookie,persistent:$persistent,roaming:$roaming,rekey_time:$rekey_time,rekey_method:$rekey_method,idle:$idle,mobile_idle:$mobile_idle,switch_tcp:$switch_tcp,cpu_enabled:$cpu_enabled,cpg_enabled:$cpg_enabled,cpu_dir:$cpu_dir,cpg_dir:$cpg_dir,ocserv_version:$ocserv_version}' > "$settings"
 
     python3 - "$base" "$out" "$settings" <<'PYCFG'
 import base64, json, re, sys
@@ -3055,7 +3202,17 @@ else:
     disable_scalar('cert-user-oid')
     disable_scalar('cert-group-oid')
 set_scalar('max-clients', d['max_clients']); set_scalar('max-same-clients', d['max_same'])
-set_scalar('max-ban-score', d['score']); set_scalar('ban-time', d['ban_time']); set_scalar('ban-reset-time', d['ban_reset'])
+set_scalar('max-ban-score', d['score'])
+def ver_tuple(v):
+    m=re.search(r'(\d+)\.(\d+)\.(\d+)',str(v or ''))
+    return tuple(map(int,m.groups())) if m else (0,0,0)
+if ver_tuple(d.get('ocserv_version')) >= (1,4,1):
+    disable_scalar('min-reauth-time')
+    set_scalar('ban-time', d['ban_time'])
+else:
+    disable_scalar('ban-time')
+    set_scalar('min-reauth-time', d['ban_time'])
+set_scalar('ban-reset-time', d['ban_reset'])
 set_scalar('cookie-timeout', d['cookie'])
 if truth(d['persistent']): set_scalar('persistent-cookies', 'true')
 else: disable_scalar('persistent-cookies')
@@ -3209,7 +3366,11 @@ supplemental_files_menu() {
                 mkdir -p "$dir"; file="${dir%/}/$name"; touch "$file"; chmod 600 "$file"
                 install_available_packages nano
                 editor="${EDITOR:-nano}"; "$editor" "$file"
-                if validate_config "$(instance_config "$instance")"; then reload_instance "$instance" || true; else print_warn "Main config validation failed after editing supplemental file; review the file before reconnecting users."; fi
+                if validate_config "$(instance_config "$instance")"; then
+                    print_ok "Supplemental file saved. ocserv rereads per-user/per-group files for the connecting session; no server reload/restart was performed."
+                else
+                    print_warn "Main config validation failed after editing supplemental file; review the file before reconnecting users."
+                fi
                 ;;
             4) name="$(ask_nonempty "File name to delete")"; safe_name "$name" || { print_err "Invalid file name."; pause; continue; }; file="${dir%/}/$name"; [[ -f "$file" ]] || { print_warn "File not found."; pause; continue; }; ask_yes_no "Delete $file?" "n" && rm -f "$file"; ;;
             0) return 0 ;;
@@ -3333,7 +3494,7 @@ from pathlib import Path
 import re,sys
 path=Path(sys.argv[1]); group=sys.argv[2]; value=sys.argv[3]
 if path.exists(): lines=path.read_text(encoding='utf-8', errors='ignore').splitlines()
-else: lines=[f'# Group supplemental config: {group}', '# Ocserv Manager changes only max-same-clients; other directives may be maintained manually.']
+else: lines=[f'# Group supplemental config: {group}', '# Ocserv Manager may manage max-same-clients and bandwidth; other directives are preserved.']
 pat=re.compile(r'^\s*max-same-clients\s*=')
 idx=[i for i,l in enumerate(lines) if pat.match(l)]
 if value:
@@ -3348,8 +3509,8 @@ path.write_text('\n'.join(lines).rstrip()+'\n', encoding='utf-8')
 PYGROUP
     chmod 600 "$file"
     audit "group-max-same-upsert instance=$instance group=$group max=${max:-inherit}"
-    print_ok "Group saved. Ocserv Manager changed only max-same-clients; other directives in the group file were preserved."
-    reload_instance "$instance" || true
+    print_ok "Group saved. Ocserv Manager changed max-same-clients only in this action; bandwidth and other directives were preserved."
+    print_info "No ocserv reload/restart was performed; supplemental group settings are reread for connecting sessions."
 }
 
 delete_group() {
@@ -3364,7 +3525,7 @@ delete_group() {
         ask_yes_no "Delete only the group supplemental config? User group labels in ocpasswd will remain." "n" || return 0
     fi
     rm -f "$file"; audit "group-delete-config instance=$instance group=$group"; print_ok "Group supplemental config deleted."
-    reload_instance "$instance" || true
+    print_info "No ocserv reload/restart was performed; the change applies when affected users connect/reconnect."
 }
 
 show_groups() {
@@ -3568,6 +3729,265 @@ PY
     rm -f "$tmp"
 }
 
+# -----------------------------------------------------------------------------
+# Per-user / per-group bandwidth limits
+# ocserv uses rx-data-per-sec / tx-data-per-sec in bytes per second.
+# RX is data received by the server from the VPN client (client upload).
+# TX is data transmitted by the server to the VPN client (client download).
+# Supplemental group config is loaded first and user config second, so a user
+# value overrides the group value for the same scalar setting.
+# -----------------------------------------------------------------------------
+bandwidth_mbps_to_bytes() {
+    local mbps="$1"
+    python3 - "$mbps" <<'PYBWCONVERT'
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import sys
+try:
+    mbps=Decimal(sys.argv[1])
+except InvalidOperation:
+    raise SystemExit(2)
+if mbps <= 0:
+    raise SystemExit(2)
+# Network Mbps is decimal megabits/sec. ocserv config expects bytes/sec.
+value=(mbps*Decimal(1000000)/Decimal(8)).quantize(Decimal('1'), rounding=ROUND_HALF_UP)
+print(int(value))
+PYBWCONVERT
+}
+
+bandwidth_bytes_to_mbps() {
+    local value="${1:-}"
+    python3 - "$value" <<'PYBWFMT'
+from decimal import Decimal
+import sys
+s=sys.argv[1].strip()
+if not s:
+    print('inherit')
+    raise SystemExit
+try: n=int(s)
+except Exception:
+    print(s)
+    raise SystemExit
+if n <= 0:
+    print('unlimited override')
+else:
+    v=Decimal(n)*Decimal(8)/Decimal(1000000)
+    out=f"{v:.3f}".rstrip('0').rstrip('.')
+    print(f"{out} Mbps ({n} B/s)")
+PYBWFMT
+}
+
+supplemental_active_scalar() {
+    local file="$1" key="$2"
+    [[ -f "$file" ]] || return 0
+    awk -v k="$key" '
+        BEGIN{IGNORECASE=0}
+        $0 ~ "^[[:space:]]*" k "[[:space:]]*=" {
+            sub("^[[:space:]]*" k "[[:space:]]*=[[:space:]]*", "", $0)
+            sub(/[[:space:]]*(#.*)?$/, "", $0)
+            v=$0
+        }
+        END{if(v!="") print v}
+    ' "$file"
+}
+
+patch_supplemental_bandwidth_file() {
+    local file="$1" label="$2" rx="$3" tx="$4" mode="$5"
+    python3 - "$file" "$label" "$rx" "$tx" "$mode" <<'PYBWPATCH'
+from pathlib import Path
+import os,re,sys,tempfile
+path=Path(sys.argv[1]); label=sys.argv[2]; rx=sys.argv[3]; tx=sys.argv[4]; mode=sys.argv[5]
+if path.exists():
+    lines=path.read_text(encoding='utf-8', errors='ignore').splitlines()
+else:
+    lines=[f'# Supplemental config: {label}', '# Managed safely by Ocserv Manager; unrelated directives are preserved.']
+patterns={
+    'rx': re.compile(r'^\s*rx-data-per-sec\s*='),
+    'tx': re.compile(r'^\s*tx-data-per-sec\s*='),
+}
+values={'rx':rx,'tx':tx}
+for which,key in [('rx','rx-data-per-sec'),('tx','tx-data-per-sec')]:
+    idx=[i for i,line in enumerate(lines) if patterns[which].match(line)]
+    if mode == 'inherit':
+        for i in idx:
+            lines[i]='# ocserv-manager disabled bandwidth (inherit): '+lines[i].lstrip()
+        continue
+    value=values[which]
+    newline=f'{key} = {value}'
+    if idx:
+        lines[idx[0]]=newline
+        for i in idx[1:]:
+            lines[i]='# ocserv-manager disabled duplicate bandwidth: '+lines[i].lstrip()
+    else:
+        lines.append(newline)
+text='\n'.join(lines).rstrip()+'\n'
+path.parent.mkdir(parents=True, exist_ok=True)
+fd,tmp=tempfile.mkstemp(prefix='.'+path.name+'.', dir=str(path.parent))
+os.close(fd)
+try:
+    Path(tmp).write_text(text, encoding='utf-8')
+    os.chmod(tmp,0o600)
+    os.replace(tmp,path)
+finally:
+    try: os.unlink(tmp)
+    except FileNotFoundError: pass
+PYBWPATCH
+}
+
+select_existing_user() {
+    local instance="$1" passwd user
+    passwd="$(passwd_for_instance "$instance")"
+    show_users_file_safe "$instance"
+    while true; do
+        user="$(ask_nonempty "Username")"
+        if ! valid_username "$user"; then print_warn "Invalid username."; continue; fi
+        if grep -qE "^${user//./\\.}:" "$passwd"; then printf '%s\n' "$user"; return 0; fi
+        print_warn "User not found in this instance."
+    done
+}
+
+select_existing_group() {
+    local instance="$1" group
+    show_groups "$instance"
+    while true; do
+        group="$(ask_nonempty "Group name")"
+        if validate_group_name "$group" && list_groups "$instance" | grep -Fxq "$group"; then
+            printf '%s\n' "$group"; return 0
+        fi
+        print_warn "Group not found or invalid."
+    done
+}
+
+configure_bandwidth_limit() {
+    local instance="$1" kind="$2" target="${3:-}" dir file rx_cur tx_cur mode up down rx tx label
+    ensure_supplemental_config_state "$instance"
+    if ! supplemental_feature_enabled "$instance" "$kind"; then
+        print_info "config-per-$kind is disabled; bandwidth overrides cannot apply until it is enabled."
+        if ask_yes_no "Enable config-per-$kind now?" "y"; then
+            set_supplemental_feature "$instance" "$kind" enable || return 1
+        else
+            return 0
+        fi
+    fi
+    if [[ "$kind" == user ]]; then
+        [[ -n "$target" ]] || target="$(select_existing_user "$instance")"
+        dir="$(user_dir "$instance")"; label="user $target"
+    else
+        [[ -n "$target" ]] || target="$(select_existing_group "$instance")"
+        dir="$(group_dir "$instance")"; label="group $target"
+    fi
+    safe_name "$target" || { print_err "Unsafe user/group name."; return 1; }
+    file="${dir%/}/$target"
+    rx_cur="$(supplemental_active_scalar "$file" rx-data-per-sec || true)"
+    tx_cur="$(supplemental_active_scalar "$file" tx-data-per-sec || true)"
+    echo "Current bandwidth for $label:"
+    echo "  Upload   (client -> server / rx-data-per-sec): $(bandwidth_bytes_to_mbps "$rx_cur")"
+    echo "  Download (server -> client / tx-data-per-sec): $(bandwidth_bytes_to_mbps "$tx_cur")"
+    echo
+    mode="$(choose_menu "Bandwidth policy for $label:" \
+        "Set the same upload and download limit (Mbps)" \
+        "Set separate upload and download limits (Mbps)" \
+        "Unlimited override for this $kind (write 0/0; useful to override a limited group)" \
+        "Inherit parent/global policy (remove active bandwidth override)")"
+    case "$mode" in
+        1)
+            up="$(ask_number "Upload/download limit in Mbps (decimal, e.g. 20 or 12.5)" "20")"
+            [[ "$up" != 0 && "$up" != 0.0 ]] || { print_err "Use the explicit Unlimited option instead of a zero Mbps limit."; return 1; }
+            rx="$(bandwidth_mbps_to_bytes "$up")" || { print_err "Invalid bandwidth value."; return 1; }
+            tx="$rx"; mode=set
+            ;;
+        2)
+            up="$(ask_number "Upload limit in Mbps (client -> server)" "10")"
+            down="$(ask_number "Download limit in Mbps (server -> client)" "20")"
+            [[ "$up" != 0 && "$up" != 0.0 && "$down" != 0 && "$down" != 0.0 ]] || { print_err "Use Unlimited override instead of zero Mbps."; return 1; }
+            rx="$(bandwidth_mbps_to_bytes "$up")" || { print_err "Invalid upload value."; return 1; }
+            tx="$(bandwidth_mbps_to_bytes "$down")" || { print_err "Invalid download value."; return 1; }
+            mode=set
+            ;;
+        3) rx=0; tx=0; mode=set ;;
+        4) rx=""; tx=""; mode=inherit ;;
+    esac
+    mkdir -p "$dir"; chmod 700 "$dir" 2>/dev/null || true
+    patch_supplemental_bandwidth_file "$file" "$label" "$rx" "$tx" "$mode"
+    chmod 600 "$file"
+    audit "bandwidth-$kind instance=$instance target=$target mode=$mode rx=${rx:-inherit} tx=${tx:-inherit}"
+    print_ok "Bandwidth policy saved for $label. Other directives in $file were preserved."
+    if [[ "$mode" == inherit ]]; then
+        print_info "This $kind now inherits bandwidth settings from the next applicable layer."
+    else
+        echo "Effective explicit values written:"
+        echo "  Upload:   $(bandwidth_bytes_to_mbps "$rx")"
+        echo "  Download: $(bandwidth_bytes_to_mbps "$tx")"
+    fi
+    print_info "No ocserv restart/reload was performed: supplemental files are read for user sessions. Existing connected sessions may keep their current worker limits until reconnect."
+}
+
+show_bandwidth_target() {
+    local instance="$1" kind="$2" target="${3:-}" dir file rx tx
+    if [[ "$kind" == user ]]; then
+        [[ -n "$target" ]] || target="$(select_existing_user "$instance")"; dir="$(user_dir "$instance")"
+    else
+        [[ -n "$target" ]] || target="$(select_existing_group "$instance")"; dir="$(group_dir "$instance")"
+    fi
+    file="${dir%/}/$target"
+    rx="$(supplemental_active_scalar "$file" rx-data-per-sec || true)"
+    tx="$(supplemental_active_scalar "$file" tx-data-per-sec || true)"
+    echo "==== Bandwidth: $kind $target ===="
+    echo "File: $file"
+    echo "Upload   (rx-data-per-sec): $(bandwidth_bytes_to_mbps "$rx")"
+    echo "Download (tx-data-per-sec): $(bandwidth_bytes_to_mbps "$tx")"
+    if [[ -z "$rx" && -z "$tx" ]]; then
+        [[ "$kind" == user ]] && print_info "No user override: group/global bandwidth applies." || print_info "No group override: global/default bandwidth applies."
+    fi
+}
+
+list_bandwidth_limits() {
+    local instance="$1" kind dir f name rx tx found=0
+    echo "==== Explicit supplemental bandwidth limits: $instance ===="
+    for kind in group user; do
+        [[ "$kind" == user ]] && dir="$(user_dir "$instance")" || dir="$(group_dir "$instance")"
+        echo "-- $kind --"
+        if [[ -d "$dir" ]]; then
+            for f in "$dir"/*; do
+                [[ -f "$f" ]] || continue
+                rx="$(supplemental_active_scalar "$f" rx-data-per-sec || true)"
+                tx="$(supplemental_active_scalar "$f" tx-data-per-sec || true)"
+                [[ -n "$rx" || -n "$tx" ]] || continue
+                found=1; name="$(basename "$f")"
+                printf '%s | upload=%s | download=%s\n' "$name" "$(bandwidth_bytes_to_mbps "$rx")" "$(bandwidth_bytes_to_mbps "$tx")"
+            done
+        fi
+    done
+    (( found == 1 )) || echo "No explicit per-user/per-group bandwidth directives found."
+    echo
+    print_info "Precedence for scalar bandwidth settings: user override > group override > main/global config."
+}
+
+bandwidth_limits_menu() {
+    local instance="$1" choice
+    while true; do
+        echo
+        echo "==== Bandwidth limits: $instance ===="
+        echo "Ocserv native shaping: rx-data-per-sec / tx-data-per-sec (bytes/sec)."
+        echo "Manager input is Mbps; 1 Mbps = 125000 bytes/sec."
+        echo "1) Set/edit group bandwidth"
+        echo "2) Show one group bandwidth"
+        echo "3) Set/edit user bandwidth"
+        echo "4) Show one user bandwidth"
+        echo "5) List all explicit bandwidth limits"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
+        case "$choice" in
+            1) configure_bandwidth_limit "$instance" group; pause ;;
+            2) show_bandwidth_target "$instance" group; pause ;;
+            3) configure_bandwidth_limit "$instance" user; pause ;;
+            4) show_bandwidth_target "$instance" user; pause ;;
+            5) list_bandwidth_limits "$instance"; pause ;;
+            0) return 0 ;;
+            *) print_warn "Invalid selection." ;;
+        esac
+    done
+}
+
 user_management_menu() {
     local instance="$1" choice user mode
     mode="$(state_get "$instance" AUTH_MODE 2>/dev/null || echo imported)"
@@ -3588,7 +4008,8 @@ user_management_menu() {
         echo "9) Connected user count"
         echo "10) Show session client/software information"
         echo "11) Disconnect user"
-        echo "12) config-per-user / config-per-group settings"
+        echo "12) Bandwidth limits (per-user / per-group)"
+        echo "13) config-per-user / config-per-group settings"
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
@@ -3603,7 +4024,8 @@ user_management_menu() {
             9) echo "Connected sessions/users reported: $(connected_users_count "$instance")"; pause ;;
             10) show_session_clients "$instance" || true; pause ;;
             11) user="$(ask_nonempty "Username")"; if occtl_exec "$instance" disconnect user "$user"; then print_ok "Disconnect requested."; else print_err "Disconnect failed."; fi; pause ;;
-            12) supplemental_config_menu "$instance" || true ;;
+            12) bandwidth_limits_menu "$instance" || true ;;
+            13) supplemental_config_menu "$instance" || true ;;
             0) return 0 ;;
             *) print_warn "Invalid selection." ;;
         esac
@@ -3618,14 +4040,16 @@ group_management_menu() {
         echo "1) List groups and settings"
         echo "2) Create/edit group"
         echo "3) Delete group supplemental config"
-        echo "4) config-per-user / config-per-group settings"
+        echo "4) Bandwidth limits (per-group / per-user)"
+        echo "5) config-per-user / config-per-group settings"
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
             1) show_groups "$instance"; pause ;;
             2) create_or_edit_group "$instance"; pause ;;
             3) delete_group "$instance"; pause ;;
-            4) supplemental_config_menu "$instance" ;;
+            4) bandwidth_limits_menu "$instance" ;;
+            5) supplemental_config_menu "$instance" ;;
             0) return 0 ;;
             *) print_warn "Invalid selection." ;;
         esac
@@ -3681,6 +4105,11 @@ create_instance_wizard() {
     choose_dns_servers "$instance"
     configure_limits_and_bans "$instance"
     configure_network_profile "$instance"
+    # New instances use the service-oriented roaming/cookie defaults while keeping the timers/MTU choice just entered above.
+    local _ka _dpd _mdpd _mtud _mtu
+    _ka="$(state_get "$instance" KEEPALIVE)"; _dpd="$(state_get "$instance" DPD)"; _mdpd="$(state_get "$instance" MOBILE_DPD)"; _mtud="$(state_get "$instance" MTU_DISCOVERY)"; _mtu="$(state_get "$instance" MTU)"
+    set_recommended_stability_state "$instance"
+    state_set "$instance" KEEPALIVE "$_ka"; state_set "$instance" DPD "$_dpd"; state_set "$instance" MOBILE_DPD "$_mdpd"; state_set "$instance" MTU_DISCOVERY "$_mtud"; state_set "$instance" MTU "$_mtu"
     configure_routing_profile "$instance"
     ensure_ip_forwarding_default
     configure_firewall_mode "$instance"
@@ -12403,6 +12832,11 @@ show_connection_stability_values() {
     echo "- idle-timeout: $(state_get "$instance" IDLE_TIMEOUT)"
     echo "- mobile-idle-timeout: $(state_get "$instance" MOBILE_IDLE_TIMEOUT)"
     echo "- rekey-time/method: $(state_get "$instance" REKEY_TIME) / $(state_get "$instance" REKEY_METHOD)"
+    local _conf _rate _session
+    _conf="$(instance_config "$instance")"
+    _rate="$(parse_config_value "$_conf" rate-limit-ms 2>/dev/null || true)"; _session="$(parse_config_value "$_conf" session-timeout 2>/dev/null || true)"
+    echo "- rate-limit-ms: ${_rate:-unset}"
+    echo "- session-timeout: ${_session:-disabled/unset}"
     local _dpd _mdpd
     _dpd="$(state_get "$instance" DPD 2>/dev/null || echo 0)"
     _mdpd="$(state_get "$instance" MOBILE_DPD 2>/dev/null || echo 0)"
@@ -12449,7 +12883,7 @@ apply_connection_stability_profile() {
             state_set "$instance" MOBILE_DPD 60
             state_set "$instance" SWITCH_TO_TCP_TIMEOUT 25
             state_set "$instance" MTU_DISCOVERY true
-            state_set "$instance" COOKIE_TIMEOUT 300
+            state_set "$instance" COOKIE_TIMEOUT 86400
             state_set "$instance" PERSISTENT_COOKIES false
             state_set "$instance" DENY_ROAMING false
             state_set "$instance" IDLE_TIMEOUT disabled
@@ -12541,22 +12975,19 @@ custom_connection_stability_settings() {
 }
 
 apply_recommended_stale_session_profile_cli_one() {
-    local instance="$1" tmp old_state old_conf service was_active=0
+    local instance="$1" tmp old_state old_conf
     [[ "$(state_get "$instance" MANAGED 2>/dev/null || echo 0)" == 1 ]] || { print_err "Instance is not manager-owned: $instance"; return 1; }
     old_state="$(mktemp /tmp/ocserv-stale-state.${instance}.XXXXXX)"
     old_conf="$(mktemp /tmp/ocserv-stale-conf.${instance}.XXXXXX)"
     [[ -f "$(instance_state_file "$instance")" ]] && cp -a "$(instance_state_file "$instance")" "$old_state" || : > "$old_state"
     [[ -f "$(instance_config "$instance")" ]] && cp -a "$(instance_config "$instance")" "$old_conf" || : > "$old_conf"
-    service="$(instance_service "$instance")"
-    systemctl is-active --quiet "$service" 2>/dev/null && was_active=1 || true
-
     ensure_connection_state_defaults "$instance"
     state_set "$instance" KEEPALIVE 30
     state_set "$instance" DPD 30
     state_set "$instance" MOBILE_DPD 60
     state_set "$instance" SWITCH_TO_TCP_TIMEOUT 25
     state_set "$instance" MTU_DISCOVERY true
-    state_set "$instance" COOKIE_TIMEOUT 300
+    state_set "$instance" COOKIE_TIMEOUT 86400
     state_set "$instance" PERSISTENT_COOKIES false
     state_set "$instance" DENY_ROAMING false
     state_set "$instance" IDLE_TIMEOUT disabled
@@ -12571,19 +13002,16 @@ apply_recommended_stale_session_profile_cli_one() {
         rm -f "$tmp" "$old_state" "$old_conf"
         return 1
     fi
-    install -m 600 "$tmp" "$(instance_config "$instance")"
-    rm -f "$tmp"
-    if (( was_active == 1 )) && ! restart_service_bounded "$service" 15; then
-        print_err "Service restart failed; restoring the previous connection settings for $instance."
+    if ! transactional_replace_config "$instance" "$tmp"; then
+        print_err "Could not safely apply the recommended connection profile for $instance."
         [[ -s "$old_state" ]] && cp -a "$old_state" "$(instance_state_file "$instance")"
         [[ -s "$old_conf" ]] && cp -a "$old_conf" "$(instance_config "$instance")"
-        restart_service_bounded "$service" 15 >/dev/null 2>&1 || true
-        rm -f "$old_state" "$old_conf"
+        rm -f "$tmp" "$old_state" "$old_conf"
         return 1
     fi
-    rm -f "$old_state" "$old_conf"
-    audit "stale-session-fix instance=$instance keepalive=30 dpd=30 mobile_dpd=60"
-    print_ok "$instance: recommended stale-session detection applied (keepalive=30, dpd=30, mobile-dpd=60)."
+    rm -f "$tmp" "$old_state" "$old_conf"
+    audit "stale-session-fix instance=$instance keepalive=30 dpd=30 mobile_dpd=60 cookie_timeout=86400"
+    print_ok "$instance: recommended service stability profile applied (30/30/60 timers, cookie 86400, roaming allowed, persistent cookies off)."
     return 0
 }
 
@@ -12603,16 +13031,354 @@ apply_recommended_stale_session_profile_cli() {
     apply_recommended_stale_session_profile_cli_one "$target"
 }
 
+
+doctor_read_supplemental_scalar() {
+    local file="$1" key="$2"
+    [[ -f "$file" ]] || return 0
+    sed -nE "s/^[[:space:]]*${key//-/\\-}[[:space:]]*=[[:space:]]*([^#[:space:]]+).*/\\1/p" "$file" | tail -n1
+}
+
+doctor_supplemental_audit() {
+    local instance="$1" kind dir f name idle midle sess maxs noudp rx tx found=0
+    for kind in group user; do
+        if [[ "$kind" == group ]]; then dir="$(group_dir "$instance")"; else dir="$(user_dir "$instance")"; fi
+        [[ -d "$dir" ]] || continue
+        for f in "$dir"/*; do
+            [[ -f "$f" ]] || continue
+            name="$(basename "$f")"
+            idle="$(doctor_read_supplemental_scalar "$f" idle-timeout)"
+            midle="$(doctor_read_supplemental_scalar "$f" mobile-idle-timeout)"
+            sess="$(doctor_read_supplemental_scalar "$f" session-timeout)"
+            maxs="$(doctor_read_supplemental_scalar "$f" max-same-clients)"
+            noudp="$(doctor_read_supplemental_scalar "$f" no-udp)"
+            rx="$(doctor_read_supplemental_scalar "$f" rx-data-per-sec)"
+            tx="$(doctor_read_supplemental_scalar "$f" tx-data-per-sec)"
+            if [[ -n "$idle$midle$sess$maxs$noudp$rx$tx" ]]; then
+                found=1
+                printf '%s %s:' "$kind" "$name"
+                [[ -n "$maxs" ]] && printf ' max-same=%s' "$maxs"
+                [[ -n "$idle" ]] && printf ' idle=%s' "$idle"
+                [[ -n "$midle" ]] && printf ' mobile-idle=%s' "$midle"
+                [[ -n "$sess" ]] && printf ' session-timeout=%s' "$sess"
+                [[ -n "$noudp" ]] && printf ' no-udp=%s' "$noudp"
+                [[ -n "$rx" ]] && printf ' upload(rx)=%sB/s' "$rx"
+                [[ -n "$tx" ]] && printf ' download(tx)=%sB/s' "$tx"
+                echo
+                [[ -n "$idle$midle$sess" ]] && print_warn "$kind '$name' contains an active timeout override; this can disconnect that scope even when the main config has idle/session timeouts disabled."
+            fi
+        done
+    done
+    (( found == 1 )) || print_info "No active timeout/max-same/no-udp/bandwidth overrides found in supplemental files."
+}
+
+doctor_central_health() {
+    local instance="$1" envf api token timeout_s fail node service health tmp code elapsed
+    [[ "$(state_get "$instance" CENTRAL_ENABLED 2>/dev/null || echo 0)" == 1 ]] || { print_info "Central integration: disabled for this instance."; return 0; }
+    envf="$(central_env_file "$instance")"
+    [[ -r "$envf" ]] || { print_err "Central integration is enabled but env file is missing: $envf"; return 1; }
+    api="$(central_read_env_value "$envf" API_URL || true)"; token="$(central_read_env_value "$envf" API_TOKEN || true)"
+    timeout_s="$(central_read_env_value "$envf" API_TIMEOUT || true)"; timeout_s="${timeout_s:-5}"
+    fail="$(central_read_env_value "$envf" FAIL_MODE || true)"; fail="${fail:-closed}"
+    node="$(central_read_env_value "$envf" NODE_ID || true)"
+    service="$(central_agent_service "$instance")"
+    echo "Central: API=${api:-missing} | fail-mode=$fail | timeout=${timeout_s}s | node=${node:-auto}"
+    [[ "$fail" == closed ]] && print_ok "Central fail-closed enforcement is active." || print_warn "Central fail mode is '$fail'; quota/session enforcement can be bypassed during API failure."
+    systemctl is-active --quiet "$service" 2>/dev/null && print_ok "Central live agent is active." || print_warn "Central live agent is not active."
+    [[ -n "$api" && -n "$token" ]] || { print_err "Central API URL/token missing."; return 1; }
+    tmp="$(mktemp)"
+    elapsed="$(curl -sS -o "$tmp" -w '%{time_total}' -m "$timeout_s" -H "X-API-Token: $token" "$api/health" 2>/dev/null || true)"
+    if jq -e '.ok == true' "$tmp" >/dev/null 2>&1; then
+        print_ok "Central /health responded successfully in ${elapsed:-?}s."
+    else
+        print_err "Central /health did not return a valid healthy response. With fail-closed, new sessions may be refused until this is fixed."
+        rm -f "$tmp"; return 1
+    fi
+    rm -f "$tmp"
+}
+
+doctor_version_check() {
+    local installed latest
+    installed="$(installed_ocserv_version)"
+    latest="$(online_ocserv_latest_stable 2>/dev/null || true)"
+    echo "ocserv version: ${installed:-unknown}; latest stable release online: ${latest:-unavailable}"
+    if [[ -z "$installed" ]]; then print_err "Could not determine ocserv version."; return 1; fi
+
+    # Historical fix thresholds are intentionally fixed facts, not claims about
+    # the current latest version. They remain useful even after newer releases.
+    if ! version_ge "$installed" "$OCSERV_PASSWORD_RETRY_FIXED"; then
+        print_warn "Installed ocserv predates $OCSERV_PASSWORD_RETRY_FIXED. That release fixed the known bug where a correct password could be rejected after a wrong-password attempt in the same session."
+    fi
+    if ! version_ge "$installed" "$OCSERV_SILENT_CLIENT_FIX_VERSION"; then
+        print_warn "Installed ocserv predates $OCSERV_SILENT_CLIENT_FIX_VERSION, which includes the silent-client worker-hang and relevant production/security fixes introduced in that release."
+    fi
+
+    if [[ -z "$latest" ]]; then
+        print_warn "Could not query the official GitLab Releases API. Latest-version status is UNKNOWN; Doctor will not substitute a hard-coded version as 'latest'."
+        return 0
+    fi
+    if version_ge "$latest" "$installed" && [[ "$(version_core "$latest")" != "$(version_core "$installed")" ]]; then
+        print_info "A newer stable upstream release is available: $latest (online GitLab Releases lookup; report only, no automatic upgrade)."
+    elif [[ "$(version_core "$latest")" == "$(version_core "$installed")" ]]; then
+        print_ok "Installed ocserv matches the latest stable upstream release: $latest."
+    elif version_ge "$installed" "$latest"; then
+        print_info "Installed ocserv ($installed) is newer than the latest plain stable release returned online ($latest); it may be a distro/backport/custom build."
+    fi
+}
+
+doctor_log_summary() {
+    local instance="$1" svc tmp
+    svc="$(instance_service "$instance")"; tmp="$(mktemp)"
+    journalctl -u "$svc" --since '-24 hours' -n 3000 --no-pager 2>/dev/null >"$tmp" || true
+    python3 - "$tmp" <<'PYDOCLOG'
+import re,sys
+text=open(sys.argv[1],encoding='utf-8',errors='ignore').read().splitlines()
+patterns={
+ 'authentication/password': re.compile(r'auth(?:entication)?.*(?:fail|denied)|login failed|wrong password|password.*(?:fail|incorrect)',re.I),
+ 'ban/rate': re.compile(r'\bban(?:ned|ning)?\b|ban score|rate.limit',re.I),
+ 'worker/seccomp': re.compile(r'worker.*(?:crash|segfault|hang|killed)|seccomp|namespace.*fail',re.I),
+ 'DTLS/UDP/GnuTLS': re.compile(r'dtls|gnutls.*(?:error|fatal)|udp.*(?:fail|error|timeout)',re.I),
+ 'connect-script/Central': re.compile(r'connect.script|disconnect.script|ocserv-manager-central|central.*(?:fail|error|denied)',re.I),
+}
+for name,p in patterns.items():
+    hits=[x for x in text if p.search(x)]
+    print(f'{name}: {len(hits)} event(s) in sampled last 24h')
+    for line in hits[-3:]: print('  '+line[-360:])
+PYDOCLOG
+    rm -f "$tmp"
+}
+
+stability_doctor_instance() {
+    local instance="$1" conf svc rate idle midle session persistent roam mtu_disc isolate central group_has_limits=0
+    conf="$(instance_config "$instance")"; svc="$(instance_service "$instance")"
+    echo "==== Stability Doctor: $instance ===="
+    doctor_version_check || true
+    validate_config "$conf" >/dev/null 2>&1 && print_ok "ocserv configuration validates." || print_err "ocserv configuration validation FAILED."
+    systemctl is-active --quiet "$svc" 2>/dev/null && print_ok "$svc is active." || print_err "$svc is not active."
+    occtl_exec "$instance" show status >/dev/null 2>&1 && print_ok "occtl control socket responds." || print_warn "occtl control socket did not respond."
+    echo "Active sessions reported by occtl: $(connected_users_count "$instance" 2>/dev/null || echo unknown)"
+    rate="$(parse_config_value "$conf" rate-limit-ms 2>/dev/null || true)"
+    idle="$(parse_config_value "$conf" idle-timeout 2>/dev/null || true)"; midle="$(parse_config_value "$conf" mobile-idle-timeout 2>/dev/null || true)"; session="$(parse_config_value "$conf" session-timeout 2>/dev/null || true)"
+    persistent="$(parse_config_value "$conf" persistent-cookies 2>/dev/null || true)"; roam="$(parse_config_value "$conf" deny-roaming 2>/dev/null || true)"; mtu_disc="$(parse_config_value "$conf" try-mtu-discovery 2>/dev/null || true)"; isolate="$(parse_config_value "$conf" isolate-workers 2>/dev/null || true)"
+    echo "Main config: rate-limit-ms=${rate:-unset}; idle-timeout=${idle:-disabled/unset}; mobile-idle-timeout=${midle:-disabled/unset}; session-timeout=${session:-disabled/unset}"
+    echo "Main config: persistent-cookies=${persistent:-false/unset}; deny-roaming=${roam:-false/unset}; try-mtu-discovery=${mtu_disc:-unset}; isolate-workers=${isolate:-unset/default}"
+    [[ -z "$idle$midle$session" ]] && print_ok "Main idle/mobile/session timeout directives are unset (disabled)." || print_warn "At least one main timeout directive is active; review whether intentional."
+    [[ "$persistent" != true ]] && print_ok "Persistent cookies are not enabled." || print_warn "persistent-cookies=true keeps cookies valid after manual disconnect until expiration."
+    [[ "$roam" != true ]] && print_ok "Roaming between client public IPs is allowed." || print_info "deny-roaming=true is active."
+    [[ "$mtu_disc" == true ]] && print_ok "MTU discovery is enabled as selected for the service profile." || print_info "MTU discovery is not enabled."
+    [[ "$isolate" != false ]] && print_ok "Worker isolation is not explicitly disabled." || print_warn "isolate-workers=false is active; security isolation is reduced."
+    echo
+    echo "Supplemental per-group/per-user audit:"
+    doctor_supplemental_audit "$instance"
+    if [[ "$(state_get "$instance" CENTRAL_ENABLED 2>/dev/null || echo 0)" == 1 ]] && grep -RqsE '^[[:space:]]*max-same-clients[[:space:]]*=' "$(group_dir "$instance")" 2>/dev/null; then
+        print_warn "Dual session enforcement detected: Central is enabled and at least one group also has local max-same-clients. This is supported, but a reconnect can be rejected by either layer; use User Diagnosis to identify which one."
+    fi
+    echo
+    doctor_central_health "$instance" || true
+    echo
+    doctor_log_summary "$instance"
+    echo
+    print_info "Doctor is evidence-based: it reports confirmed configuration/runtime facts and labels ambiguous conditions as warnings rather than guessing a root cause."
+}
+
+doctor_ocpasswd_user_line() {
+    local instance="$1" user="$2" passwd
+    passwd="$(passwd_for_instance "$instance")"; [[ -r "$passwd" ]] || return 1
+    awk -F: -v u="$user" '$1==u {print; exit}' "$passwd"
+}
+
+doctor_user_local_sessions() {
+    local instance="$1" user="$2" tmp
+    tmp="$(mktemp)"
+    if ! occtl_json "$instance" show users >"$tmp" 2>/dev/null; then rm -f "$tmp"; echo 0; return; fi
+    python3 - "$tmp" "$user" <<'PYDUS'
+import json,sys
+try: d=json.load(open(sys.argv[1],encoding='utf-8')); u=sys.argv[2]
+except Exception: print(0); raise SystemExit
+if isinstance(d,dict):
+    items=d.get('users')
+    if items is None: items=list(d.values())
+elif isinstance(d,list): items=d
+else: items=[]
+if isinstance(items,dict): items=list(items.values())
+count=0
+for x in items:
+    if not isinstance(x,dict): continue
+    name=str(x.get('Username') or x.get('username') or x.get('user') or '')
+    if name==u: count+=1
+print(count)
+PYDUS
+    rm -f "$tmp"
+}
+
+doctor_central_user_json() {
+    local instance="$1" user="$2" envf api token timeout_s encoded
+    [[ "$(state_get "$instance" CENTRAL_ENABLED 2>/dev/null || echo 0)" == 1 ]] || return 2
+    envf="$(central_env_file "$instance")"; [[ -r "$envf" ]] || return 1
+    api="$(central_read_env_value "$envf" API_URL || true)"; token="$(central_read_env_value "$envf" API_TOKEN || true)"; timeout_s="$(central_read_env_value "$envf" API_TIMEOUT || true)"; timeout_s="${timeout_s:-5}"
+    [[ -n "$api" && -n "$token" ]] || return 1
+    encoded="$(python3 - "$user" <<'PYURL'
+import sys,urllib.parse
+print(urllib.parse.quote(sys.argv[1],safe=''))
+PYURL
+)"
+    curl -fsS -m "$timeout_s" -H "X-API-Token: $token" "$api/user/$encoded"
+}
+
+doctor_effective_local_maxsame() {
+    local instance="$1" user="$2" groups="$3" ufile g value="" found="" count=0
+    ufile="$(user_dir "$instance")/$user"
+    value="$(doctor_read_supplemental_scalar "$ufile" max-same-clients)"
+    [[ -n "$value" ]] && { echo "$value (per-user)"; return; }
+    IFS=',' read -r -a _docgroups <<<"$groups"
+    for g in "${_docgroups[@]}"; do
+        [[ -n "$g" && "$g" != '*' ]] || continue
+        value="$(doctor_read_supplemental_scalar "$(group_dir "$instance")/$g" max-same-clients)"
+        if [[ -n "$value" ]]; then
+            ((count+=1)); found+="${found:+, }$g=$value"
+        fi
+    done
+    if (( count == 1 )); then echo "${found#*=} (group:${found%%=*})"; return; fi
+    if (( count > 1 )); then echo "selected-group-dependent ($found)"; return; fi
+    value="$(parse_config_value "$(instance_config "$instance")" max-same-clients 2>/dev/null || true)"
+    echo "${value:-0} (main/global)"
+}
+
+stability_doctor_user() {
+    local instance="$1" user="${2:-}" line groups hash local_sessions maxlocal cj tmp svc envf node_id recent
+    [[ -n "$user" ]] || user="$(ask_nonempty "Username to diagnose")"
+    echo "==== User Connection Diagnosis: $instance / $user ===="
+    line="$(doctor_ocpasswd_user_line "$instance" "$user" || true)"
+    if [[ -z "$line" ]]; then
+        print_err "CONFIRMED: username is not present in this instance's ocpasswd file. Plain authentication for this username cannot succeed here."
+        return 0
+    fi
+    groups="$(printf '%s' "$line" | cut -d: -f2)"; hash="$(printf '%s' "$line" | cut -d: -f3-)"
+    echo "ocpasswd groups: ${groups:-none}"
+    if [[ "$hash" == '!'* || "$hash" == '*' || -z "$hash" ]]; then print_err "CONFIRMED: local password entry appears locked/disabled/empty."; else print_ok "Local ocpasswd entry exists and is not visibly locked."; fi
+    local_sessions="$(doctor_user_local_sessions "$instance" "$user")"
+    maxlocal="$(doctor_effective_local_maxsame "$instance" "$user" "$groups")"
+    echo "Local active sessions (occtl): $local_sessions"
+    echo "Effective local max-same-clients: $maxlocal"
+    if [[ "$maxlocal" =~ ^([0-9]+) && "${BASH_REMATCH[1]}" -gt 0 && "$local_sessions" -ge "${BASH_REMATCH[1]}" ]]; then
+        print_warn "LOCAL LIMIT SATURATED: ocserv can reject another connection before/independently of Central."
+    fi
+    tmp="$(mktemp)"
+    if doctor_central_user_json "$instance" "$user" >"$tmp" 2>/dev/null; then
+        echo "Central user state:"
+        jq '{user:.user, expired:.expired, limits:.limits, active_sessions:.active_sessions}' "$tmp" 2>/dev/null || cat "$tmp"
+        if jq -e '.user.disabled == 1 or .user.disabled == true' "$tmp" >/dev/null 2>&1; then print_err "CONFIRMED CENTRAL DENIAL: user is disabled."; fi
+        if jq -e '.expired == true' "$tmp" >/dev/null 2>&1; then print_err "CONFIRMED CENTRAL DENIAL: account is expired."; fi
+        if jq -e '.limits.exhausted == true' "$tmp" >/dev/null 2>&1; then print_err "CONFIRMED CENTRAL DENIAL: quota is exhausted."; fi
+        local _ac _ms
+        _ac="$(jq -r '.active_sessions|length' "$tmp" 2>/dev/null || echo 0)"; _ms="$(jq -r '.limits.max_sessions // 0' "$tmp" 2>/dev/null || echo 0)"
+        if [[ "$_ms" =~ ^[0-9]+$ && "$_ac" =~ ^[0-9]+$ && "$_ms" -gt 0 && "$_ac" -ge "$_ms" ]]; then
+            print_warn "CENTRAL LIMIT SATURATED: active sessions=$_ac / max=$_ms. This may be legitimate usage or stale state; compare node/session details above before changing limits."
+        fi
+    else
+        if [[ "$(state_get "$instance" CENTRAL_ENABLED 2>/dev/null || echo 0)" == 1 ]]; then
+            print_warn "Central user state could not be queried. Because this integration is fail-closed, API failure can refuse new connections."
+        else
+            print_info "Central is disabled for this instance."
+        fi
+    fi
+    rm -f "$tmp"
+    svc="$(instance_service "$instance")"
+    echo
+    echo "Recent log lines containing this username (last 2 hours, up to 30):"
+    journalctl -u "$svc" --since '-2 hours' --no-pager 2>/dev/null | grep -F -- "$user" | tail -n 30 || true
+    echo
+    print_info "Interpretation: explicit disabled/expired/quota/local-limit/Central-limit findings above are strong evidence. If none appears, use Live login capture to correlate the next failed attempt."
+}
+
+doctor_live_capture() {
+    local instance="$1" user duration svc tmp
+    user="$(ask_nonempty "Username that will attempt to connect")"
+    duration="$(ask_integer "Capture window seconds" "45" 10 180)"; svc="$(instance_service "$instance")"; tmp="$(mktemp)"
+    print_info "Live capture started for $duration seconds. Have the user attempt one connection during this window."
+    timeout "$duration" journalctl -u "$svc" -f -n 0 --no-pager >"$tmp" 2>/dev/null || true
+    echo "==== Matching live events for $user ===="
+    grep -F -- "$user" "$tmp" | tail -n 80 || true
+    echo "==== Other authentication/DTLS/Central events in the same window ===="
+    grep -Ei 'auth|password|login|ban|dtls|gnutls|connect-script|ocserv-manager-central|worker.*(fail|error|crash|hang)' "$tmp" | tail -n 80 || true
+    rm -f "$tmp"
+    echo
+    stability_doctor_user "$instance" "$user"
+}
+
+doctor_no_udp_test() {
+    local instance="$1" user file marker='# ocserv-manager-doctor: temporary no-udp test' mode tmp
+    [[ "$(state_get "$instance" CONFIG_PER_USER_ENABLED 2>/dev/null || echo 0)" == 1 ]] || { print_err "config-per-user is disabled; temporary per-user DTLS isolation cannot be applied safely."; return 1; }
+    user="$(ask_nonempty "Username for temporary TCP-only/DTLS isolation test")"
+    doctor_ocpasswd_user_line "$instance" "$user" >/dev/null 2>&1 || { print_err "Username is not present in this instance's ocpasswd file."; return 1; }
+    file="$(user_dir "$instance")/$user"
+    mkdir -p "$(dirname "$file")"
+    echo "1) Enable temporary no-udp=true for this user"
+    echo "2) Remove only the Doctor-managed temporary no-udp test"
+    echo "0) Cancel"
+    read -r -p "Select: " mode || true
+    case "$mode" in
+        1)
+            if grep -qE '^[[:space:]]*no-udp[[:space:]]*=' "$file" 2>/dev/null; then print_info "An active manual no-udp directive already exists; Doctor will not override or take ownership of it."; return 0; fi
+            { [[ -f "$file" ]] && cat "$file"; echo "$marker"; echo 'no-udp = true'; } >"$file.tmp.$$"
+            mv "$file.tmp.$$" "$file"; chmod 600 "$file"
+            print_ok "Temporary no-udp=true added for $user. It takes effect on the user's next connection; no ocserv restart is required."
+            print_info "After the test, return here and choose Remove so only the Doctor-managed directive is cleaned up."
+            ;;
+        2)
+            python3 - "$file" "$marker" <<'PYNOUDP'
+import sys
+from pathlib import Path
+p=Path(sys.argv[1]); marker=sys.argv[2]
+if not p.exists(): raise SystemExit
+lines=p.read_text(encoding='utf-8',errors='ignore').splitlines(); out=[]; i=0
+while i<len(lines):
+    if lines[i].strip()==marker:
+        i+=1
+        if i<len(lines) and lines[i].strip().lower().replace(' ','')=='no-udp=true': i+=1
+        continue
+    out.append(lines[i]); i+=1
+p.write_text('\n'.join(out).rstrip()+('\n' if out else ''),encoding='utf-8')
+PYNOUDP
+            [[ -s "$file" ]] || rm -f "$file"
+            print_ok "Doctor-managed temporary no-udp test removed for $user."
+            ;;
+        0) return 0 ;;
+        *) print_warn "Invalid selection." ;;
+    esac
+}
+
+stability_doctor_menu() {
+    local instance="$1" choice
+    while true; do
+        echo; echo "==== Stability Doctor: $instance ===="
+        echo "1) Full instance stability audit"
+        echo "2) Diagnose one username"
+        echo "3) Live login-failure capture + username diagnosis"
+        echo "4) Temporary per-user TCP-only (no-udp) isolation test"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
+        case "$choice" in
+            1) stability_doctor_instance "$instance"; pause ;;
+            2) stability_doctor_user "$instance"; pause ;;
+            3) doctor_live_capture "$instance"; pause ;;
+            4) doctor_no_udp_test "$instance"; pause ;;
+            0) return ;;
+            *) print_warn "Invalid selection." ;;
+        esac
+    done
+}
+
 connection_stability_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Connection Stability / Mobile Roaming: $instance ===="
         echo "1) Show current connection timers/settings"
-        echo "2) Apply RECOMMENDED service profile (fast stale-session detection: keepalive 30 / DPD 30 / mobile-DPD 60)"
+        echo "2) Apply RECOMMENDED service profile (30/30/60 timers, cookie 86400, roaming allowed, persistent cookies OFF)"
         echo "3) Apply Aggressive roaming profile (persistent cookies ON; security tradeoff)"
         echo "4) Apply upstream/default connection profile"
         echo "5) Custom connection stability settings"
-        echo "6) Restore a previous stability snapshot"
+        echo "6) Stability Doctor (instance/user/live diagnosis)"
+        echo "7) Restore a previous stability snapshot"
         echo "0) Back"
         read -r -p "Select: " choice || true
         case "$choice" in
@@ -12621,7 +13387,8 @@ connection_stability_menu() {
             3) print_warn "Persistent cookies remain usable until timeout even after manual disconnect. Use only if the roaming/reconnect benefit is worth that tradeoff."; ask_yes_no "Apply aggressive roaming profile?" "n" && apply_connection_stability_profile "$instance" aggressive-roaming; pause ;;
             4) apply_connection_stability_profile "$instance" upstream; pause ;;
             5) custom_connection_stability_settings "$instance"; pause ;;
-            6) restore_stability_snapshot "$instance"; pause ;;
+            6) stability_doctor_menu "$instance" ;;
+            7) restore_stability_snapshot "$instance"; pause ;;
             0) return ;;
             *) print_warn "Invalid selection." ;;
         esac
@@ -14826,7 +15593,7 @@ uninstall_menu() {
 # -----------------------------------------------------------------------------
 show_versions() {
     local latest installed binary
-    latest="$(online_ocserv_tags 2>/dev/null | head -n1 || true)"
+    latest="$(online_ocserv_latest_stable 2>/dev/null || true)"
     echo "Ocserv Manager: $PROGRAM_VERSION"
     echo "Embedded Central Manager: $CENTRAL_EMBEDDED_VERSION"
     if [[ -x "$CENTRAL_MANAGER_BIN" ]]; then
@@ -14837,7 +15604,7 @@ show_versions() {
     installed="$(installed_ocserv_version)"; binary="$(ocserv_bin)"
     echo "Installed ocserv: ${installed:-not-installed}"
     echo "Detected ocserv binary: ${binary:-not-found}"
-    echo "Latest upstream tag found online: ${latest:-unavailable}"
+    echo "Latest stable upstream release found online: ${latest:-unavailable}"
     echo "Install method state:"
     [[ -f "$MANAGER_ETC/ocserv-install.env" ]] && cat "$MANAGER_ETC/ocserv-install.env" || echo "unknown/imported"
 }
@@ -14917,7 +15684,7 @@ main_menu() {
             4) instance="$(choose_instance)" && group_management_menu "$instance";;
             5) certificate_manager;;
             6) backup_menu;;
-            7) status_dashboard; if instance="$(choose_instance 2>/dev/null)"; then if ask_yes_no "Run detailed diagnostics for $instance?" "n"; then run_instance_diagnostics "$instance"; fi; fi; pause;;
+            7) status_dashboard; if instance="$(choose_instance 2>/dev/null)"; then if ask_yes_no "Run detailed diagnostics for $instance?" "n"; then run_instance_diagnostics "$instance"; fi; if ask_yes_no "Open Stability Doctor for $instance?" "n"; then stability_doctor_menu "$instance"; fi; fi; pause;;
             8) central_menu;;
             9) api_menu;;
             10) configure_audit_logging; pause;;
@@ -14948,6 +15715,21 @@ case "${1:-}" in
         ;;
     --fix-stale-sessions)
         need_root; ensure_dirs; apply_recommended_stale_session_profile_cli "${2:-default}"
+        exit $?
+        ;;
+    --stability-doctor)
+        need_root; ensure_dirs
+        instance="${2:-default}"
+        instance_exists "$instance" || { print_err "Unknown instance: $instance"; exit 1; }
+        stability_doctor_instance "$instance"
+        exit $?
+        ;;
+    --diagnose-user)
+        need_root; ensure_dirs
+        instance="${2:-default}"; user="${3:-}"
+        instance_exists "$instance" || { print_err "Unknown instance: $instance"; exit 1; }
+        [[ -n "$user" ]] || { print_err "Usage: $0 --diagnose-user <instance> <username>"; exit 2; }
+        stability_doctor_user "$instance" "$user"
         exit $?
         ;;
     --json-status)
@@ -15014,7 +15796,9 @@ $PROGRAM_NAME $PROGRAM_VERSION
 Usage: $0 [option]
   --version                 Show manager version
   --network-report [instance]  Read-only policy-route/nftables/DNS/firewall report
-  --fix-stale-sessions [instance|all] Apply recommended 30/30/60 connection timers without full reconfigure
+  --fix-stale-sessions [instance|all] Apply recommended service stability profile without forced restart when reload is sufficient
+  --stability-doctor [instance] Full read-only stability/config/Central/log audit
+  --diagnose-user <instance> <username> Diagnose local/Central limits, account state, sessions and recent logs
   --reapply-firewall        Reapply only manager-owned scoped firewall rules (normally used by systemd)
   --json-status [instance]  Print read-only JSON status
   --validate-all            Validate all registered ocserv configs
