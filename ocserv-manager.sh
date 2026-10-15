@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Ocserv Manager v3.9.2 (v3.9.1 maintenance release)
+# Ocserv Manager v3.9.3 (v3.9.1 maintenance series)
 # Multi-instance installer and manager for ocserv on Ubuntu/Debian.
 # Designed as a replacement for the original single-instance ocserv.sh.
 
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="3.9.2"
+PROGRAM_VERSION="3.9.3"
 PROGRAM_NAME="Ocserv Manager"
 OCSERV_SILENT_CLIENT_FIX_VERSION="1.5.0"
 OCSERV_PASSWORD_RETRY_FIXED="1.4.2"
@@ -11522,6 +11522,14 @@ show_preserved_update_settings() {
 }
 
 apply_program_update_without_reconfigure() {
+    # 'ask' preserves the standalone Central menu/CLI behavior. Integrated
+    # Manager updates pass the already confirmed policy ('yes' or 'no') so
+    # Central never asks the same backup question a second time.
+    local update_backup_policy="${1:-ask}"
+    case "$update_backup_policy" in
+        ask|yes|no) ;;
+        *) print_err "Invalid Central update backup policy: $update_backup_policy"; return 2 ;;
+    esac
     need_root
 
     local master_found=0 node_found=0
@@ -11548,11 +11556,21 @@ apply_program_update_without_reconfigure() {
 
     timestamp="$(date +%Y%m%d-%H%M%S)"
     local keep_update_backup=0
-    if ask_yes_no "Create a persistent Central update backup before applying code updates?" "y"; then
-        backup_root="$UPDATE_BACKUP_ROOT/$timestamp-$PROGRAM_VERSION"
+    if [[ "$update_backup_policy" == "ask" ]]; then
+        if ask_yes_no "Create a persistent Central update backup before applying code updates?" "y"; then
+            keep_update_backup=1
+        fi
+    elif [[ "$update_backup_policy" == "yes" ]]; then
         keep_update_backup=1
+        print_info "Central backup policy inherited from the Manager update: keep a persistent backup."
     else
-        backup_root="$(mktemp -d /tmp/ocserv-central-update-rollback.XXXXXX)"
+        print_info "Central backup policy inherited from the Manager update: no persistent backup."
+    fi
+
+    if (( keep_update_backup == 1 )); then
+        backup_root="$UPDATE_BACKUP_ROOT/$timestamp-$PROGRAM_VERSION"
+    else
+        backup_root="$(mktemp -d /tmp/ocserv-central-update-rollback.XXXXXX)" || return 1
         print_warn "No persistent Central update backup will be kept; the temporary rollback bundle exists only for this update."
     fi
 
@@ -11940,7 +11958,9 @@ main_menu() {
 
 case "${1:-}" in
     --apply-update)
-        apply_program_update_without_reconfigure
+        # Optional positional policy: yes/no for integrated Manager updates;
+        # absent means ask as before for standalone Central invocation.
+        apply_program_update_without_reconfigure "${2:-ask}"
         exit $?
         ;;
     --apply-master-update)
@@ -12068,7 +12088,11 @@ EOF
 }
 
 update_embedded_central_without_reconfigure() {
-    local tmp
+    local tmp update_backup_policy="${1:-ask}"
+    case "$update_backup_policy" in
+        ask|yes|no) ;;
+        *) print_err "Invalid integrated Central backup policy: $update_backup_policy"; return 2 ;;
+    esac
     need_root
     tmp="$(mktemp)"
     extract_embedded_central_manager "$tmp"
@@ -12076,7 +12100,7 @@ update_embedded_central_without_reconfigure() {
     "$tmp" --self-test-handlers >/dev/null || { rm -f "$tmp"; print_err "Embedded Central Manager failed handler self-test; update was not applied."; return 1; }
     if [[ -x "$CENTRAL_MANAGER_BIN" || -f /etc/systemd/system/ocserv-central.service || -f /etc/systemd/system/ocserv-central-agent.service ]]; then
         print_info "Applying integrated Central $CENTRAL_EMBEDDED_VERSION code update without reconfigure..."
-        "$tmp" --apply-update
+        "$tmp" --apply-update "$update_backup_policy"
         local rc=$?
         if (( rc == 0 )); then
             install -m 700 "$tmp" "$CENTRAL_MANAGER_BIN"
@@ -15798,10 +15822,13 @@ show_versions() {
 }
 
 apply_manager_self_update() {
-    local backup
+    local backup backup_policy="no"
     bash -n "$0" || { print_err "Current script syntax is invalid; refusing update."; return 1; }
     backup=""
-    if ask_yes_no "Create a persistent backup before updating the Manager code?" "y"; then
+    # This is one coordinated update transaction. The user's answer also
+    # controls persistent backups for an installed integrated Central runtime.
+    if ask_yes_no "Keep a persistent backup for this update (Manager + Central)?" "y"; then
+        backup_policy="yes"
         ensure_backup_root
         backup="$BACKUP_ROOT/manager-update-$(date +%Y%m%d-%H%M%S)"; mkdir -p "$backup"
         [[ -f "$MANAGER_BIN" ]] && cp -a "$MANAGER_BIN" "$backup/ocserv-manager.previous"
@@ -15816,7 +15843,7 @@ apply_manager_self_update() {
     [[ -n "$backup" ]] && print_info "Backup: $backup" || print_info "Backup: not created (declined)"
     if [[ -x "$CENTRAL_MANAGER_BIN" || -f /etc/systemd/system/ocserv-central.service || -f /etc/systemd/system/ocserv-central-agent.service ]]; then
         print_info "An integrated Central installation was detected. Updating its embedded code/components without reconfigure..."
-        update_embedded_central_without_reconfigure || print_warn "Central update reported an error; existing Central configuration was not intentionally reconfigured."
+        update_embedded_central_without_reconfigure "$backup_policy" || print_warn "Central update reported an error; existing Central configuration was not intentionally reconfigured."
     fi
 }
 
