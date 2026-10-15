@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Ocserv Manager v3.9.4 (based on v3.9.3 with Central Service Controls + Timed Pause)
+# Ocserv Manager v3.9.4.1 (hotfix of the full-Central-suspend v3.9.4 branch)
 # Multi-instance installer and manager for ocserv on Ubuntu/Debian.
 # Designed as a replacement for the original single-instance ocserv.sh.
 
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="3.9.4"
+PROGRAM_VERSION="3.9.4.1"
 PROGRAM_NAME="Ocserv Manager"
 OCSERV_SILENT_CLIENT_FIX_VERSION="1.5.0"
 OCSERV_PASSWORD_RETRY_FIXED="1.4.2"
@@ -5567,6 +5567,8 @@ import re
 import sqlite3
 import time
 import uuid
+import threading
+import logging
 from pathlib import Path
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
@@ -5603,6 +5605,22 @@ def human_bytes(value: int | None) -> str | None:
 
 
 app = FastAPI(title="ocserv-central", version="2.4")
+# Log slow API operations without including credentials or usernames.
+SLOW_API_WARN_MS = max(100, int(os.getenv("SLOW_API_WARN_MS", "1000")))
+
+@app.middleware("http")
+async def log_slow_requests(request: Request, call_next):
+    start = time.monotonic()
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = (time.monotonic() - start) * 1000
+        logging.exception("central api_error path=%s elapsed_ms=%.1f", request.url.path, elapsed_ms)
+        raise
+    elapsed_ms = (time.monotonic() - start) * 1000
+    if elapsed_ms >= SLOW_API_WARN_MS:
+        logging.warning("central slow_api path=%s status=%d elapsed_ms=%.1f", request.url.path, response.status_code, elapsed_ms)
+    return response
 
 def now() -> int:
     return int(time.time())
@@ -5614,7 +5632,8 @@ def auth(x_api_token: str | None):
 def db():
     con = sqlite3.connect(DB_PATH, timeout=20)
     con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL")
+    # WAL is persistent. Reissuing journal_mode=WAL on every read/write
+    # connection causes unnecessary schema-lock contention.
     con.execute("PRAGMA synchronous=NORMAL")
     return con
 
@@ -5625,6 +5644,8 @@ def column_exists(con, table, column):
 def init_db():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     with db() as con:
+        # Configure persistent WAL once, at startup, before opening traffic.
+        con.execute("PRAGMA journal_mode=WAL")
         con.execute("""
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
@@ -5656,6 +5677,11 @@ def init_db():
             PRIMARY KEY (node_id, ocserv_id)
         )
         """)
+
+        # Restored databases can have many inactive historical sessions.
+        # Both indices are needed for login count and expiring active sessions.
+        con.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_active ON sessions(username, active)")
+        con.execute("CREATE INDEX IF NOT EXISTS idx_sessions_active_seen ON sessions(active, last_seen)")
 
         con.execute("""
         CREATE TABLE IF NOT EXISTS usage_log (
@@ -5996,7 +6022,7 @@ def delete_user_rows_everywhere(con, usernames: list[str]):
     return totals
 
 
-def sync_ocpasswd_to_db():
+def _sync_ocpasswd_to_db_uncached():
     """Synchronize the optional Master-local fallback ocpasswd.
 
     v20 authority_sources are additive and take precedence for their own
@@ -6065,6 +6091,50 @@ def sync_ocpasswd_to_db():
         "removed_table_rows": removed_table_rows,
         "prune_skipped_reason": prune_skipped_reason,
     }
+
+# The Master-local ocpasswd is a fallback source, not an event to re-write on
+# every VPN login/heartbeat. Keep a short resync window for external DB changes.
+_LOCAL_SYNC_LOCK = threading.RLock()
+_LOCAL_SYNC_CACHE = {"signature": None, "last_success": 0.0, "result": None}
+LOCAL_SYNC_MAX_AGE = max(5, int(os.getenv("LOCAL_SYNC_MAX_AGE", "60")))
+
+def _local_ocpasswd_signature():
+    try:
+        st = os.stat(OCPASSWD_PATH)
+        return (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
+    except FileNotFoundError:
+        return ("missing",)
+    except OSError:
+        # Never conceal a transient file error behind a cached good result.
+        return None
+
+def sync_ocpasswd_to_db(force: bool = False):
+    """Sync only on file change, explicit refresh, or periodic reconciliation.
+
+    Serializes same-process sync calls; preserves authority sources, quotas,
+    usage counters, and the existing REMOVE_MISSING_USERS semantics. A file
+    changing while being read is never marked as safely cached.
+    """
+    with _LOCAL_SYNC_LOCK:
+        before = _local_ocpasswd_signature()
+        cache = _LOCAL_SYNC_CACHE
+        if (not force and before is not None and
+                cache["result"] is not None and cache["signature"] == before and
+                time.monotonic() - cache["last_success"] < LOCAL_SYNC_MAX_AGE):
+            return {**cache["result"], "skipped_unchanged": True}
+        start = time.monotonic()
+        result = _sync_ocpasswd_to_db_uncached()
+        elapsed_ms = (time.monotonic() - start) * 1000
+        if elapsed_ms >= SLOW_API_WARN_MS:
+            logging.warning("central slow_local_sync elapsed_ms=%.1f users=%d",
+                            elapsed_ms, result.get("users_found", -1))
+        after = _local_ocpasswd_signature()
+        if before is not None and before == after:
+            cache.update(signature=after, last_success=time.monotonic(), result=result)
+        else:
+            cache.update(signature=None, last_success=0.0, result=None)
+        return {**result, "skipped_unchanged": False}
+
 
 def group_number(groupname: str | None) -> int:
     if not groupname:
@@ -6387,7 +6457,8 @@ def update_node(node_id: str, request: Request | None = None, sessions_count: in
 
 def cleanup_expired(con, t):
     cutoff = t - SESSION_TTL
-    con.execute("UPDATE sessions SET active=0 WHERE last_seen < ?", (cutoff,))
+    # Crucial: never rewrite already inactive historical rows on each login.
+    con.execute("UPDATE sessions SET active=0 WHERE active=1 AND last_seen < ?", (cutoff,))
 
 class ConnectReq(BaseModel):
     node_id: str
@@ -6461,7 +6532,7 @@ class BulkTrafficReq(BaseModel):
 @app.on_event("startup")
 def startup():
     init_db()
-    sync_ocpasswd_to_db()
+    sync_ocpasswd_to_db(force=True)
 
 # Maintenance override checked on every connect/heartbeat request. The expiration
 # is evaluated at request time, so it survives API restart and requires no timer.
@@ -6492,12 +6563,12 @@ def get_config(x_api_token: str | None = Header(default=None)):
 @app.post("/sync-ocpasswd")
 def sync_ocpasswd(x_api_token: str | None = Header(default=None)):
     auth(x_api_token)
-    return sync_ocpasswd_to_db()
+    return sync_ocpasswd_to_db(force=True)
 
 @app.post("/refresh-now")
 def refresh_now(x_api_token: str | None = Header(default=None)):
     auth(x_api_token)
-    result = sync_ocpasswd_to_db()
+    result = sync_ocpasswd_to_db(force=True)
     return {"ok": True, "action": "sync_ocpasswd_and_reload_limits", "sync": result, "note": "limits.json is read on every quota/session check; API restart is not required for group/quota edits."}
 
 @app.post("/sync-source")
