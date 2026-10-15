@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Ocserv Manager v3.9.3 (v3.9.1 maintenance series)
+# Ocserv Manager v3.9.4 (based on v3.9.3 with Central Service Controls + Timed Pause)
 # Multi-instance installer and manager for ocserv on Ubuntu/Debian.
 # Designed as a replacement for the original single-instance ocserv.sh.
 
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="3.9.3"
+PROGRAM_VERSION="3.9.4"
 PROGRAM_NAME="Ocserv Manager"
 OCSERV_SILENT_CLIENT_FIX_VERSION="1.5.0"
 OCSERV_PASSWORD_RETRY_FIXED="1.4.2"
@@ -36,6 +36,8 @@ CENTRAL_LIB_DIR="/usr/local/lib/ocserv-manager/central"
 CENTRAL_EMBED_STATE="$MANAGER_ETC/central-embedded.env"
 CENTRAL_PROFILE="$CENTRAL_INTEGRATION_DIR/profile.env"
 CENTRAL_EMBEDDED_VERSION="v20.4.4"
+CENTRAL_FULL_STATE="$MANAGER_ETC/central-full-suspend"
+CENTRAL_FULL_LOCK="$MANAGER_ETC/.central-full-suspend.lock"
 TEMPLATE_ROOT="$MANAGER_ETC/templates"
 INSTANCE_BASE_ROOT="$MANAGER_ETC/config-bases"
 STABILITY_BACKUP_ROOT="$BACKUP_ROOT/stability"
@@ -77,8 +79,19 @@ ui_read() {
         detected="$(tput cols 2>/dev/null || true)"
         [[ "$detected" =~ ^[0-9]+$ ]] && (( detected > 20 )) && width="$detected"
     fi
-    if (( ${#prompt} > width - 5 )); then
-        printf '\n%s\n> ' "${prompt% }" >&2
+    if (( ${#prompt} >= width - 2 )); then
+        # Long questions must not wrap into an ambiguous ">" input prompt.
+        # Keep the original answer/default choices visible on their own line.
+        local question="${prompt% }" answer_label="Answer: "
+        if [[ "$question" =~ ^(.*)[[:space:]](\[[^]]+\]:)$ ]]; then
+            question="${BASH_REMATCH[1]}"
+            answer_label="${BASH_REMATCH[2]} "
+        elif [[ "$question" == *': ' ]]; then
+            question="${question%: }"
+        elif [[ "$question" == *: ]]; then
+            question="${question%:}"
+        fi
+        printf '%s\n%s' "$question" "$answer_label" >&2
     else
         printf '%s' "$prompt" >&2
     fi
@@ -93,7 +106,7 @@ ui_read() {
     else
         return 1
     fi
-    [[ -t 0 ]] || printf '\n' >&2
+    # Never emit a second, synthetic newline: the terminal already echoes Enter.
     printf -v "$dest" '%s' "$answer"
 }
 
@@ -1207,6 +1220,7 @@ PYRELOAD
 }
 
 transactional_replace_config() {
+    central_full_assert_normal || return 1
     local instance="$1" newfile="$2" conf service rollback_file="" persistent_backup="" keep_backup=0 apply_mode="restart" connected=0
     conf="$(instance_config "$instance")"
     service="$(instance_service "$instance")"
@@ -4446,6 +4460,7 @@ central_register_detected_instances_for_attach() {
 # Exact modern equivalent of the old v19 "Install both master and node on this server":
 # use the local Master and attach every local ocserv instance as its own source-aware Node.
 central_attach_all_local_master() {
+    central_full_assert_normal || return 1
     local token i failed=0 count=0 token_preview
     token="$(detect_local_central_token)"
     [[ -n "$token" ]] || { print_err "Local Central Master token was not detected. Install/start the Master first."; return 1; }
@@ -4474,6 +4489,7 @@ central_attach_all_local_master() {
 }
 
 central_sync_local_master_profile() {
+    central_full_assert_normal || return 1
     local token i failed=0 updated=0
     token="$(detect_local_central_token)"
     [[ -n "$token" ]] || { print_err "Local Central Master token was not detected."; return 1; }
@@ -4551,6 +4567,7 @@ central_profile_load() {
 }
 
 central_profile_configure() {
+    central_full_assert_normal || return 1
     local api token interval timeout fail auto=0 local_token i attached=0 failed=0
     install_runtime_dependencies; install_available_packages curl jq python3
     local_token="$(detect_local_central_token)"
@@ -4595,6 +4612,7 @@ central_profile_configure() {
 }
 
 central_auto_attach_enabled() {
+    central_full_assert_normal >/dev/null 2>&1 || return 1
     [[ -f "$CENTRAL_PROFILE" ]] || return 1
     central_profile_load
     [[ "${AUTO_ATTACH:-0}" == 1 ]]
@@ -4667,6 +4685,7 @@ PYIMPCENTRAL
 }
 
 central_attach_instance_from_profile() {
+    central_full_assert_normal || return 1
     local instance="$1" interactive="${2:-1}" envf node source_id tmp svc passwd
     [[ -f "$CENTRAL_PROFILE" ]] || {
         if [[ "$interactive" == 1 ]]; then central_profile_configure; else return 1; fi
@@ -4722,6 +4741,7 @@ configure_central_for_instance() {
 }
 
 central_detach_instance() {
+    central_full_assert_normal || return 1
     local instance="$1" quiet="${2:-0}" envf svc api token source_id tmp
     envf="$(central_env_file "$instance")"
     api="" token="" source_id="$(state_get "$instance" CENTRAL_SOURCE_ID 2>/dev/null || true)"
@@ -4792,6 +4812,7 @@ central_instances_status() {
 }
 
 central_force_sync_instance() {
+    central_full_assert_normal || return 1
     local instance="$1" svc
     svc="$(central_agent_service "$instance")"
     [[ "$(state_get "$instance" CENTRAL_ENABLED 2>/dev/null || echo 0)" == 1 ]] || { print_warn "$instance is not attached."; return 1; }
@@ -4801,6 +4822,7 @@ central_force_sync_instance() {
 }
 
 migrate_central_multi_instance_v20_once() {
+    central_full_assert_normal >/dev/null 2>&1 || return 0
     local marker="$CENTRAL_INTEGRATION_DIR/.v20-migrated" i envf node passwd changed=0
     [[ -f "$marker" ]] && return 0
     # Only do work when an existing v2.5-style attachment is present.
@@ -4830,6 +4852,379 @@ migrate_central_multi_instance_v20_once() {
     : > "$marker"; chmod 600 "$marker"
     audit "central-v20-migration changed=$changed"
     print_ok "Existing Central attachments migrated to v20 source-aware agents."
+}
+
+
+# ----------------------------------------------------------------------------
+# FULL Central detachment (local server, reversible; not the timed policy pause)
+# Requires a deliberate ocserv restart when connect/disconnect hooks change.
+# State survives reboot; snapshots are operational rollback, NOT a retained backup.
+# ----------------------------------------------------------------------------
+central_full_is_suspended() { [[ -d "$CENTRAL_FULL_STATE" ]]; }
+central_full_assert_normal() {
+    if central_full_is_suspended; then
+        print_err "Full Central suspension is in progress/active. Resume or recover it before changing Central attachments, ocserv config or performing an integrated update."
+        return 1
+    fi
+}
+central_full_status() {
+    if [[ ! -d "$CENTRAL_FULL_STATE" ]]; then
+        print_info "Full Central integration: NORMAL (not suspended on this host)."
+        return 0
+    fi
+    local phase count units
+    phase="$(cat "$CENTRAL_FULL_STATE/phase" 2>/dev/null || echo unknown)"
+    count="$(wc -l < "$CENTRAL_FULL_STATE/configs.tsv" 2>/dev/null || echo '?')"
+    units="$(wc -l < "$CENTRAL_FULL_STATE/units.tsv" 2>/dev/null || echo '?')"
+    print_warn "Full Central integration state: $phase (local host)."
+    print_info "Recorded ocserv configurations: $count; service units: $units."
+    print_info "Reversible state: $CENTRAL_FULL_STATE (mode 0700); NO user/usage database or source ID was deleted."
+    if [[ "$phase" == pending ]]; then
+        print_warn "An interrupted transition needs recovery. Do not manually start the Central Master until resolved."
+    fi
+}
+
+# Generate a modified config offline, preserving all user-owned hooks.
+# Imported-instance Central blocks are removed; originally preserved user hooks
+# are restored exactly as the legacy imported configuration patch would do.
+central_full_make_offline_config() {
+    local original="$1" output="$2"
+    python3 - "$original" "$output" <<'PYCENTRALOFF'
+import pathlib,re,sys
+original, output=map(pathlib.Path,sys.argv[1:3])
+s=original.read_text(encoding='utf-8')
+lines=s.splitlines(keepends=True)
+start='# BEGIN OCSERV-MANAGER-CENTRAL-IMPORTED'
+end='# END OCSERV-MANAGER-CENTRAL-IMPORTED'
+preserved='# ocserv-manager central preserved: '
+legacy_paths={
+    '/usr/local/sbin/ocserv-central-connect.sh',
+    '/usr/local/sbin/ocserv-central-disconnect.sh',
+    '/usr/local/sbin/ocserv-central-hook.sh',
+}
+result=[]; in_imported=False; imported_count=0; restored_count=0; removed=0
+for line in lines:
+    raw=line.rstrip('\r\n')
+    if raw.strip()==start:
+        if in_imported: raise ValueError('Nested Central imported block')
+        in_imported=True; imported_count+=1
+        continue
+    if raw.strip()==end:
+        if not in_imported: raise ValueError('Unexpected end of imported Central block')
+        in_imported=False
+        continue
+    if in_imported:
+        continue
+    if raw.startswith(preserved):
+        result.append(line.replace(preserved,'',1)); restored_count+=1
+        continue
+    m=re.match(r'^\s*(connect-script|disconnect-script)\s*=\s*(.*)$',raw,re.I)
+    if m:
+        hook=m.group(2).split('#',1)[0].strip().strip('"\'')
+        if hook.startswith('/usr/local/lib/ocserv-manager/central/') or hook in legacy_paths:
+            # No commented Central hook directive left active.
+            result.append('# ocserv-manager full-suspend: '+line)
+            removed+=1
+            continue
+    result.append(line)
+if in_imported: raise ValueError('Unterminated Central imported block')
+if imported_count>1: raise ValueError('Multiple Central imported blocks: manual inspection required')
+if (imported_count or removed or restored_count)==0:
+    # Unrelated instance, preserve exact bytes; never touch its config.
+    output.write_bytes(original.read_bytes())
+else:
+    output.write_text(''.join(result),encoding='utf-8')
+print(f'Central hook directives disabled: {removed}; imported blocks removed: {imported_count}; preserved user directives restored: {restored_count}',file=sys.stderr)
+PYCENTRALOFF
+}
+central_full_atomic_apply() {
+    local dest="$1" src="$2" temp
+    [[ -f "$dest" && ! -L "$dest" ]] || { print_err "Unsafe config path (missing or symlink): $dest"; return 1; }
+    temp="$(mktemp "$(dirname "$dest")/.ocserv-central-switch.XXXXXX")" || return 1
+    if ! cp -a -- "$dest" "$temp" || ! cat -- "$src" > "$temp" || ! mv -f -- "$temp" "$dest"; then
+        rm -f -- "$temp"
+        return 1
+    fi
+}
+central_full_collect_units() {
+    {
+        printf '%s\n' 'ocserv-central.service' 'ocserv-central-agent.service' 'ocserv-central-cleanup.timer' 'ocserv-central-cleanup.service'
+        systemctl list-unit-files --no-legend --no-pager 'ocserv-manager-central@*.service' 2>/dev/null | awk '{print $1}' || true
+        systemctl list-units --all --no-legend --no-pager 'ocserv-manager-central@*.service' 2>/dev/null | awk '{print $1}' || true
+        local i
+        while IFS= read -r i; do
+            [[ "$i" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || continue
+            [[ "$(state_get "$i" CENTRAL_ENABLED 2>/dev/null || echo 0)" == 1 ]] && central_agent_service "$i"
+        done < <(list_instances | sort -u)
+    } | grep -E '^(ocserv-central\.service|ocserv-central-agent\.service|ocserv-central-cleanup\.timer|ocserv-central-cleanup\.service|ocserv-manager-central@[a-zA-Z0-9][a-zA-Z0-9._-]*\.service)$' | sort -u
+}
+central_full_restore_unit() {
+    local unit="$1" was_active="$2" was_enabled="$3"
+    case "$was_enabled" in
+        enabled|linked) systemctl enable "$unit" >/dev/null || return 1 ;;
+        enabled-runtime|linked-runtime) systemctl enable --runtime "$unit" >/dev/null || return 1 ;;
+        disabled) systemctl disable "$unit" >/dev/null || return 1 ;;
+        *) : ;; # static/indirect/alias/masked: do not change boot policy
+    esac
+    if [[ "$was_active" == active && "$unit" != ocserv-central-cleanup.service ]]; then
+        systemctl start "$unit" >/dev/null || return 1
+    elif [[ "$was_active" != not-found ]]; then
+        systemctl stop "$unit" >/dev/null || return 1
+    fi
+}
+central_full_restore_services() {
+    local state="$1" unit active enabled errors=0
+    # Master before Agents when resuming; safe to leave existing inactive off.
+    if [[ -f "$state/units.tsv" ]]; then
+        while IFS=$'\t' read -r unit active enabled; do
+            [[ -n "$unit" ]] || continue
+            [[ "$unit" == ocserv-central.service ]] || continue
+            central_full_restore_unit "$unit" "$active" "$enabled" || errors=$((errors+1))
+        done < "$state/units.tsv"
+        while IFS=$'\t' read -r unit active enabled; do
+            [[ -n "$unit" && "$unit" != ocserv-central.service ]] || continue
+            central_full_restore_unit "$unit" "$active" "$enabled" || errors=$((errors+1))
+        done < "$state/units.tsv"
+    fi
+    (( errors == 0 ))
+}
+central_full_stop_services() {
+    local state="$1" unit active enabled errors=0
+    # Stop agents/timer first, Master last. Never disable a static/indirect unit.
+    while IFS=$'\t' read -r unit active enabled; do
+        [[ "$unit" != ocserv-central.service ]] || continue
+        if [[ "$active" == active ]]; then
+            systemctl stop "$unit" || errors=$((errors+1))
+        fi
+        case "$enabled" in
+            enabled|enabled-runtime|linked|linked-runtime) systemctl disable "$unit" || errors=$((errors+1)) ;;
+        esac
+    done < "$state/units.tsv"
+    while IFS=$'\t' read -r unit active enabled; do
+        [[ "$unit" == ocserv-central.service ]] || continue
+        if [[ "$active" == active ]]; then
+            systemctl stop "$unit" || errors=$((errors+1))
+        fi
+        case "$enabled" in
+            enabled|enabled-runtime|linked|linked-runtime) systemctl disable "$unit" || errors=$((errors+1)) ;;
+        esac
+    done < "$state/units.tsv"
+    # Verify systemd has actually stopped the targeted components.
+    while IFS=$'\t' read -r unit active enabled; do
+        [[ -n "$unit" ]] || continue
+        if systemctl is-active --quiet "$unit" 2>/dev/null; then
+            print_err "Central component is still active after stop: $unit"
+            errors=$((errors+1))
+        fi
+    done < "$state/units.tsv"
+    (( errors == 0 ))
+}
+
+# Restore either original or offline snapshot. Only overwrite when the current
+# bytes are exactly an expected transition snapshot (never destroy later edits).
+central_full_switch_configs() {
+    local state="$1" direction="$2" ix instance conf original offline orig_hash off_hash was_active current target errors=0
+    while IFS=$'\t' read -r ix instance conf orig_hash off_hash was_active; do
+        [[ -n "$ix" ]] || continue
+        original="$state/configs/$ix.original"; offline="$state/configs/$ix.offline"
+        [[ -f "$original" && -f "$offline" && -f "$conf" ]] || { print_err "Missing recorded configuration: $conf"; errors=$((errors+1)); continue; }
+        current="$(sha256sum "$conf" | awk '{print $1}')"
+        if [[ "$direction" == offline ]]; then target="$off_hash"; else target="$orig_hash"; fi
+        if [[ "$current" != "$orig_hash" && "$current" != "$off_hash" ]]; then
+            print_err "Config edited since Central transition began: $conf. Preserving changes; manual reconciliation required."
+            errors=$((errors+1)); continue
+        fi
+        if [[ "$current" != "$target" ]]; then
+            if [[ "$direction" == offline ]]; then
+                central_full_atomic_apply "$conf" "$offline" || { errors=$((errors+1)); continue; }
+            else
+                central_full_atomic_apply "$conf" "$original" || { errors=$((errors+1)); continue; }
+            fi
+        fi
+        # An interrupted restart can leave ocserv running an older in-memory
+        # config even when the on-disk bytes already match our target.
+        # Always reconcile the active daemon on recovery/resume.
+        if [[ "$was_active" == active ]] && ! restart_service_bounded "$(instance_service "$instance")" 30; then
+            print_err "ocserv restart failed for $instance; check journalctl."
+            errors=$((errors+1))
+        fi
+    done < "$state/configs.tsv"
+    (( errors == 0 ))
+}
+central_full_plan() {
+    local state="$1" instance conf unit active enabled i=0 h1 h2
+    mkdir -m 700 -p "$state/configs" || return 1
+    : > "$state/configs.tsv"; : > "$state/units.tsv"
+    while IFS= read -r instance; do
+        [[ "$instance" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || { print_err "Unsafe instance name: $instance"; return 1; }
+        conf="$(instance_config "$instance")"
+        [[ -f "$conf" && ! -L "$conf" && "$conf" != *$'\t'* && "$conf" != *$'\n'* ]] || { print_err "Missing/symlink/unsupported config path: $conf"; return 1; }
+        i=$((i+1))
+        cp -a -- "$conf" "$state/configs/$i.original" || return 1
+        chmod 600 "$state/configs/$i.original"
+        if ! central_full_make_offline_config "$conf" "$state/configs/$i.offline"; then return 1; fi
+        chmod 600 "$state/configs/$i.offline"
+        if cmp -s "$conf" "$state/configs/$i.offline"; then
+            # A registered Central instance with a custom/unrecognized hook must
+            # never be silently treated as detached; stopping the Master could
+            # cause its custom hook to reject VPN logins.
+            if [[ "$(state_get "$instance" CENTRAL_ENABLED 2>/dev/null || echo 0)" == 1 ]] && \
+               grep -Eq '^[[:space:]]*(connect-script|disconnect-script)[[:space:]]*=' "$conf"; then
+                print_err "Central is enabled for $instance but its active hook is not Manager-recognized. Review this custom script before full suspension: $conf"
+                return 1
+            fi
+            rm -f -- "$state/configs/$i.original" "$state/configs/$i.offline"
+            continue  # Unrelated instance: never block its normal config edits.
+        fi
+        validate_config "$state/configs/$i.offline" || { print_err "Offline config validation failed: $conf"; return 1; }
+        h1="$(sha256sum "$state/configs/$i.original" | awk '{print $1}')"
+        h2="$(sha256sum "$state/configs/$i.offline" | awk '{print $1}')"
+        active="$(systemctl is-active "$(instance_service "$instance")" 2>/dev/null || true)"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "$instance" "$conf" "$h1" "$h2" "$active" >> "$state/configs.tsv"
+    done < <(list_instances | sort -u)
+    while IFS= read -r unit; do
+        [[ -n "$unit" ]] || continue
+        active="$(systemctl is-active "$unit" 2>/dev/null || true)"; active="${active:-inactive}"
+        enabled="$(systemctl is-enabled "$unit" 2>/dev/null || true)"; enabled="${enabled:-not-found}"
+        # Skip services neither installed nor running, so restoring them is a no-op.
+        [[ "$enabled" == not-found && "$active" != active ]] && continue
+        printf '%s\t%s\t%s\n' "$unit" "$active" "$enabled" >> "$state/units.tsv"
+    done < <(central_full_collect_units)
+}
+central_full_suspend() (
+    need_root; ensure_dirs
+    command -v flock >/dev/null 2>&1 || { print_err "flock is required."; return 1; }
+    exec 8> "$CENTRAL_FULL_LOCK"
+    flock -n 8 || { print_err "Another full Central switch is in progress."; return 1; }
+    if central_full_is_suspended; then central_full_status; return 1; fi
+    local staging state="$CENTRAL_FULL_STATE"
+    staging="$(mktemp -d "$MANAGER_ETC/.central-suspend-prepare.XXXXXXXX")" || return 1
+    chmod 700 "$staging"
+    if ! central_full_plan "$staging"; then
+        rm -rf -- "$staging"; print_err "Preparation/validation failed: no changes were applied."; return 1
+    fi
+    print_warn "FULL local suspension will remove Central login hooks, restart active ocserv instances (CONNECTED USERS WILL DISCONNECT), and stop/disable the local Master and Agents at boot."
+    print_warn "No Central DB, users, limits, usage logs, source IDs, or agent configuration will be deleted."
+    print_warn "If this Master serves OTHER servers, their logins may fail with fail-closed! Suspend integration on those nodes separately."
+    print_warn "Restarting ocserv can affect CUSTOM hooks, certificate auth and sessions; inspect the offline configs before production rollout."
+    if ! ask_yes_no "Proceed with FULL Central suspension and possible VPN disconnections?" "n"; then
+        rm -rf -- "$staging"; print_info "Cancelled; no changes made."; return 0
+    fi
+    printf 'pending\n' > "$staging/phase"
+    if ! mv -- "$staging" "$state"; then rm -rf -- "$staging"; return 1; fi
+    if ! central_full_switch_configs "$state" offline || ! central_full_stop_services "$state"; then
+        print_err "Full suspension did not finish. Attempting rollback to original state."
+        local rc=0
+        central_full_switch_configs "$state" original || rc=1
+        central_full_restore_services "$state" || rc=1
+        if (( rc == 0 )); then rm -rf -- "$state"; print_warn "Rolled back; the previous integration is restored."; else
+            print_err "Rollback incomplete. Recovery snapshots preserved at $state. Run --central-full-recover before further changes."
+        fi
+        return 1
+    fi
+    printf 'suspended\n' > "$state/phase"
+    print_ok "Local Central integration is FULLY SUSPENDED; login hooks removed and Central services stopped/disabled. Resume manually to restore."
+    central_full_status
+)
+central_full_check_master_ready() {
+    local state="$1" unit active enabled api token count
+    [[ -f "$CENTRAL_PROFILE" ]] || return 0
+    # The local Master should be healthy BEFORE login hooks are reenabled.
+    while IFS=$'\t' read -r unit active enabled; do
+        [[ "$unit" == ocserv-central.service && "$active" == active ]] || continue
+        central_profile_load
+        api="${API_URL:-}"; token="${API_TOKEN:-}"
+        case "$api" in
+            http://127.0.0.1:8088|http://localhost:8088|http://[::1]:8088) ;;
+            *) return 0 ;; # Master may be remote: do not assume local ownership
+        esac
+        command -v curl >/dev/null 2>&1 || { print_warn "curl unavailable; cannot verify Central health."; return 0; }
+        for ((count=0; count<30; count++)); do
+            if curl --silent --show-error --fail --max-time 2 -H "X-API-Token: $token" "$api/health" >/dev/null 2>&1; then
+                return 0
+            fi
+            sleep 1
+        done
+        print_err "Local Central Master API did not become healthy; leaving VPN login hooks offline."
+        return 1
+    done < "$state/units.tsv"
+    return 0
+}
+central_full_resume() (
+    need_root; ensure_dirs
+    exec 8> "$CENTRAL_FULL_LOCK"
+    flock -n 8 || { print_err "Another full Central switch is in progress."; return 1; }
+    local state="$CENTRAL_FULL_STATE" phase ix instance conf original_hash off_hash was_active current
+    [[ -d "$state" ]] || { print_info "Full Central is already normal (no saved suspend state)."; return 0; }
+    phase="$(cat "$state/phase" 2>/dev/null || echo unknown)"
+    if [[ "$phase" != suspended ]]; then
+        print_err "Incomplete Central transition ($phase). Use --central-full-recover to restore the previous state first."
+        return 1
+    fi
+    # Preflight every target: detect outside edits before restarting anything.
+    while IFS=$'\t' read -r ix instance conf original_hash off_hash was_active; do
+        [[ -n "$ix" ]] || continue
+        [[ -f "$conf" ]] || { print_err "Config missing: $conf"; return 1; }
+        current="$(sha256sum "$conf" | awk '{print $1}')"
+        if [[ "$current" != "$off_hash" && "$current" != "$original_hash" ]]; then
+            print_err "Config was edited during suspension: $conf; will not overwrite. Resolve manually before resuming."
+            return 1
+        fi
+        validate_config "$state/configs/$ix.original" || { print_err "Recorded original config no longer validates: $conf"; return 1; }
+    done < "$state/configs.tsv"
+    print_warn "Resuming full Central integration restarts active ocserv instances to restore login hooks; connected users may disconnect."
+    ask_yes_no "Resume full Central integration now?" "n" || return 0
+    printf 'pending\n' > "$state/phase"
+    if ! central_full_restore_services "$state" || ! central_full_check_master_ready "$state" || ! central_full_switch_configs "$state" original; then
+        print_err "Resume failed; returning local VPN configs to safe OFFLINE mode and stopping Central services."
+        local rc=0
+        central_full_switch_configs "$state" offline || rc=1
+        central_full_stop_services "$state" || rc=1
+        if (( rc == 0 )); then
+            printf 'suspended\n' > "$state/phase"
+        else
+            print_err "Recovery incomplete; use --central-full-recover and inspect logs."
+        fi
+        return 1
+    fi
+    rm -rf -- "$state"
+    print_ok "Full Central integration RESUMED. Original configs and unit activation/boot states restored."
+)
+central_full_recover() (
+    need_root; ensure_dirs
+    exec 8> "$CENTRAL_FULL_LOCK"
+    flock -n 8 || { print_err "Another full Central switch is in progress."; return 1; }
+    [[ -d "$CENTRAL_FULL_STATE" ]] || { print_info "Nothing to recover."; return 0; }
+    print_warn "Recovery restores original configs and service states from the recorded pre-suspension snapshots."
+    ask_yes_no "Recover interrupted full Central transition? (ocserv may restart)" "n" || return 0
+    if central_full_restore_services "$CENTRAL_FULL_STATE" && central_full_switch_configs "$CENTRAL_FULL_STATE" original; then
+        rm -rf -- "$CENTRAL_FULL_STATE"
+        print_ok "Original Central integration restored after interrupted transition."
+    else
+        print_err "Recovery incomplete; no snapshots removed. Examine recorded configs and unit statuses."
+        return 1
+    fi
+)
+central_full_menu() {
+    local choice
+    while true; do
+        echo; echo '==== Fully Suspend / Resume Central (LOCAL HOST) ===='
+        central_full_status
+        echo '1) Fully suspend local Central integration (restart ocserv, stop services)'
+        echo '2) Resume previously suspended integration'
+        echo '3) Recover an interrupted transition'
+        echo '4) Status'
+        echo '0) Back'
+        ui_read choice 'Select: ' || return 1
+        case "$choice" in
+            1) central_full_suspend; pause ;;
+            2) central_full_resume; pause ;;
+            3) central_full_recover; pause ;;
+            4) central_full_status; pause ;;
+            0) return 0 ;;
+            *) print_warn 'Invalid selection.' ;;
+        esac
+    done
 }
 
 central_instances_menu() {
@@ -4900,6 +5295,9 @@ MANAGER_BIN="/usr/local/sbin/ocserv-central-manager"
 
 MASTER_SERVICE="/etc/systemd/system/ocserv-central.service"
 NODE_AGENT_SERVICE="/etc/systemd/system/ocserv-central-agent.service"
+# Temporary Master-side policy override. Entries self-expire on each API request.
+# Root-only; no quotas/users/settings are rewritten by this feature.
+ENFORCEMENT_PAUSE_FILE="$MASTER_ETC/enforcement-pause.json"
 
 HOOK_SCRIPT="/usr/local/sbin/ocserv-central-hook.sh"
 CONNECT_WRAPPER="/usr/local/sbin/ocserv-central-connect.sh"
@@ -4946,8 +5344,19 @@ ui_read() {
         detected="$(tput cols 2>/dev/null || true)"
         [[ "$detected" =~ ^[0-9]+$ ]] && (( detected > 20 )) && width="$detected"
     fi
-    if (( ${#prompt} > width - 5 )); then
-        printf '\n%s\n> ' "${prompt% }" >&2
+    if (( ${#prompt} >= width - 2 )); then
+        # Long questions must not wrap into an ambiguous ">" input prompt.
+        # Keep the original answer/default choices visible on their own line.
+        local question="${prompt% }" answer_label="Answer: "
+        if [[ "$question" =~ ^(.*)[[:space:]](\[[^]]+\]:)$ ]]; then
+            question="${BASH_REMATCH[1]}"
+            answer_label="${BASH_REMATCH[2]} "
+        elif [[ "$question" == *': ' ]]; then
+            question="${question%: }"
+        elif [[ "$question" == *: ]]; then
+            question="${question%:}"
+        fi
+        printf '%s\n%s' "$question" "$answer_label" >&2
     else
         printf '%s' "$prompt" >&2
     fi
@@ -4962,7 +5371,7 @@ ui_read() {
     else
         return 1
     fi
-    [[ -t 0 ]] || printf '\n' >&2
+    # Never emit a second, synthetic newline: the terminal already echoes Enter.
     printf -v "$dest" '%s' "$answer"
 }
 
@@ -6054,6 +6463,23 @@ def startup():
     init_db()
     sync_ocpasswd_to_db()
 
+# Maintenance override checked on every connect/heartbeat request. The expiration
+# is evaluated at request time, so it survives API restart and requires no timer.
+# A failed, corrupt, or expired state file ALWAYS means normal enforcement.
+ENFORCEMENT_PAUSE_FILE = "/etc/ocserv-central/enforcement-pause.json"
+def enforcement_pause_info():
+    try:
+        with open(ENFORCEMENT_PAUSE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        until = state.get("until")
+        if type(until) is not int or until <= now() or until > now() + 3600:
+            return None
+        if state.get("scope") != "central-all":
+            return None
+        return {"until": until, "remaining_seconds": max(0, until - now())}
+    except (FileNotFoundError, PermissionError, ValueError, TypeError, OSError):
+        return None
+
 @app.get("/health")
 def health():
     return {"ok": True, "version": "2.4", "time": now(), "multi_instance_sources": True}
@@ -6128,6 +6554,7 @@ def connect(req: ConnectReq, request: Request, x_api_token: str | None = Header(
     req.groupname = authoritative_group_for_user(req.username, req.groupname, req.source_id)
 
     max_sessions, quota_bytes = effective_limits(req.username, req.groupname)
+    policy_paused = enforcement_pause_info() is not None
 
     with db() as con:
         con.execute("BEGIN IMMEDIATE")
@@ -6141,13 +6568,14 @@ def connect(req: ConnectReq, request: Request, x_api_token: str | None = Header(
 
         user = con.execute("SELECT * FROM users WHERE username=?", (req.username,)).fetchone()
 
+        # A maintenance pause never re-enables administratively disabled accounts.
         if user["disabled"]:
             return {"allow": False, "reason": "user disabled"}
 
         if account_is_expired(req.username):
             return {"allow": False, "reason": "account expired"}
 
-        if quota_bytes > 0 and user["used_bytes"] >= quota_bytes:
+        if not policy_paused and quota_bytes > 0 and user["used_bytes"] >= quota_bytes:
             log_quota_exhausted(req.username, req.groupname, user["used_bytes"], quota_bytes, "connect quota exceeded")
             return {"allow": False, "reason": "quota exceeded"}
 
@@ -6158,7 +6586,7 @@ def connect(req: ConnectReq, request: Request, x_api_token: str | None = Header(
             (req.username,)
         ).fetchone()["c"]
 
-        if active_count >= max_sessions:
+        if not policy_paused and active_count >= max_sessions:
             return {"allow": False, "reason": f"session limit exceeded: {active_count}/{max_sessions}", "active_count": active_count, "max_sessions": max_sessions}
 
         con.execute(
@@ -6173,7 +6601,7 @@ def connect(req: ConnectReq, request: Request, x_api_token: str | None = Header(
 
         return {
             "allow": True,
-            "reason": "ok",
+            "reason": "maintenance pause" if policy_paused else "ok",
             "username": req.username,
             "groupname": req.groupname,
             "max_sessions": max_sessions,
@@ -6220,6 +6648,7 @@ def heartbeat(req: HeartbeatReq, request: Request, x_api_token: str | None = Hea
     auth(x_api_token)
     t = now()
     disconnect_ids = []
+    policy_paused = enforcement_pause_info() is not None
     sync_ocpasswd_to_db()
     update_node(req.node_id, request, len(req.sessions))
 
@@ -6282,7 +6711,7 @@ def heartbeat(req: HeartbeatReq, request: Request, x_api_token: str | None = Hea
                 disconnect_ids.append(s.ocserv_id)
             elif account_is_expired(s.username):
                 disconnect_ids.append(s.ocserv_id)
-            elif quota_bytes > 0 and user["used_bytes"] >= quota_bytes:
+            elif not policy_paused and quota_bytes > 0 and user["used_bytes"] >= quota_bytes:
                 log_quota_exhausted(s.username, s.groupname, user["used_bytes"], quota_bytes, "heartbeat quota exceeded")
                 disconnect_ids.append(s.ocserv_id)
 
@@ -11522,6 +11951,7 @@ show_preserved_update_settings() {
 }
 
 apply_program_update_without_reconfigure() {
+    if [[ -d /etc/ocserv-manager/central-full-suspend ]]; then print_err "Resume full Central integration before updating Central components."; return 1; fi
     # 'ask' preserves the standalone Central menu/CLI behavior. Integrated
     # Manager updates pass the already confirmed policy ('yes' or 'no') so
     # Central never asks the same backup question a second time.
@@ -11878,6 +12308,188 @@ install_both_master_and_local_nodes() {
     return 0
 }
 
+# ----- Root-only Central maintenance and service controls -----
+central_service_action() {
+    if [[ -d /etc/ocserv-manager/central-full-suspend && "${2:-}" =~ ^(start|restart|enable)$ ]]; then
+        print_err "Full Central integration is suspended. Use option 11 to Resume instead of starting individual components."; return 1
+    fi
+    local unit="$1" action="$2" valid=0
+    case "$unit" in
+        ocserv-central.service|ocserv-central-agent.service|ocserv-manager-central@*.service) valid=1 ;;
+    esac
+    [[ "$valid" == 1 && "$unit" != *[!a-zA-Z0-9@._-]* ]] || { print_err "Unsafe service name."; return 2; }
+    case "$action" in
+        start|stop|restart|enable|disable|status|logs) ;;
+        *) print_err "Invalid service action."; return 2 ;;
+    esac
+    if [[ "$action" == stop && "$unit" == ocserv-central.service ]]; then
+        print_warn "Stopping the Master does NOT remove limits. fail-closed nodes may deny new logins."
+        print_warn "For a short policy break, use Temporary enforcement pause instead."
+        ask_yes_no "Stop Central Master service anyway?" "n" || return 0
+    elif [[ "$action" == stop && "$unit" != ocserv-central.service ]]; then
+        print_warn "Stopping this Agent suspends live heartbeat, traffic accounting and quota disconnects."
+        print_warn "Login connect hooks can remain active; this is NOT a controlled policy pause."
+        ask_yes_no "Stop the selected Agent anyway?" "n" || return 0
+    fi
+    case "$action" in
+        status)
+            printf 'Service: %s\n' "$unit"
+            printf '  Active: %s\n' "$(systemctl is-active "$unit" 2>/dev/null || echo unavailable)"
+            printf '  Boot:   %s\n' "$(systemctl is-enabled "$unit" 2>/dev/null || echo unavailable)"
+            # One short field per line is easier to read with screen readers
+            # and avoids wrapped, colorized `systemctl status` output.
+            systemctl show "$unit" --no-pager \
+                -p LoadState -p SubState -p Result -p MainPID --no-legend 2>/dev/null || true
+            ;;
+        logs) journalctl -u "$unit" -n 80 --no-pager -l || true ;;
+        enable|disable)
+            systemctl "$action" "$unit" && print_ok "$unit: $action completed."
+            ;;
+        *)
+            systemctl "$action" "$unit" && print_ok "$unit: $action completed."
+            ;;
+    esac
+}
+
+central_service_control_menu() {
+    local choice unit action i n found
+    while true; do
+        safe_clear
+        echo "==== Central - Service Controls ===="
+        echo "Master:       $(systemctl is-active ocserv-central.service 2>/dev/null || echo missing)"
+        echo "Legacy Node:  $(systemctl is-active ocserv-central-agent.service 2>/dev/null || echo missing)"
+        echo "1) Manage Central Master service"
+        echo "2) Manage legacy Node Agent service"
+        echo "3) Manage a local per-instance Central agent"
+        echo "4) Show all Central component service statuses"
+        echo "0) Back"
+        echo
+        ui_read choice "Select: " || return 1
+        case "$choice" in
+            0) return 0 ;;
+            1) unit="ocserv-central.service" ;;
+            2) unit="ocserv-central-agent.service" ;;
+            3)
+                if ! command -v /usr/local/sbin/ocserv-manager >/dev/null 2>&1; then
+                    print_warn "Ocserv Manager runtime is not installed."; pause; continue
+                fi
+                local -a local_units=()
+                mapfile -t local_units < <(
+                    {
+                        systemctl list-unit-files --no-legend 'ocserv-manager-central@*.service' 2>/dev/null | awk '{print $1}' || true
+                        systemctl list-units --all --no-legend 'ocserv-manager-central@*.service' 2>/dev/null | awk '{print $1}' || true
+                        if [[ -d /etc/ocserv-manager/central ]]; then
+                            find /etc/ocserv-manager/central -maxdepth 1 -type f -name '*.env' ! -name 'profile.env' -printf '%f\n' 2>/dev/null | sed -nE 's/^([A-Za-z0-9][A-Za-z0-9._-]*)[.]env$/ocserv-manager-central@\1.service/p'
+                        fi
+                    } | grep -E '^ocserv-manager-central@[A-Za-z0-9][A-Za-z0-9._-]*\.service$' | sort -u
+                )
+                if (( ${#local_units[@]} == 0 )); then
+                    print_warn "No installed per-instance Central agent units found."; pause; continue
+                fi
+                printf 'Local Central agents:\n'
+                for ((i=0; i<${#local_units[@]}; i++)); do
+                    printf '%d) %s (%s)\n' "$((i+1))" "${local_units[$i]}" "$(systemctl is-active "${local_units[$i]}" 2>/dev/null || echo missing)"
+                done
+                ui_read n "Choose agent (0=Back): " || return 1
+                [[ "$n" =~ ^[0-9]+$ ]] && (( 10#$n >= 1 && 10#$n <= ${#local_units[@]} )) || continue
+                unit="${local_units[$((10#$n-1))]}"
+                ;;
+            4)
+                systemctl --no-pager --all status ocserv-central.service ocserv-central-agent.service 2>&1 || true
+                systemctl list-units --no-pager --all 'ocserv-manager-central@*.service' 2>/dev/null || true
+                pause; continue ;;
+            *) print_warn "Invalid choice."; continue ;;
+        esac
+        while true; do
+            echo
+            printf 'Selected: %s (%s)\n' "$unit" "$(systemctl is-active "$unit" 2>/dev/null || echo missing)"
+            echo "1) Start   2) Stop   3) Restart   4) Status   5) Recent logs"
+            echo "6) Enable at boot   7) Disable at boot   0) Back"
+            ui_read choice "Select: " || return 1
+            case "$choice" in
+                1) action=start ;; 2) action=stop ;; 3) action=restart ;;
+                4) action=status ;; 5) action=logs ;; 6) action=enable ;; 7) action=disable ;;
+                0) break ;; *) print_warn "Invalid choice."; continue ;;
+            esac
+            central_service_action "$unit" "$action" || print_warn "Service command did not succeed."
+            pause
+        done
+    done
+}
+
+central_pause_status() {
+    local until now_epoch remaining
+    if [[ ! -f "$ENFORCEMENT_PAUSE_FILE" ]]; then
+        print_info "Central enforcement: ACTIVE (no maintenance pause)."; return 0
+    fi
+    until="$(jq -er 'if (.scope=="central-all" and (.until|type)=="number") then .until|floor else empty end' "$ENFORCEMENT_PAUSE_FILE" 2>/dev/null || true)"
+    now_epoch="$(date +%s)"
+    if [[ ! "$until" =~ ^[0-9]+$ ]] || (( until <= now_epoch || until > now_epoch + 3600 )); then
+        print_info "Central enforcement: ACTIVE (pause expired or invalid)."
+    else
+        remaining="$((until - now_epoch))"
+        print_warn "Central enforcement is PAUSED on this Master for another ${remaining} seconds (all attached Nodes)."
+        print_info "The API stays online; traffic is counted. Disabled/expired accounts and local limits still apply."
+    fi
+}
+
+central_pause_enforcement() {
+    need_root
+    local minutes until tmp
+    [[ -f "$MASTER_SERVICE" ]] || { print_err "Central Master is not installed."; return 1; }
+    systemctl is-active --quiet ocserv-central.service || {
+        print_err "Central Master must be running. Start it in Service Controls first."; return 1;
+    }
+    central_pause_status
+    print_warn "This temporarily bypasses ONLY Central session limits and traffic quota."
+    print_warn "Password authentication, disabled users, expiry, local limits and external auth remain enforced."
+    print_warn "All Nodes connected to THIS Master will be affected. Usage is still counted."
+    minutes="$(ask_integer "Pause duration in minutes (1-60)" "5" 1 60)" || return 1
+    ask_yes_no "Temporarily bypass Central enforcement for $minutes minutes?" "n" || return 0
+    until="$(( $(date +%s) + minutes*60 ))"
+    mkdir -p "$MASTER_ETC"
+    tmp="$(mktemp "$MASTER_ETC/.enforcement-pause.XXXXXX")" || return 1
+    chmod 600 "$tmp"
+    if ! jq -nc --argjson until "$until" '{scope:"central-all",until:$until}' > "$tmp"; then
+        rm -f "$tmp"; return 1
+    fi
+    mv -f "$tmp" "$ENFORCEMENT_PAUSE_FILE"
+    chmod 600 "$ENFORCEMENT_PAUSE_FILE"
+    logger -t ocserv-central-manager "TEMPORARY Central enforcement pause enabled until epoch=$until (minutes=$minutes)"
+    print_ok "Central policy pause enabled; expires automatically at $(date -d "@$until" '+%Y-%m-%d %H:%M:%S %Z')."
+}
+
+central_resume_enforcement() {
+    need_root
+    central_pause_status
+    [[ -f "$ENFORCEMENT_PAUSE_FILE" ]] || return 0
+    ask_yes_no "Resume normal Central enforcement immediately?" "n" || return 0
+    rm -f -- "$ENFORCEMENT_PAUSE_FILE"
+    logger -t ocserv-central-manager "Central enforcement pause cancelled manually"
+    print_ok "Normal Central enforcement restored. Over-quota/disabled users may be disconnected on next heartbeat."
+}
+
+central_pause_menu() {
+    local choice
+    while true; do
+        safe_clear
+        echo "==== Central - Temporary Enforcement Pause ===="
+        central_pause_status
+        echo "1) Pause Central limits temporarily (1-60 minutes)"
+        echo "2) Resume Central limits now"
+        echo "3) Show pause status"
+        echo "0) Back"
+        ui_read choice "Select: " || return 1
+        case "$choice" in
+            1) run_central_menu_action central_pause_enforcement; pause ;;
+            2) run_central_menu_action central_resume_enforcement; pause ;;
+            3) central_pause_status; pause ;;
+            0) return 0 ;;
+            *) print_warn "Invalid choice." ;;
+        esac
+    done
+}
+
 central_self_test_handlers() {
     local fn missing=0
     local handlers=(
@@ -11893,6 +12505,10 @@ central_self_test_handlers() {
         install_node
         apply_master_update_menu
         apply_node_update_menu
+        central_service_control_menu
+        central_pause_menu
+        central_pause_enforcement
+        central_resume_enforcement
     )
     for fn in "${handlers[@]}"; do
         if ! declare -F "$fn" >/dev/null 2>&1; then
@@ -11938,9 +12554,18 @@ main_menu() {
         echo "6) Uninstall legacy Node part"
         echo "7) Uninstall Master part"
         echo "8) Apply program update without reconfigure"
+        echo "9) Service controls (Master, Agent, status, logs)"
+        echo "10) Temporary Central enforcement pause (timed, reversible)"
+        echo "11) Fully suspend / resume Central integration (local host)"
         echo "0) Exit"
         echo
         ui_read choice "Select: " || return 1
+        if [[ -d /etc/ocserv-manager/central-full-suspend ]]; then
+            case "$choice" in
+                0|5|9|11) : ;;
+                *) print_err "Full Central is suspended. Resume it via option 11 before managing Central services, profiles, quotas, sources or updates."; pause; continue ;;
+            esac
+        fi
         case "$choice" in
             1) master_menu ;;
             2) open_manager_multi_instance ;;
@@ -11950,6 +12575,9 @@ main_menu() {
             6) uninstall_node; pause ;;
             7) uninstall_master; pause ;;
             8) apply_program_update_without_reconfigure; pause ;;
+            9) central_service_control_menu ;;
+            10) central_pause_menu ;;
+            11) if manager_multi_instance_available; then /usr/local/sbin/ocserv-manager --central-full-menu; else print_err "Use the integrated Ocserv Manager to suspend the local integration."; pause; fi ;;
             0) exit 0 ;;
             *) echo "Invalid choice"; sleep 1 ;;
         esac
@@ -12088,6 +12716,7 @@ EOF
 }
 
 update_embedded_central_without_reconfigure() {
+    central_full_assert_normal || return 1
     local tmp update_backup_policy="${1:-ask}"
     case "$update_backup_policy" in
         ask|yes|no) ;;
@@ -15822,6 +16451,7 @@ show_versions() {
 }
 
 apply_manager_self_update() {
+    central_full_assert_normal || return 1
     local backup backup_policy="no"
     bash -n "$0" || { print_err "Current script syntax is invalid; refusing update."; return 1; }
     backup=""
@@ -15990,7 +16620,27 @@ case "${1:-}" in
         exit $?
         ;;
     --central-install)
-        need_root; ensure_dirs; install_embedded_central_manager_code
+        need_root; ensure_dirs; central_full_assert_normal || exit 1; install_embedded_central_manager_code
+        exit $?
+        ;;
+    --central-full-menu)
+        need_root; ensure_dirs; central_full_menu
+        exit $?
+        ;;
+    --central-full-status)
+        need_root; central_full_status
+        exit $?
+        ;;
+    --central-full-suspend)
+        need_root; ensure_dirs; central_full_suspend
+        exit $?
+        ;;
+    --central-full-resume)
+        need_root; ensure_dirs; central_full_resume
+        exit $?
+        ;;
+    --central-full-recover)
+        need_root; ensure_dirs; central_full_recover
         exit $?
         ;;
     --central-menu)
@@ -16026,6 +16676,11 @@ Usage: $0 [option]
   --central-sync-local-master-profile Sync current local Master token/profile to already attached local instances
   --central-import-v19-node [node.env] Import v19 Node API settings into the v20.4.4 source-aware shared instance profile
   --central-menu            Open the integrated Central Manager console
+  --central-full-menu       Full suspend/resume maintenance console (LOCAL host)
+  --central-full-status     Show whether the local Central integration is suspended
+  --central-full-suspend    Safely detach all local Central hooks; stop/disable Master/Agents
+  --central-full-resume     Restore captured hook configs and original service states
+  --central-full-recover    Recover interrupted suspend/resume transaction
   --central-update          Update installed Central code/components without reconfigure
   --central-status          Show integrated Central status
   (no option)               Interactive menu
