@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Ocserv Manager v3.9.4.1 (hotfix of the full-Central-suspend v3.9.4 branch)
+# Ocserv Manager v3.9.4.2 (terminal I/O improvements on top of v3.9.4.1)
 # Multi-instance installer and manager for ocserv on Ubuntu/Debian.
 # Designed as a replacement for the original single-instance ocserv.sh.
 
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="3.9.4.1"
+PROGRAM_VERSION="3.9.4.2"
 PROGRAM_NAME="Ocserv Manager"
 OCSERV_SILENT_CLIENT_FIX_VERSION="1.5.0"
 OCSERV_PASSWORD_RETRY_FIXED="1.4.2"
@@ -63,50 +63,135 @@ CURRENT_TXN_APPLY_MODE="restart"
 if [[ ! -t 2 || "${TERM:-dumb}" == "dumb" || "${NO_COLOR:-}" != "" ]]; then
     C_RESET='' C_RED='' C_GREEN='' C_YELLOW='' C_CYAN=''
 fi
-print_ok()   { printf '%b[OK]%b %s\n' "$C_GREEN" "$C_RESET" "$*" >&2; }
-print_warn() { printf '%b[WARN]%b %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
-print_err()  { printf '%b[ERR]%b %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
-print_info() { printf '%b[INFO]%b %s\n' "$C_CYAN" "$C_RESET" "$*" >&2; }
-
-# A single predictable input implementation for Manager AND Central menus.
-# It displays the question on stderr, even when the answer is captured using
-# command substitution, and never treats EOF as an affirmative response.
-ui_read() {
-    local dest="$1" prompt="$2" answer='' width="${COLUMNS:-80}"
-    [[ "$width" =~ ^[0-9]+$ ]] || width=80
-    if [[ -t 2 ]] && command -v tput >/dev/null 2>&1; then
-        local detected
-        detected="$(tput cols 2>/dev/null || true)"
-        [[ "$detected" =~ ^[0-9]+$ ]] && (( detected > 20 )) && width="$detected"
-    fi
-    if (( ${#prompt} >= width - 2 )); then
-        # Long questions must not wrap into an ambiguous ">" input prompt.
-        # Keep the original answer/default choices visible on their own line.
-        local question="${prompt% }" answer_label="Answer: "
-        if [[ "$question" =~ ^(.*)[[:space:]](\[[^]]+\]:)$ ]]; then
-            question="${BASH_REMATCH[1]}"
-            answer_label="${BASH_REMATCH[2]} "
-        elif [[ "$question" == *': ' ]]; then
-            question="${question%: }"
-        elif [[ "$question" == *: ]]; then
-            question="${question%:}"
+# Terminal output is word-wrapped only for a real terminal (or a UI test).
+# Data returned on stdout by functions and CLI commands is never modified.
+ui_columns() {
+    local dest="$1" terminal_width="${COLUMNS:-80}" detected=''
+    if [[ -t 2 && -r /dev/tty ]]; then
+        if [[ "${UI_WIDTH_CACHE_SECONDS:-}" == "$SECONDS" && "${UI_WIDTH_CACHE:-}" =~ ^[0-9]+$ ]]; then
+            terminal_width="$UI_WIDTH_CACHE"
+        else
+            detected="$(stty size </dev/tty 2>/dev/null || true)"
+            detected="${detected##* }"
+            [[ "$detected" =~ ^[0-9]+$ ]] && terminal_width="$detected"
+            UI_WIDTH_CACHE="$terminal_width"
+            UI_WIDTH_CACHE_SECONDS="$SECONDS"
         fi
-        printf '%s\n%s' "$question" "$answer_label" >&2
+    fi
+    [[ "$terminal_width" =~ ^[0-9]+$ ]] || terminal_width=80
+    (( terminal_width >= 24 )) || terminal_width=24
+    (( terminal_width <= 500 )) || terminal_width=500
+    printf -v "$dest" '%s' "$terminal_width"
+}
+
+# Usage: ui_render "visible prefix" "ANSI color" "message".
+# Hanging indentation keeps menu numbers and status labels legible.
+ui_render() {
+    local prefix="$1" color="$2" content="$3" cols first next words word piece
+    local first_prefix="$prefix" next_prefix='' line='' used=0 available
+    if [[ ! -t 2 && "${OCSERV_UI_TEST_WRAP:-0}" != 1 ]]; then
+        printf '%b%s%b%s\n' "$color" "$prefix" "$C_RESET" "$content" >&2
+        return 0
+    fi
+    ui_columns cols
+    if [[ -z "$prefix" && "$content" =~ ^([0-9]+\)[[:space:]]+)(.*)$ ]]; then
+        first_prefix="${BASH_REMATCH[1]}"
+        content="${BASH_REMATCH[2]}"
+    elif [[ -z "$prefix" && "$content" =~ ^(-[[:space:]]+)(.*)$ ]]; then
+        first_prefix="${BASH_REMATCH[1]}"
+        content="${BASH_REMATCH[2]}"
+    fi
+    printf -v next_prefix '%*s' "${#first_prefix}" ''
+    # UI text is not a data serialization format. Only spaces and tabs used
+    # for layout are collapsed, never the contents of captured stdout.
+    content="${content//$'\t'/ }"
+    content="${content//$'\r'/}"
+    local -a chunks=()
+    while [[ "$content" == *$'\n'* ]]; do
+        chunks+=("${content%%$'\n'*}")
+        content="${content#*$'\n'}"
+    done
+    chunks+=("$content")
+    local chunk last=0 current_prefix="$first_prefix" emit_color="$color"
+    for chunk in "${chunks[@]}"; do
+        local -a tokens=()
+        read -r -a tokens <<< "$chunk"
+        line=''
+        if (( ${#tokens[@]} == 0 )); then
+            printf '%b%s%b\n' "$emit_color" "$current_prefix" "$C_RESET" >&2
+            current_prefix="$next_prefix"; emit_color=''
+            continue
+        fi
+        for word in "${tokens[@]}"; do
+            while [[ -n "$word" ]]; do
+                available=$((cols - ${#current_prefix} - 1))
+                (( available >= 8 )) || available=8
+                if [[ -n "$line" ]] && (( ${#line} + 1 + ${#word} > available )); then
+                    printf '%b%s%b%s\n' "$emit_color" "$current_prefix" "$C_RESET" "$line" >&2
+                    line=''; current_prefix="$next_prefix"; emit_color=''
+                    continue
+                fi
+                if (( ${#word} > available )); then
+                    piece="${word:0:available}"
+                    word="${word:available}"
+                    if [[ -n "$line" ]]; then
+                        printf '%b%s%b%s\n' "$emit_color" "$current_prefix" "$C_RESET" "$line" >&2
+                        line=''; current_prefix="$next_prefix"; emit_color=''
+                    fi
+                    printf '%b%s%b%s\n' "$emit_color" "$current_prefix" "$C_RESET" "$piece" >&2
+                    current_prefix="$next_prefix"; emit_color=''
+                else
+                    if [[ -z "$line" ]]; then line="$word"; else line+=" $word"; fi
+                    word=''
+                fi
+            done
+        done
+        if [[ -n "$line" ]]; then
+            printf '%b%s%b%s\n' "$emit_color" "$current_prefix" "$C_RESET" "$line" >&2
+        fi
+        current_prefix="$next_prefix"; emit_color=''
+    done
+}
+ui_line()   { ui_render '' '' "$*"; }
+print_ok()   { ui_render '[OK] '   "$C_GREEN" "$*"; }
+print_warn() { ui_render '[WARN] ' "$C_YELLOW" "$*"; }
+print_err()  { ui_render '[ERR] '  "$C_RED" "$*"; }
+print_info() { ui_render '[INFO] ' "$C_CYAN" "$*"; }
+
+ui_read() {
+    local dest="$1" prompt="$2" answer='' cols question label='Answer: ' trimmed
+    ui_columns cols
+    # Keep input on a fresh line when the question/default cannot fit.
+    if (( ${#prompt} >= cols - 3 )) || [[ "$prompt" == *$'\n'* ]]; then
+        trimmed="${prompt% }"
+        question="$trimmed"
+        if [[ "$trimmed" =~ ^(.*)[[:space:]](\[[^]]+\]:)$ ]]; then
+            question="${BASH_REMATCH[1]}"
+            label="${BASH_REMATCH[2]} "
+        elif [[ "$trimmed" == *: ]]; then
+            question="${trimmed%:}"
+        fi
+        ui_line "$question"
+        if (( ${#label} >= cols - 3 )); then
+            ui_line "Default selection: $label"
+            label='Value: '
+        fi
+        printf '%s' "$label" >&2
     else
         printf '%s' "$prompt" >&2
     fi
-    # In a real interactive console, read the terminal instead of consuming
-    # a piped script body. Test harnesses without a tty read supplied stdin.
+    # Read from controlling tty when stdin is a script/pipe and a tty exists.
     if [[ -t 0 ]]; then
-        IFS= read -r answer || return 1
+        if ! IFS= read -r answer; then printf '\n' >&2; return 1; fi
     elif [[ -t 2 && -r /dev/tty ]]; then
-        IFS= read -r answer </dev/tty || return 1
+        if ! IFS= read -r answer </dev/tty; then printf '\n' >&2; return 1; fi
     elif IFS= read -r answer; then
-        :
+        # Piped/test input is not echoed by a terminal; finish the prompt line.
+        [[ -t 2 ]] || printf '\n' >&2
     else
+        printf '\n' >&2
         return 1
     fi
-    # Never emit a second, synthetic newline: the terminal already echoes Enter.
     printf -v "$dest" '%s' "$answer"
 }
 
@@ -225,7 +310,7 @@ choose_menu() {
     local i choice
     printf '\n%s\n' "$prompt" >&2
     for ((i=0; i<${#options[@]}; i++)); do
-        printf '%d) %s\n' "$((i+1))" "${options[$i]}" >&2
+        ui_line "$((i+1))) ${options[$i]}"
     done
     while true; do
         ui_read choice "Select: " || return 1
@@ -525,11 +610,11 @@ select_ocserv_install_target() {
     echo "Installed version: ${current:-not installed}" >&2
     echo "Latest upstream tag: ${latest:-unavailable}" >&2
     echo "Choose installation source:" >&2
-    echo "1) Latest stable upstream source (${latest:-online lookup})" >&2
-    echo "2) Choose an upstream version from online list" >&2
-    echo "3) Enter a specific upstream version/tag" >&2
-    echo "4) Ubuntu/Debian distribution package" >&2
-    echo "0) Back" >&2
+    ui_line "1) Latest stable upstream source (${latest:-online lookup})" >&2
+    ui_line "2) Choose an upstream version from online list" >&2
+    ui_line "3) Enter a specific upstream version/tag" >&2
+    ui_line "4) Ubuntu/Debian distribution package" >&2
+    ui_line "0) Back" >&2
     while true; do
         ui_read choice "Select: " || return 1
         case "$choice" in
@@ -552,7 +637,7 @@ select_ocserv_install_target() {
             (( tags_count > 0 )) || { print_err "No versions returned." >&2; return 1; }
             echo "Available upstream versions:" >&2
             for ((i=0; i<tags_count && i<30; i++)); do
-                printf '%d) %s\n' "$((i+1))" "${_tags[$i]}" >&2
+                ui_line "$((i+1))) ${_tags[$i]}"
             done
             while true; do
                 ui_read selection "Select version number: " || return 1
@@ -1029,7 +1114,7 @@ choose_instance() {
     while IFS= read -r i; do [[ -n "$i" ]] && items+=("$i"); done < <(list_instances | sort -u)
     ((${#items[@]})) || { print_err "No managed ocserv instance found." >&2; return 1; }
     echo "Instances:" >&2
-    for ((idx=0; idx<${#items[@]}; idx++)); do printf '%d) %s\n' "$((idx+1))" "${items[$idx]}" >&2; done
+    for ((idx=0; idx<${#items[@]}; idx++)); do ui_line "$((idx+1))) ${items[$idx]}"; done
     while true; do
         ui_read idx "Select instance: " || return 1
         if [[ "$idx" =~ ^[0-9]+$ ]] && ((idx>=1 && idx<=${#items[@]})); then
@@ -1731,10 +1816,10 @@ ipv4_forwarding_menu() {
         echo "Saved Manager policy: $([[ "$desired" == 1 ]] && echo enabled || echo disabled)"
         echo "Persistent sysctl: $persistent"
         echo
-        echo "1) Enable and persist"
-        echo "2) Reapply saved setting"
-        echo "3) Disable and persist (not recommended for a VPN router)"
-        echo "0) Back"
+        ui_line "1) Enable and persist"
+        ui_line "2) Reapply saved setting"
+        ui_line "3) Disable and persist (not recommended for a VPN router)"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) enable_ip_forwarding; print_ok "IPv4 forwarding is enabled now and will persist after reboot."; pause ;;
@@ -1850,11 +1935,11 @@ configure_firewall_mode() {
     profile="$(fw_profile_for_instance "$instance")"
     echo
     echo "==== Firewall setup: $instance ===="
-    echo "1) iptables - standard Manager rules"
-    echo "2) iptables-persistent - legacy/plain"
-    echo "   Uses persistent host-wide NAT and does not create Manager INPUT/FORWARD/NAT rules for this instance."
-    echo "3) UFW"
-    echo "0) Back / keep current"
+    ui_line "1) iptables - standard Manager rules"
+    ui_line "2) iptables-persistent - legacy/plain"
+    ui_line "   Uses persistent host-wide NAT and does not create Manager INPUT/FORWARD/NAT rules for this instance."
+    ui_line "3) UFW"
+    ui_line "0) Back / keep current"
     echo "Current: $profile"
     while true; do
         ui_read choice "Select [keep current]: " || return 1
@@ -3412,11 +3497,11 @@ supplemental_files_menu() {
         echo
         echo "==== config-per-$kind files: $instance ===="
         echo "Directory: $dir"
-        echo "1) List files"
-        echo "2) Show one file"
-        echo "3) Edit/create one raw file"
-        echo "4) Delete one file"
-        echo "0) Back"
+        ui_line "1) List files"
+        ui_line "2) Show one file"
+        ui_line "3) Edit/create one raw file"
+        ui_line "4) Delete one file"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) [[ -d "$dir" ]] && find "$dir" -maxdepth 1 -type f -printf '%f\n' | sort || echo "No directory/files yet."; pause ;;
@@ -3449,15 +3534,15 @@ supplemental_config_menu() {
         echo "==== Per-user / Per-group supplemental configuration: $instance ===="
         echo "config-per-user:  $([[ "$ustate" == 1 ]] && echo enabled || echo disabled) | $udir"
         echo "config-per-group: $([[ "$gstate" == 1 ]] && echo enabled || echo disabled) | $gdir"
-        echo "1) Enable config-per-user"
-        echo "2) Disable config-per-user"
-        echo "3) Change config-per-user directory"
-        echo "4) Manage config-per-user files"
-        echo "5) Enable config-per-group"
-        echo "6) Disable config-per-group"
-        echo "7) Change config-per-group directory"
-        echo "8) Manage config-per-group files"
-        echo "0) Back"
+        ui_line "1) Enable config-per-user"
+        ui_line "2) Disable config-per-user"
+        ui_line "3) Change config-per-user directory"
+        ui_line "4) Manage config-per-user files"
+        ui_line "5) Enable config-per-group"
+        ui_line "6) Disable config-per-group"
+        ui_line "7) Change config-per-group directory"
+        ui_line "8) Manage config-per-group files"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) set_supplemental_feature "$instance" user enable; pause ;;
@@ -3494,10 +3579,10 @@ choose_user_groups() {
         return 0
     fi
     echo "$prompt" >&2
-    for idx in "${!groups[@]}"; do printf '%d) %s\n' "$((idx+1))" "${groups[$idx]}" >&2; done
+    for idx in "${!groups[@]}"; do ui_line "$((idx+1))) ${groups[$idx]}"; done
     echo "m) Enter group name(s) manually" >&2
-    (( allow_none == 1 )) && echo "0) No explicit group / wildcard (*)" >&2
-    echo "You may select multiple existing groups with comma-separated numbers, e.g. 1,3." >&2
+    (( allow_none == 1 )) && ui_line "0) No explicit group / wildcard (*)" >&2
+    ui_line "You may select multiple existing groups with comma-separated numbers, e.g. 1,3." >&2
     while true; do
         ui_read input "Select group(s): " || return 1
         input="${input// /}"
@@ -4029,12 +4114,12 @@ bandwidth_limits_menu() {
         echo "==== Bandwidth limits: $instance ===="
         echo "Ocserv native shaping: rx-data-per-sec / tx-data-per-sec (bytes/sec)."
         echo "Manager input is Mbps; 1 Mbps = 125000 bytes/sec."
-        echo "1) Set/edit group bandwidth"
-        echo "2) Show one group bandwidth"
-        echo "3) Set/edit user bandwidth"
-        echo "4) Show one user bandwidth"
-        echo "5) List all explicit bandwidth limits"
-        echo "0) Back"
+        ui_line "1) Set/edit group bandwidth"
+        ui_line "2) Show one group bandwidth"
+        ui_line "3) Set/edit user bandwidth"
+        ui_line "4) Show one user bandwidth"
+        ui_line "5) List all explicit bandwidth limits"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) configure_bandwidth_limit "$instance" group; pause ;;
@@ -4057,20 +4142,20 @@ user_management_menu() {
     while true; do
         echo
         echo "==== Users: $instance ===="
-        echo "1) Create user"
-        echo "2) Change password"
-        echo "3) Lock user"
-        echo "4) Unlock user"
-        echo "5) Delete user"
-        echo "6) Change user group"
-        echo "7) List users (password hashes hidden)"
-        echo "8) Show connected users (JSON)"
-        echo "9) Connected user count"
-        echo "10) Show session client/software information"
-        echo "11) Disconnect user"
-        echo "12) Bandwidth limits (per-user / per-group)"
-        echo "13) config-per-user / config-per-group settings"
-        echo "0) Back"
+        ui_line "1) Create user"
+        ui_line "2) Change password"
+        ui_line "3) Lock user"
+        ui_line "4) Unlock user"
+        ui_line "5) Delete user"
+        ui_line "6) Change user group"
+        ui_line "7) List users (password hashes hidden)"
+        ui_line "8) Show connected users (JSON)"
+        ui_line "9) Connected user count"
+        ui_line "10) Show session client/software information"
+        ui_line "11) Disconnect user"
+        ui_line "12) Bandwidth limits (per-user / per-group)"
+        ui_line "13) config-per-user / config-per-group settings"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) create_user "$instance" || true; pause ;;
@@ -4097,12 +4182,12 @@ group_management_menu() {
     while true; do
         echo
         echo "==== Groups: $instance ===="
-        echo "1) List groups and settings"
-        echo "2) Create/edit group"
-        echo "3) Delete group supplemental config"
-        echo "4) Bandwidth limits (per-group / per-user)"
-        echo "5) config-per-user / config-per-group settings"
-        echo "0) Back"
+        ui_line "1) List groups and settings"
+        ui_line "2) Create/edit group"
+        ui_line "3) Delete group supplemental config"
+        ui_line "4) Bandwidth limits (per-group / per-user)"
+        ui_line "5) config-per-user / config-per-group settings"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) show_groups "$instance"; pause ;;
@@ -5231,18 +5316,18 @@ central_instances_menu() {
     local choice instance i auto
     while true; do
         echo; echo "==== Central - Local ocserv instances (multi-instance) ===="
-        echo "Every attached instance has its own occtl socket, Node ID, source ID and ocpasswd authority."
-        echo "The Master receives user/group snapshots from each instance; a single Master-side OCPASSWD_PATH is no longer required for these attached sources."
-        echo "1) List instances / attachment status"
-        echo "2) Configure shared Central API/agent profile (URL/token/interval/timeout/fail-mode)"
-        echo "3) Attach one instance"
-        echo "4) Attach ALL discovered instances"
-        echo "5) Detach one instance"
-        echo "6) Detach ALL instances"
-        echo "7) Force user/group + session sync for one instance"
-        echo "8) Agent logs for one instance"
-        echo "9) Toggle auto-attach for newly created instances"
-        echo "0) Back"
+        ui_line "Every attached instance has its own occtl socket, Node ID, source ID and ocpasswd authority."
+        ui_line "The Master receives user/group snapshots from each instance; a single Master-side OCPASSWD_PATH is no longer required for these attached sources."
+        ui_line "1) List instances / attachment status"
+        ui_line "2) Configure shared Central API/agent profile (URL/token/interval/timeout/fail-mode)"
+        ui_line "3) Attach one instance"
+        ui_line "4) Attach ALL discovered instances"
+        ui_line "5) Detach one instance"
+        ui_line "6) Detach ALL instances"
+        ui_line "7) Force user/group + session sync for one instance"
+        ui_line "8) Agent logs for one instance"
+        ui_line "9) Toggle auto-attach for newly created instances"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) central_instances_status; pause;;
@@ -5328,50 +5413,135 @@ C_CYAN="\033[36m"
 if [[ ! -t 2 || "${TERM:-dumb}" == "dumb" || "${NO_COLOR:-}" != "" ]]; then
     C_RESET='' C_RED='' C_GREEN='' C_YELLOW='' C_CYAN=''
 fi
-print_ok()   { printf '%b[OK]%b %s\n' "$C_GREEN" "$C_RESET" "$*" >&2; }
-print_warn() { printf '%b[WARN]%b %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
-print_err()  { printf '%b[ERR]%b %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
-print_info() { printf '%b[INFO]%b %s\n' "$C_CYAN" "$C_RESET" "$*" >&2; }
-
-# A single predictable input implementation for Manager AND Central menus.
-# It displays the question on stderr, even when the answer is captured using
-# command substitution, and never treats EOF as an affirmative response.
-ui_read() {
-    local dest="$1" prompt="$2" answer='' width="${COLUMNS:-80}"
-    [[ "$width" =~ ^[0-9]+$ ]] || width=80
-    if [[ -t 2 ]] && command -v tput >/dev/null 2>&1; then
-        local detected
-        detected="$(tput cols 2>/dev/null || true)"
-        [[ "$detected" =~ ^[0-9]+$ ]] && (( detected > 20 )) && width="$detected"
-    fi
-    if (( ${#prompt} >= width - 2 )); then
-        # Long questions must not wrap into an ambiguous ">" input prompt.
-        # Keep the original answer/default choices visible on their own line.
-        local question="${prompt% }" answer_label="Answer: "
-        if [[ "$question" =~ ^(.*)[[:space:]](\[[^]]+\]:)$ ]]; then
-            question="${BASH_REMATCH[1]}"
-            answer_label="${BASH_REMATCH[2]} "
-        elif [[ "$question" == *': ' ]]; then
-            question="${question%: }"
-        elif [[ "$question" == *: ]]; then
-            question="${question%:}"
+# Terminal output is word-wrapped only for a real terminal (or a UI test).
+# Data returned on stdout by functions and CLI commands is never modified.
+ui_columns() {
+    local dest="$1" terminal_width="${COLUMNS:-80}" detected=''
+    if [[ -t 2 && -r /dev/tty ]]; then
+        if [[ "${UI_WIDTH_CACHE_SECONDS:-}" == "$SECONDS" && "${UI_WIDTH_CACHE:-}" =~ ^[0-9]+$ ]]; then
+            terminal_width="$UI_WIDTH_CACHE"
+        else
+            detected="$(stty size </dev/tty 2>/dev/null || true)"
+            detected="${detected##* }"
+            [[ "$detected" =~ ^[0-9]+$ ]] && terminal_width="$detected"
+            UI_WIDTH_CACHE="$terminal_width"
+            UI_WIDTH_CACHE_SECONDS="$SECONDS"
         fi
-        printf '%s\n%s' "$question" "$answer_label" >&2
+    fi
+    [[ "$terminal_width" =~ ^[0-9]+$ ]] || terminal_width=80
+    (( terminal_width >= 24 )) || terminal_width=24
+    (( terminal_width <= 500 )) || terminal_width=500
+    printf -v "$dest" '%s' "$terminal_width"
+}
+
+# Usage: ui_render "visible prefix" "ANSI color" "message".
+# Hanging indentation keeps menu numbers and status labels legible.
+ui_render() {
+    local prefix="$1" color="$2" content="$3" cols first next words word piece
+    local first_prefix="$prefix" next_prefix='' line='' used=0 available
+    if [[ ! -t 2 && "${OCSERV_UI_TEST_WRAP:-0}" != 1 ]]; then
+        printf '%b%s%b%s\n' "$color" "$prefix" "$C_RESET" "$content" >&2
+        return 0
+    fi
+    ui_columns cols
+    if [[ -z "$prefix" && "$content" =~ ^([0-9]+\)[[:space:]]+)(.*)$ ]]; then
+        first_prefix="${BASH_REMATCH[1]}"
+        content="${BASH_REMATCH[2]}"
+    elif [[ -z "$prefix" && "$content" =~ ^(-[[:space:]]+)(.*)$ ]]; then
+        first_prefix="${BASH_REMATCH[1]}"
+        content="${BASH_REMATCH[2]}"
+    fi
+    printf -v next_prefix '%*s' "${#first_prefix}" ''
+    # UI text is not a data serialization format. Only spaces and tabs used
+    # for layout are collapsed, never the contents of captured stdout.
+    content="${content//$'\t'/ }"
+    content="${content//$'\r'/}"
+    local -a chunks=()
+    while [[ "$content" == *$'\n'* ]]; do
+        chunks+=("${content%%$'\n'*}")
+        content="${content#*$'\n'}"
+    done
+    chunks+=("$content")
+    local chunk last=0 current_prefix="$first_prefix" emit_color="$color"
+    for chunk in "${chunks[@]}"; do
+        local -a tokens=()
+        read -r -a tokens <<< "$chunk"
+        line=''
+        if (( ${#tokens[@]} == 0 )); then
+            printf '%b%s%b\n' "$emit_color" "$current_prefix" "$C_RESET" >&2
+            current_prefix="$next_prefix"; emit_color=''
+            continue
+        fi
+        for word in "${tokens[@]}"; do
+            while [[ -n "$word" ]]; do
+                available=$((cols - ${#current_prefix} - 1))
+                (( available >= 8 )) || available=8
+                if [[ -n "$line" ]] && (( ${#line} + 1 + ${#word} > available )); then
+                    printf '%b%s%b%s\n' "$emit_color" "$current_prefix" "$C_RESET" "$line" >&2
+                    line=''; current_prefix="$next_prefix"; emit_color=''
+                    continue
+                fi
+                if (( ${#word} > available )); then
+                    piece="${word:0:available}"
+                    word="${word:available}"
+                    if [[ -n "$line" ]]; then
+                        printf '%b%s%b%s\n' "$emit_color" "$current_prefix" "$C_RESET" "$line" >&2
+                        line=''; current_prefix="$next_prefix"; emit_color=''
+                    fi
+                    printf '%b%s%b%s\n' "$emit_color" "$current_prefix" "$C_RESET" "$piece" >&2
+                    current_prefix="$next_prefix"; emit_color=''
+                else
+                    if [[ -z "$line" ]]; then line="$word"; else line+=" $word"; fi
+                    word=''
+                fi
+            done
+        done
+        if [[ -n "$line" ]]; then
+            printf '%b%s%b%s\n' "$emit_color" "$current_prefix" "$C_RESET" "$line" >&2
+        fi
+        current_prefix="$next_prefix"; emit_color=''
+    done
+}
+ui_line()   { ui_render '' '' "$*"; }
+print_ok()   { ui_render '[OK] '   "$C_GREEN" "$*"; }
+print_warn() { ui_render '[WARN] ' "$C_YELLOW" "$*"; }
+print_err()  { ui_render '[ERR] '  "$C_RED" "$*"; }
+print_info() { ui_render '[INFO] ' "$C_CYAN" "$*"; }
+
+ui_read() {
+    local dest="$1" prompt="$2" answer='' cols question label='Answer: ' trimmed
+    ui_columns cols
+    # Keep input on a fresh line when the question/default cannot fit.
+    if (( ${#prompt} >= cols - 3 )) || [[ "$prompt" == *$'\n'* ]]; then
+        trimmed="${prompt% }"
+        question="$trimmed"
+        if [[ "$trimmed" =~ ^(.*)[[:space:]](\[[^]]+\]:)$ ]]; then
+            question="${BASH_REMATCH[1]}"
+            label="${BASH_REMATCH[2]} "
+        elif [[ "$trimmed" == *: ]]; then
+            question="${trimmed%:}"
+        fi
+        ui_line "$question"
+        if (( ${#label} >= cols - 3 )); then
+            ui_line "Default selection: $label"
+            label='Value: '
+        fi
+        printf '%s' "$label" >&2
     else
         printf '%s' "$prompt" >&2
     fi
-    # In a real interactive console, read the terminal instead of consuming
-    # a piped script body. Test harnesses without a tty read supplied stdin.
+    # Read from controlling tty when stdin is a script/pipe and a tty exists.
     if [[ -t 0 ]]; then
-        IFS= read -r answer || return 1
+        if ! IFS= read -r answer; then printf '\n' >&2; return 1; fi
     elif [[ -t 2 && -r /dev/tty ]]; then
-        IFS= read -r answer </dev/tty || return 1
+        if ! IFS= read -r answer </dev/tty; then printf '\n' >&2; return 1; fi
     elif IFS= read -r answer; then
-        :
+        # Piped/test input is not echoed by a terminal; finish the prompt line.
+        [[ -t 2 ]] || printf '\n' >&2
     else
+        printf '\n' >&2
         return 1
     fi
-    # Never emit a second, synthetic newline: the terminal already echoes Enter.
     printf -v "$dest" '%s' "$answer"
 }
 
@@ -5446,7 +5616,7 @@ choose_menu() {
     local i choice
     printf '\n%s\n' "$prompt" >&2
     for ((i=0; i<${#options[@]}; i++)); do
-        printf '%d) %s\n' "$((i+1))" "${options[$i]}" >&2
+        ui_line "$((i+1))) ${options[$i]}"
     done
     while true; do
         ui_read choice "Select: " || return 1
@@ -8076,7 +8246,7 @@ master_status() {
     echo
     print_info "Master API settings:"
     echo "Local API URL: http://127.0.0.1:8088"
-    echo "Listener: 0.0.0.0:8088 (remote reachability still depends on host/network firewall)"
+    ui_line "Listener: 0.0.0.0:8088 (remote reachability still depends on host/network firewall)"
     [[ -n "$token" ]] && echo "API token: $token_preview (masked)"
     echo "Session TTL: ${ttl:-120} seconds"
     echo "Remove missing ocpasswd users: ${remove:-0}"
@@ -8726,18 +8896,18 @@ exhausted_quota_file_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Exhausted Quota File Tools ===="
-        echo "1) List exhausted-quota users, auto-dedupe if duplicates exist"
-        echo "2) Reset file only, empty it"
-        echo "3) Dedupe file only, keep one row per username"
-        echo "4) Rebuild file from current DB state, only users still really over quota"
-        echo "5) Prune resolved users, remove users that are no longer over quota"
-        echo "6) Delete exhausted-quota file"
-        echo "0) Back"
+        ui_line "1) List exhausted-quota users, auto-dedupe if duplicates exist"
+        ui_line "2) Reset file only, empty it"
+        ui_line "3) Dedupe file only, keep one row per username"
+        ui_line "4) Rebuild file from current DB state, only users still really over quota"
+        ui_line "5) Prune resolved users, remove users that are no longer over quota"
+        ui_line "6) Delete exhausted-quota file"
+        ui_line "0) Back"
         echo
         echo "Important:"
         echo "- Reset only clears the report file."
-        echo "- If a user is still over quota, they can be logged again on next connect/heartbeat."
-        echo "- Rebuild is usually the cleanest option after changing quotas or adding traffic."
+        ui_line "- If a user is still over quota, they can be logged again on next connect/heartbeat."
+        ui_line "- Rebuild is usually the cleanest option after changing quotas or adding traffic."
         echo
         ui_read choice "Select: " || return 1
         case "$choice" in
@@ -9270,10 +9440,10 @@ restore_master_data() {
     elif [[ -z "$in" ]] && (( ${#candidates[@]} > 1 )); then
         echo "Detected Central backups (newest first):"
         for i in "${!candidates[@]}"; do
-            printf '%d) %s  [%s]\n' "$((i+1))" "${candidates[$i]}" "$(du -h "${candidates[$i]}" 2>/dev/null | awk '{print $1}')"
+            ui_line "$((i+1))) ${candidates[$i]} [$(du -h "${candidates[$i]}" 2>/dev/null | awk '{print $1}')]"
         done
         echo "$(( ${#candidates[@]} + 1 ))) Enter another path manually"
-        echo "0) Cancel"
+        ui_line "0) Cancel"
         while true; do
             ui_read choice "Select backup: " || return 1
             [[ "$choice" =~ ^[0-9]+$ ]] || { echo "Enter a number."; continue; }
@@ -9768,21 +9938,21 @@ backup_cleanup_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Backup / Restore / Cleanup Menu ===="
-        echo "1) Show database and usage_log statistics"
-        echo "2) Full backup: app + config + full database + full usage history"
-        echo "3) Lightweight backup: app + config + database without usage_log history"
-        echo "4) Config-only backup"
-        echo "5) DB-only backup"
-        echo "6) Custom backup"
-        echo "7) Restore backup"
-        echo "8) Cleanup old usage_log records manually"
-        echo "9) VACUUM / compact database"
-        echo "10) Configure automatic usage_log cleanup timer"
-        echo "11) Disable automatic cleanup timer"
-        echo "12) Show automatic cleanup timer status/logs"
-        echo "13) RECOMMENDED default backup: lightweight, keeps current usage, removes usage_log history"
-        echo "14) DEFAULT cleanup now: delete all usage_log history + VACUUM"
-        echo "0) Back"
+        ui_line "1) Show database and usage_log statistics"
+        ui_line "2) Full backup: app + config + full database + full usage history"
+        ui_line "3) Lightweight backup: app + config + database without usage_log history"
+        ui_line "4) Config-only backup"
+        ui_line "5) DB-only backup"
+        ui_line "6) Custom backup"
+        ui_line "7) Restore backup"
+        ui_line "8) Cleanup old usage_log records manually"
+        ui_line "9) VACUUM / compact database"
+        ui_line "10) Configure automatic usage_log cleanup timer"
+        ui_line "11) Disable automatic cleanup timer"
+        ui_line "12) Show automatic cleanup timer status/logs"
+        ui_line "13) RECOMMENDED default backup: lightweight, keeps current usage, removes usage_log history"
+        ui_line "14) DEFAULT cleanup now: delete all usage_log history + VACUUM"
+        ui_line "0) Back"
         echo
         ui_read choice "Select: " || return 1
         case "$choice" in
@@ -9879,16 +10049,16 @@ bulk_traffic_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Bulk Traffic / Quota Menu ===="
-        echo "1) Set one traffic quota for ALL groups"
-        echo "2) Remove traffic quota from ALL groups, make unlimited"
-        echo "3) Add extra traffic to ALL users"
-        echo "4) Set exact extra traffic for ALL users"
-        echo "5) Clear extra traffic from ALL users"
-        echo "6) Reset used traffic for ALL users"
-        echo "7) Show users"
-        echo "8) Show current limits.json"
-        echo "9) Decrease extra traffic from ALL users"
-        echo "0) Back"
+        ui_line "1) Set one traffic quota for ALL groups"
+        ui_line "2) Remove traffic quota from ALL groups, make unlimited"
+        ui_line "3) Add extra traffic to ALL users"
+        ui_line "4) Set exact extra traffic for ALL users"
+        ui_line "5) Clear extra traffic from ALL users"
+        ui_line "6) Reset used traffic for ALL users"
+        ui_line "7) Show users"
+        ui_line "8) Show current limits.json"
+        ui_line "9) Decrease extra traffic from ALL users"
+        ui_line "0) Back"
         echo
         ui_read choice "Select: " || return 1
         case "$choice" in
@@ -10400,8 +10570,8 @@ handle_group_manual_quota_overrides() {
     jq -r '.users[] | " - \(.username): manual_quota_gb=\(.quota_gb), max_sessions_override=\(.max_sessions // "none")"' <<<"$info"
     echo
     echo "How should these manually configured users be handled?"
-    echo "1) Keep their manual quota overrides; the group quota will NOT replace their manual volume"
-    echo "2) Apply the new group quota to them; remove only quota_gb override"
+    ui_line "1) Keep their manual quota overrides; the group quota will NOT replace their manual volume"
+    ui_line "2) Apply the new group quota to them; remove only quota_gb override"
     echo "   Any manual max_sessions override will be preserved"
     ui_read choice "Select [1]: " || return 1
     choice="${choice:-1}"
@@ -10457,9 +10627,9 @@ edit_one_group_quota() {
     echo
     print_warn "This group has $users_count synced users in central DB."
     echo "How should existing used traffic be handled?"
-    echo "1) Keep used traffic and apply the new quota immediately"
+    ui_line "1) Keep used traffic and apply the new quota immediately"
     echo "   Example: user used 80GB, new quota 100GB => remaining 20GB"
-    echo "2) Reset used traffic for users in this group to 0"
+    ui_line "2) Reset used traffic for users in this group to 0"
     echo "   Example: user used 80GB, new quota 100GB => remaining 100GB"
     ui_read reset_choice "Select [1]: " || return 1
     reset_choice="${reset_choice:-1}"
@@ -10537,14 +10707,14 @@ group_quota_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Group Quota / New Group Menu ===="
-        echo "1) List group limits and user counts"
-        echo "2) Add/sync NEW groups from ocpasswd only, keep old group settings"
-        echo "3) Edit ONE group quota/sessions and choose used-traffic handling"
-        echo "4) Make ONE group unlimited, keep sessions"
-        echo "5) Reset used traffic for ONE group"
-        echo "6) Configure ALL groups from ocpasswd, may edit existing groups too"
-        echo "7) Show current limits.json"
-        echo "0) Back"
+        ui_line "1) List group limits and user counts"
+        ui_line "2) Add/sync NEW groups from ocpasswd only, keep old group settings"
+        ui_line "3) Edit ONE group quota/sessions and choose used-traffic handling"
+        ui_line "4) Make ONE group unlimited, keep sessions"
+        ui_line "5) Reset used traffic for ONE group"
+        ui_line "6) Configure ALL groups from ocpasswd, may edit existing groups too"
+        ui_line "7) Show current limits.json"
+        ui_line "0) Back"
         echo
         ui_read choice "Select: " || return 1
         case "$choice" in
@@ -10579,8 +10749,8 @@ edit_user_override() {
 
     echo
     print_info "Editing user override: $u"
-    echo "If max sessions is 0, the user uses group default. Use -1 for unlimited sessions."
-    echo "If quota is 0 in user override, it means unlimited for this user override."
+    ui_line "If max sessions is 0, the user uses group default. Use -1 for unlimited sessions."
+    ui_line "If quota is 0 in user override, it means unlimited for this user override."
     echo
 
     max_sessions="$(ask_number "User max sessions, 0 = use group default, -1 = unlimited" "$current_ms")"
@@ -10601,9 +10771,9 @@ edit_user_override() {
 
     echo
     echo "How should this user's already-used traffic be handled?"
-    echo "1) Keep used traffic and apply the new user quota immediately"
+    ui_line "1) Keep used traffic and apply the new user quota immediately"
     echo "   Example: user used 80GB, new quota 100GB => remaining 20GB"
-    echo "2) Reset used traffic for this user to 0"
+    ui_line "2) Reset used traffic for this user to 0"
     echo "   Example: user used 80GB, new quota 100GB => remaining 100GB"
     ui_read reset_choice "Select [1]: " || return 1
     reset_choice="${reset_choice:-1}"
@@ -10885,14 +11055,14 @@ db_user_cleanup_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Database User Cleanup / ocpasswd Prune Menu ===="
-        echo "1) Show DB vs ocpasswd user statistics"
-        echo "2) List DB users missing from ocpasswd"
-        echo "3) Delete DB users missing from ocpasswd"
-        echo "4) List inactive DB users older than N days"
-        echo "5) Delete inactive users older than N days ONLY if missing from ocpasswd"
-        echo "6) DANGER: Delete inactive users older than N days even if still in ocpasswd"
-        echo "7) VACUUM / compact database"
-        echo "0) Back"
+        ui_line "1) Show DB vs ocpasswd user statistics"
+        ui_line "2) List DB users missing from ocpasswd"
+        ui_line "3) Delete DB users missing from ocpasswd"
+        ui_line "4) List inactive DB users older than N days"
+        ui_line "5) Delete inactive users older than N days ONLY if missing from ocpasswd"
+        ui_line "6) DANGER: Delete inactive users older than N days even if still in ocpasswd"
+        ui_line "7) VACUUM / compact database"
+        ui_line "0) Back"
         echo
         ui_read choice "Select: " || return 1
 
@@ -11092,8 +11262,8 @@ restore_usage_reset_snapshot() {
         return 1
     fi
 
-    echo "1) Recommended: old value before reset + current usage accumulated after reset"
-    echo "2) Exact old value: overwrite current usage with the value before reset"
+    ui_line "1) Recommended: old value before reset + current usage accumulated after reset"
+    ui_line "2) Exact old value: overwrite current usage with the value before reset"
     ui_read mode "Select [1]: " || return 1
     mode="${mode:-1}"
 
@@ -11156,8 +11326,8 @@ PYRESTORESNAPSHOT
 
 usage_log_recovery_cutoff() {
     local choice date_text
-    echo "1) Use ALL currently available usage_log records" >&2
-    echo "2) Use logs from a specific local date/time" >&2
+    ui_line "1) Use ALL currently available usage_log records" >&2
+    ui_line "2) Use logs from a specific local date/time" >&2
     ui_read choice "Select [1]: " || return 1
     choice="${choice:-1}"
     if [[ "$choice" == "2" ]]; then
@@ -11171,8 +11341,8 @@ usage_log_recovery_cutoff() {
 
 preview_usage_log_recovery() {
     local scope target cutoff db="$DB_DIR/central.db"
-    echo "1) One group"
-    echo "2) One user"
+    ui_line "1) One group"
+    ui_line "2) One user"
     ui_read scope "Select: " || return 1
     case "$scope" in
         1) target="$(ask_value "Group name" "group2")" ;;
@@ -11215,8 +11385,8 @@ PYPREVIEWLOGRECOVERY
 
 apply_usage_log_recovery() {
     local scope target cutoff db="$DB_DIR/central.db" was_active=0 rc=0
-    echo "1) Recover one group"
-    echo "2) Recover one user"
+    ui_line "1) Recover one group"
+    ui_line "2) Recover one user"
     ui_read scope "Select: " || return 1
     case "$scope" in
         1) target="$(ask_value "Group name" "group2")" ;;
@@ -11290,15 +11460,15 @@ usage_recovery_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Used Traffic Recovery / Undo Reset ===="
-        echo "1) Show recovery statistics"
-        echo "2) List exact pre-reset snapshot batches"
-        echo "3) Preview one snapshot batch"
-        echo "4) Restore one exact snapshot batch"
-        echo "5) Preview fallback recovery from usage_log"
-        echo "6) Apply fallback recovery from usage_log"
-        echo "0) Back"
+        ui_line "1) Show recovery statistics"
+        ui_line "2) List exact pre-reset snapshot batches"
+        ui_line "3) Preview one snapshot batch"
+        ui_line "4) Restore one exact snapshot batch"
+        ui_line "5) Preview fallback recovery from usage_log"
+        ui_line "6) Apply fallback recovery from usage_log"
+        ui_line "0) Back"
         echo
-        echo "v14 and newer create an exact snapshot automatically before user/group/all usage resets."
+        ui_line "v14 and newer create an exact snapshot automatically before user/group/all usage resets."
         echo "For resets that happened before v14, use usage_log fallback recovery."
         echo
         ui_read choice "Select: " || return 1
@@ -11497,13 +11667,13 @@ extra_traffic_recovery_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Extra Traffic History / Recovery ===="
-        echo "1) Show extra traffic and snapshot statistics"
-        echo "2) List extra traffic snapshot batches"
-        echo "3) Preview one snapshot batch"
-        echo "4) Restore one exact snapshot batch"
-        echo "0) Back"
+        ui_line "1) Show extra traffic and snapshot statistics"
+        ui_line "2) List extra traffic snapshot batches"
+        ui_line "3) Preview one snapshot batch"
+        ui_line "4) Restore one exact snapshot batch"
+        ui_line "0) Back"
         echo
-        echo "v15 records exact quota_extra_bytes values before add, decrease, set, and clear operations."
+        ui_line "v15 records exact quota_extra_bytes values before add, decrease, set, and clear operations."
         echo
         ui_read choice "Select: " || return 1
         case "$choice" in
@@ -12175,45 +12345,45 @@ master_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Master Menu ===="
-        echo "1) Install / reconfigure master (API token / TTL / prune / features)"
-        echo "2) Configure features: session limit / quota"
-        echo "3) Configure group limits from synchronized authority sources"
-        echo "4) Sync ocpasswd now"
-        echo "5) List users"
-        echo "6) Show one user"
-        echo "7) List active sessions"
-        echo "8) Add/edit user override"
-        echo "9) Remove user override"
-        echo "10) Reset user usage"
-        echo "11) Add traffic to user"
-        echo "12) Add time to user account"
-        echo "13) Set exact account expiry"
-        echo "14) Clear account expiry"
-        echo "15) Enable/disable user"
-        echo "16) List connected nodes / API servers"
-        echo "17) List exhausted-quota users"
-        echo "18) Exhausted-quota file tools: reset / dedupe / rebuild"
-        echo "19) Delete exhausted-quota file"
-        echo "20) Status"
-        echo "21) Show current limits.json"
-        echo "22) Backup / restore / cleanup menu"
-        echo "23) Restore program data directly"
-        echo "24) Uninstall master"
-        echo "25) Bulk traffic / quota menu"
-        echo "26) Group quota / new group menu"
-        echo "27) Database user cleanup / ocpasswd prune menu"
-        echo "28) Restart ocserv-central API"
-        echo "29) Refresh ocpasswd groups / apply current limits now"
-        echo "30) Used traffic recovery / undo accidental reset"
-        echo "31) Decrease added traffic from one user"
-        echo "32) Extra traffic change history / restore"
-        echo "33) Export usage information for one group to a TXT file"
-        echo "34) Export users at or above a used-traffic threshold to a TXT file"
-        echo "35) Prune central DB users missing from ocpasswd now"
-        echo "36) Configure automatic ocpasswd prune without reconfigure"
-        echo "37) Apply Master/API code update without reconfigure"
-        echo "38) List synchronized authority sources / conflicts"
-        echo "0) Back"
+        ui_line "1) Install / reconfigure master (API token / TTL / prune / features)"
+        ui_line "2) Configure features: session limit / quota"
+        ui_line "3) Configure group limits from synchronized authority sources"
+        ui_line "4) Sync ocpasswd now"
+        ui_line "5) List users"
+        ui_line "6) Show one user"
+        ui_line "7) List active sessions"
+        ui_line "8) Add/edit user override"
+        ui_line "9) Remove user override"
+        ui_line "10) Reset user usage"
+        ui_line "11) Add traffic to user"
+        ui_line "12) Add time to user account"
+        ui_line "13) Set exact account expiry"
+        ui_line "14) Clear account expiry"
+        ui_line "15) Enable/disable user"
+        ui_line "16) List connected nodes / API servers"
+        ui_line "17) List exhausted-quota users"
+        ui_line "18) Exhausted-quota file tools: reset / dedupe / rebuild"
+        ui_line "19) Delete exhausted-quota file"
+        ui_line "20) Status"
+        ui_line "21) Show current limits.json"
+        ui_line "22) Backup / restore / cleanup menu"
+        ui_line "23) Restore program data directly"
+        ui_line "24) Uninstall master"
+        ui_line "25) Bulk traffic / quota menu"
+        ui_line "26) Group quota / new group menu"
+        ui_line "27) Database user cleanup / ocpasswd prune menu"
+        ui_line "28) Restart ocserv-central API"
+        ui_line "29) Refresh ocpasswd groups / apply current limits now"
+        ui_line "30) Used traffic recovery / undo accidental reset"
+        ui_line "31) Decrease added traffic from one user"
+        ui_line "32) Extra traffic change history / restore"
+        ui_line "33) Export usage information for one group to a TXT file"
+        ui_line "34) Export users at or above a used-traffic threshold to a TXT file"
+        ui_line "35) Prune central DB users missing from ocpasswd now"
+        ui_line "36) Configure automatic ocpasswd prune without reconfigure"
+        ui_line "37) Apply Master/API code update without reconfigure"
+        ui_line "38) List synchronized authority sources / conflicts"
+        ui_line "0) Back"
         echo
         ui_read choice "Select: " || return 1
         case "$choice" in
@@ -12269,16 +12439,16 @@ node_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Node Menu ===="
-        echo "1) Install / reconfigure node"
-        echo "2) Edit node API settings"
-        echo "3) Enable live quota agent"
-        echo "4) Disable live quota agent"
-        echo "5) Status / logs"
-        echo "6) Test API connection"
-        echo "7) Re-apply ocserv.conf hook"
-        echo "8) Uninstall node and restore ocserv.conf"
-        echo "9) Apply Node code update without reconfigure"
-        echo "0) Back"
+        ui_line "1) Install / reconfigure node"
+        ui_line "2) Edit node API settings"
+        ui_line "3) Enable live quota agent"
+        ui_line "4) Disable live quota agent"
+        ui_line "5) Status / logs"
+        ui_line "6) Test API connection"
+        ui_line "7) Re-apply ocserv.conf hook"
+        ui_line "8) Uninstall node and restore ocserv.conf"
+        ui_line "9) Apply Node code update without reconfigure"
+        ui_line "0) Back"
         echo
         ui_read choice "Select: " || return 1
         case "$choice" in
@@ -12429,11 +12599,11 @@ central_service_control_menu() {
         echo "==== Central - Service Controls ===="
         echo "Master:       $(systemctl is-active ocserv-central.service 2>/dev/null || echo missing)"
         echo "Legacy Node:  $(systemctl is-active ocserv-central-agent.service 2>/dev/null || echo missing)"
-        echo "1) Manage Central Master service"
-        echo "2) Manage legacy Node Agent service"
-        echo "3) Manage a local per-instance Central agent"
-        echo "4) Show all Central component service statuses"
-        echo "0) Back"
+        ui_line "1) Manage Central Master service"
+        ui_line "2) Manage legacy Node Agent service"
+        ui_line "3) Manage a local per-instance Central agent"
+        ui_line "4) Show all Central component service statuses"
+        ui_line "0) Back"
         echo
         ui_read choice "Select: " || return 1
         case "$choice" in
@@ -12459,7 +12629,7 @@ central_service_control_menu() {
                 fi
                 printf 'Local Central agents:\n'
                 for ((i=0; i<${#local_units[@]}; i++)); do
-                    printf '%d) %s (%s)\n' "$((i+1))" "${local_units[$i]}" "$(systemctl is-active "${local_units[$i]}" 2>/dev/null || echo missing)"
+                    ui_line "$((i+1))) ${local_units[$i]} ($(systemctl is-active "${local_units[$i]}" 2>/dev/null || echo missing))"
                 done
                 ui_read n "Choose agent (0=Back): " || return 1
                 [[ "$n" =~ ^[0-9]+$ ]] && (( 10#$n >= 1 && 10#$n <= ${#local_units[@]} )) || continue
@@ -12474,8 +12644,8 @@ central_service_control_menu() {
         while true; do
             echo
             printf 'Selected: %s (%s)\n' "$unit" "$(systemctl is-active "$unit" 2>/dev/null || echo missing)"
-            echo "1) Start   2) Stop   3) Restart   4) Status   5) Recent logs"
-            echo "6) Enable at boot   7) Disable at boot   0) Back"
+            ui_line "1) Start   2) Stop   3) Restart   4) Status   5) Recent logs"
+            ui_line "6) Enable at boot   7) Disable at boot   0) Back"
             ui_read choice "Select: " || return 1
             case "$choice" in
                 1) action=start ;; 2) action=stop ;; 3) action=restart ;;
@@ -12546,10 +12716,10 @@ central_pause_menu() {
         safe_clear
         echo "==== Central - Temporary Enforcement Pause ===="
         central_pause_status
-        echo "1) Pause Central limits temporarily (1-60 minutes)"
-        echo "2) Resume Central limits now"
-        echo "3) Show pause status"
-        echo "0) Back"
+        ui_line "1) Pause Central limits temporarily (1-60 minutes)"
+        ui_line "2) Resume Central limits now"
+        ui_line "3) Show pause status"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) run_central_menu_action central_pause_enforcement; pause ;;
@@ -12617,18 +12787,18 @@ main_menu() {
         echo "=============================================="
         echo "       Ocserv Central Manager v20.4.4"
         echo "=============================================="
-        echo "1) Master server menu"
-        echo "2) Local ocserv instances / Node integration (multi-instance, recommended)"
-        echo "3) Install both Master and Node(s) on this server (all local ocserv instances)"
-        echo "4) Legacy single-instance Node menu (standalone/non-Manager installs)"
-        echo "5) Full status"
-        echo "6) Uninstall legacy Node part"
-        echo "7) Uninstall Master part"
-        echo "8) Apply program update without reconfigure"
-        echo "9) Service controls (Master, Agent, status, logs)"
-        echo "10) Temporary Central enforcement pause (timed, reversible)"
-        echo "11) Fully suspend / resume Central integration (local host)"
-        echo "0) Exit"
+        ui_line "1) Master server menu"
+        ui_line "2) Local ocserv instances / Node integration (multi-instance, recommended)"
+        ui_line "3) Install both Master and Node(s) on this server (all local ocserv instances)"
+        ui_line "4) Legacy single-instance Node menu (standalone/non-Manager installs)"
+        ui_line "5) Full status"
+        ui_line "6) Uninstall legacy Node part"
+        ui_line "7) Uninstall Master part"
+        ui_line "8) Apply program update without reconfigure"
+        ui_line "9) Service controls (Master, Agent, status, logs)"
+        ui_line "10) Temporary Central enforcement pause (timed, reversible)"
+        ui_line "11) Fully suspend / resume Central integration (local host)"
+        ui_line "0) Exit"
         echo
         ui_read choice "Select: " || return 1
         if [[ -d /etc/ocserv-manager/central-full-suspend ]]; then
@@ -13610,7 +13780,7 @@ vhost_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Virtual Hosts: $instance ===="
-        echo "1) List virtual hosts"; echo "2) Create virtual host"; echo "3) Delete virtual host"; echo "0) Back"
+        ui_line "1) List virtual hosts"; ui_line "2) Create virtual host"; ui_line "3) Delete virtual host"; ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in 1) list_vhosts "$instance"; pause;; 2) create_vhost "$instance"; pause;; 3) delete_vhost "$instance"; pause;; 0) return;; *) print_warn "Invalid selection.";; esac
     done
@@ -14195,9 +14365,9 @@ doctor_no_udp_test() {
     doctor_ocpasswd_user_line "$instance" "$user" >/dev/null 2>&1 || { print_err "Username is not present in this instance's ocpasswd file."; return 1; }
     file="$(user_dir "$instance")/$user"
     mkdir -p "$(dirname "$file")"
-    echo "1) Enable temporary no-udp=true for this user"
-    echo "2) Remove only the Doctor-managed temporary no-udp test"
-    echo "0) Cancel"
+    ui_line "1) Enable temporary no-udp=true for this user"
+    ui_line "2) Remove only the Doctor-managed temporary no-udp test"
+    ui_line "0) Cancel"
     ui_read mode "Select: " || return 1
     case "$mode" in
         1)
@@ -14234,11 +14404,11 @@ stability_doctor_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Stability Doctor: $instance ===="
-        echo "1) Full instance stability audit"
-        echo "2) Diagnose one username"
-        echo "3) Live login-failure capture + username diagnosis"
-        echo "4) Temporary per-user TCP-only (no-udp) isolation test"
-        echo "0) Back"
+        ui_line "1) Full instance stability audit"
+        ui_line "2) Diagnose one username"
+        ui_line "3) Live login-failure capture + username diagnosis"
+        ui_line "4) Temporary per-user TCP-only (no-udp) isolation test"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) stability_doctor_instance "$instance"; pause ;;
@@ -14255,14 +14425,14 @@ connection_stability_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Connection Stability / Mobile Roaming: $instance ===="
-        echo "1) Show current connection timers/settings"
-        echo "2) Apply RECOMMENDED service profile (30/30/60 timers, cookie 86400, roaming allowed, persistent cookies OFF)"
-        echo "3) Apply Aggressive roaming profile (persistent cookies ON; security tradeoff)"
-        echo "4) Apply upstream/default connection profile"
-        echo "5) Custom connection stability settings"
-        echo "6) Stability Doctor (instance/user/live diagnosis)"
-        echo "7) Restore a previous stability snapshot"
-        echo "0) Back"
+        ui_line "1) Show current connection timers/settings"
+        ui_line "2) Apply RECOMMENDED service profile (30/30/60 timers, cookie 86400, roaming allowed, persistent cookies OFF)"
+        ui_line "3) Apply Aggressive roaming profile (persistent cookies ON; security tradeoff)"
+        ui_line "4) Apply upstream/default connection profile"
+        ui_line "5) Custom connection stability settings"
+        ui_line "6) Stability Doctor (instance/user/live diagnosis)"
+        ui_line "7) Restore a previous stability snapshot"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) show_connection_stability_values "$instance"; pause ;;
@@ -14282,13 +14452,13 @@ repair_instance_menu() {
     local instance="$1" choice tmp
     while true; do
         echo; echo "==== Repair: $instance ===="
-        echo "1) Reapply scoped ingress/forwarding/NAT rules"
-        echo "2) Rebuild systemd units"
-        echo "3) Reapply saved manager state onto the preserved original/base config"
-        echo "4) Restart service"
-        echo "5) Reinstall Let's Encrypt reload hook"
-        echo "6) Restart Central live agent"
-        echo "0) Back"
+        ui_line "1) Reapply scoped ingress/forwarding/NAT rules"
+        ui_line "2) Rebuild systemd units"
+        ui_line "3) Reapply saved manager state onto the preserved original/base config"
+        ui_line "4) Restart service"
+        ui_line "5) Reinstall Let's Encrypt reload hook"
+        ui_line "6) Restart Central live agent"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) remove_firewall_for_instance "$instance"; apply_firewall_for_instance "$instance"; pause ;;
@@ -14314,8 +14484,8 @@ status_dashboard() {
     echo "ocserv binary: ${binary:-not found}"
     echo "Outbound interface: $(default_route_iface || echo unknown)"
     echo "IPv4 forwarding: $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unknown) (saved policy=$(ipv4_forwarding_policy))"
-    echo "Firewall: per-instance simple setup; iptables is default, UFW is opt-in and never auto-enabled."
-    echo "Advanced rules remain available under Firewall -> Advanced and stay isolated in manager-owned chains."
+    ui_line "Firewall: per-instance simple setup; iptables is default, UFW is opt-in and never auto-enabled."
+    ui_line "Advanced rules remain available under Firewall -> Advanced and stay isolated in manager-owned chains."
     echo
     local narrow_dashboard=0 term_cols="${COLUMNS:-80}"
     if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then term_cols="$(tput cols 2>/dev/null || echo 80)"; fi
@@ -14360,11 +14530,11 @@ certificate_manager() {
     local choice instance cert tmp
     while true; do
         echo; echo "==== Certificate Manager ===="
-        echo "1) Show certificate status for all instances"
-        echo "2) Change certificate for a manager-owned instance"
-        echo "3) Run certbot renew"
-        echo "4) Install/repair ocserv certificate reload hook"
-        echo "0) Back"
+        ui_line "1) Show certificate status for all instances"
+        ui_line "2) Change certificate for a manager-owned instance"
+        ui_line "3) Run certbot renew"
+        ui_line "4) Install/repair ocserv certificate reload hook"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1)
@@ -14408,7 +14578,7 @@ reconfigure_managed_instance() {
     oldsub="$(state_get "$instance" SUBNET)"; oldiface="$(state_get "$instance" OUT_IFACE 2>/dev/null || true)"
     oldipv6="$(state_get "$instance" IPV6_NETWORK 2>/dev/null || true)"; oldnat6="$(state_get "$instance" IPV6_NAT 2>/dev/null || echo 0)"
     oldtcp="$(state_get "$instance" TCP_PORT 2>/dev/null || echo 443)"; oldudp="$(state_get "$instance" UDP_PORT 2>/dev/null || echo "$oldtcp")"; oldfw="$(firewall_mode_for_instance "$instance")"
-    echo "Reconfigure sections. Existing values are preserved unless the selected section is changed."
+    ui_line "Reconfigure sections. Existing values are preserved unless the selected section is changed."
     while true; do
         choice="$(choose_menu "Select section:" "Listen IP and TCP/UDP ports" "VPN subnet" "Server certificate" "Authentication" "DNS" "Client/session and ban limits" "MTU/DPD/keepalive/IPv6 network profile" "Full/split routing, DNS leak and bypass" "Firewall mode (iptables / iptables-persistent / UFW)" "Open per-instance Firewall Manager" "Finish and apply" "Cancel")"
         case "$choice" in
@@ -14459,7 +14629,7 @@ configuration_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Configuration: $instance ===="
-        echo "1) Show config"; echo "2) Validate config"; echo "3) Guided reconfigure (patches the preserved original config structure)"; echo "4) Advanced raw edit (switches to preservation mode)"; echo "5) Restore exact version sample as base, then reapply selected values"; echo "6) config-per-user / config-per-group settings"; echo "7) IPv4 forwarding (global server setting)"; echo "0) Back"
+        ui_line "1) Show config"; ui_line "2) Validate config"; ui_line "3) Guided reconfigure (patches the preserved original config structure)"; ui_line "4) Advanced raw edit (switches to preservation mode)"; ui_line "5) Restore exact version sample as base, then reapply selected values"; ui_line "6) config-per-user / config-per-group settings"; ui_line "7) IPv4 forwarding (global server setting)"; ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) cat "$(instance_config "$instance")"; pause;;
@@ -14593,7 +14763,7 @@ api_menu() {
     local choice
     while true; do
         echo; echo "==== JSON / Read-only API ===="
-        echo "1) Print JSON status now"; echo "2) Enable/reconfigure read-only HTTP API"; echo "3) Disable API"; echo "4) API service status"; echo "0) Back"
+        ui_line "1) Print JSON status now"; ui_line "2) Enable/reconfigure read-only HTTP API"; ui_line "3) Disable API"; ui_line "4) API service status"; ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) json_status | jq .; pause;; 2) configure_readonly_api; pause;; 3) disable_readonly_api; pause;; 4) systemctl status ocserv-manager-api --no-pager || true; pause;; 0) return;; *) print_warn "Invalid selection.";; esac
@@ -15211,8 +15381,8 @@ fw_reload_iptables_persistent() {
 
 fw_set_persistence_mode() {
     local instance="$1" choice rollback
-    echo "1) Manager boot reapply only"
-    echo "2) iptables-persistent (save the complete host ruleset to /etc/iptables/rules.v4)"
+    ui_line "1) Manager boot reapply only"
+    ui_line "2) iptables-persistent (save the complete host ruleset to /etc/iptables/rules.v4)"
     ui_read choice "Select persistence mode: " || return 1
     case "$choice" in
         1)
@@ -15527,7 +15697,7 @@ fw_choose_interface() {
         items+=("$name"); states+=("${state:-?}"); addrs+=("${addr:-no-ipv4}")
     done < <(ip -o link show 2>/dev/null)
     echo "$prompt" >&2
-    [[ "$allow_any" == 1 ]] && echo "0) Any interface" >&2
+    [[ "$allow_any" == 1 ]] && ui_line "0) Any interface" >&2
     for ((i=0;i<${#items[@]};i++)); do
         printf '%d) %s (state: %s)\n   IPv4: %s\n' "$((i+1))" "${items[$i]}" "${states[$i]}" "${addrs[$i]}" >&2
     done
@@ -15558,7 +15728,7 @@ fw_choose_local_ipv4() {
     local -a ips=() ifs=()
     while read -r iface cidr; do [[ -n "$iface" && -n "$cidr" ]] || continue; ip="${cidr%%/*}"; [[ "$ip" == 127.* ]] && continue; ips+=("$ip"); ifs+=("$iface"); done < <(ip -o -4 addr show 2>/dev/null | awk '{print $2, $4}')
     echo "$prompt" >&2
-    for ((i=0;i<${#ips[@]};i++)); do printf '%d) %s on %s\n' "$((i+1))" "${ips[$i]}" "${ifs[$i]}" >&2; done
+    for ((i=0;i<${#ips[@]};i++)); do ui_line "$((i+1))) ${ips[$i]} on ${ifs[$i]}"; done
     echo "m) Enter IPv4 manually" >&2
     while true; do
         ui_read choice "Select: " || return 1
@@ -15586,23 +15756,23 @@ fw_choose_route() {
     local -a recs=()
     while IFS= read -r r; do [[ -n "$r" ]] && recs+=("$r"); done < <(fw_route_records "$family")
     echo "$prompt" >&2
-    for ((i=0;i<${#recs[@]};i++)); do IFS='|' read -r d dev via src table raw <<<"${recs[$i]}"; printf '%d) dest=%s dev=%s via=%s src=%s table=%s\n' "$((i+1))" "$d" "$dev" "${via:--}" "${src:--}" "$table" >&2; done
-    echo "0) Cancel" >&2
+    for ((i=0;i<${#recs[@]};i++)); do IFS='|' read -r d dev via src table raw <<<"${recs[$i]}"; ui_line "$((i+1))) dest=$d dev=$dev via=${via:--} src=${src:--} table=$table"; done
+    ui_line "0) Cancel" >&2
     while true; do ui_read choice "Select route: " || return 1; [[ "$choice" == 0 ]] && return 1; if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#recs[@]})); then echo "${recs[$((choice-1))]}"; return 0; fi; print_warn "Invalid selection." >&2; done
 }
 
 fw_choose_source() {
     local instance="$1" family="${2:-ipv4}" choice value
     echo "Source selector:" >&2
-    if [[ "$family" == ipv6 ]]; then echo "1) Instance IPv6 VPN pool (@vpn6)" >&2; else echo "1) Instance IPv4 VPN pool (@vpn)" >&2; fi
-    echo "2) Any source" >&2; echo "3) Custom IP/CIDR" >&2
+    if [[ "$family" == ipv6 ]]; then ui_line "1) Instance IPv6 VPN pool (@vpn6)" >&2; else ui_line "1) Instance IPv4 VPN pool (@vpn)" >&2; fi
+    ui_line "2) Any source" >&2; ui_line "3) Custom IP/CIDR" >&2
     ui_read choice "Select [1]: " || return 1; choice="${choice:-1}"
     case "$choice" in 1) [[ "$family" == ipv6 ]] && echo @vpn6 || echo @vpn ;; 2) echo any ;; 3) value="$(ask_value "Source IP/CIDR" "")"; echo "$value" ;; *) echo any ;; esac
 }
 
 fw_choose_destination() {
     local family="${1:-ipv4}" choice rec dest
-    echo "Destination selector:" >&2; echo "1) Any destination" >&2; echo "2) Choose from detected routing table" >&2; echo "3) Custom IP/CIDR" >&2
+    echo "Destination selector:" >&2; ui_line "1) Any destination" >&2; ui_line "2) Choose from detected routing table" >&2; ui_line "3) Custom IP/CIDR" >&2
     ui_read choice "Select [1]: " || return 1; choice="${choice:-1}"
     case "$choice" in
         1) echo any ;;
@@ -15617,7 +15787,7 @@ fw_choose_destination() {
 
 fw_select_primary_outbound() {
     local instance="$1" choice iface rec dest dev via src table raw
-    echo "Primary outbound selection:"; echo "1) Auto-detect current default route"; echo "2) Choose an interface"; echo "3) Choose from detected routes"
+    echo "Primary outbound selection:"; ui_line "1) Auto-detect current default route"; ui_line "2) Choose an interface"; ui_line "3) Choose from detected routes"
     ui_read choice "Select [1]: " || return 1; choice="${choice:-1}"
     case "$choice" in
         1) iface="$(default_route_iface)"; state_set "$instance" OUT_IFACE "$iface"; state_set "$instance" FIREWALL_PRIMARY_ROUTE "default(auto)" ;;
@@ -15662,17 +15832,17 @@ fw_rule_wizard() {
     local instance="$1" replace_index="${2:-}" existing="${3:-}" type kind family source dest inif outif action proto dport tosrc todst desc ret id table chain target match targetargs rec rdest rdev rvia rsrc rtable rraw
     id="$(jq -r '.id // empty' <<<"${existing:-{}}" 2>/dev/null || true)"; [[ -n "$id" ]] || id="$(fw_new_rule_id)"
     echo "Rule type:" >&2
-    echo "1) Stateful FORWARD pair (outbound + established return)" >&2
-    echo "2) One-way FORWARD rule" >&2
-    echo "3) NAT MASQUERADE" >&2
-    echo "4) NAT SNAT to a local/source IP" >&2
-    echo "5) DNAT / port forward" >&2
-    echo "6) INPUT allow/deny/reject" >&2
-    echo "7) OUTPUT allow/deny/reject" >&2
-    echo "8) Advanced managed netfilter rule (filter/nat/mangle/raw; no flush/policy commands)" >&2
-    echo "9) Native UFW rule (in / out / route; UFW backend only)" >&2
-    echo "10) TCP MSS clamp to PMTU on a forwarded path" >&2
-    echo "0) Cancel" >&2
+    ui_line "1) Stateful FORWARD pair (outbound + established return)" >&2
+    ui_line "2) One-way FORWARD rule" >&2
+    ui_line "3) NAT MASQUERADE" >&2
+    ui_line "4) NAT SNAT to a local/source IP" >&2
+    ui_line "5) DNAT / port forward" >&2
+    ui_line "6) INPUT allow/deny/reject" >&2
+    ui_line "7) OUTPUT allow/deny/reject" >&2
+    ui_line "8) Advanced managed netfilter rule (filter/nat/mangle/raw; no flush/policy commands)" >&2
+    ui_line "9) Native UFW rule (in / out / route; UFW backend only)" >&2
+    ui_line "10) TCP MSS clamp to PMTU on a forwarded path" >&2
+    ui_line "0) Cancel" >&2
     ui_read type "Select: " || return 1
     [[ "$type" == 0 ]] && return 1
     case "$type" in 1) kind=forward_pair ;; 2) kind=forward ;; 3) kind=nat_masquerade ;; 4) kind=nat_snat ;; 5) kind=dnat ;; 6) kind=input ;; 7) kind=output ;; 8) kind=advanced ;; 9) kind=ufw_native ;; 10) kind=mss_clamp ;; *) print_warn "Invalid selection." >&2; return 1 ;; esac
@@ -15683,7 +15853,7 @@ fw_rule_wizard() {
         forward_pair|forward)
             source="$(fw_choose_source "$instance" "$family")"; dest="$(fw_choose_destination "$family")"
             echo "Inbound interface is optional." >&2; inif="$(fw_choose_interface "Choose inbound interface" "" 1)"
-            echo "Outbound interface can be selected directly or from a route." >&2; echo "1) Interface" >&2; echo "2) Detected route" >&2
+            echo "Outbound interface can be selected directly or from a route." >&2; ui_line "1) Interface" >&2; ui_line "2) Detected route" >&2
             ui_read type "Select [1]: " || return 1; type="${type:-1}"
             if [[ "$type" == 2 ]]; then rec="$(fw_choose_route "Choose route" "$family")" || return 1; IFS='|' read -r rdest rdev rvia rsrc rtable rraw <<<"$rec"; outif="$rdev"; [[ "$dest" == any && "$rdest" != default ]] && dest="$rdest"; else outif="$(fw_choose_interface "Choose outbound interface" "" 0)"; fi
             echo "Action: 1) ACCEPT  2) DROP  3) REJECT" >&2; ui_read type "Select [1]: " || return 1; case "${type:-1}" in 2) action=DROP;;3) action=REJECT;;*) action=ACCEPT;; esac
@@ -15691,7 +15861,7 @@ fw_rule_wizard() {
             ;;
         nat_masquerade|nat_snat)
             source="$(fw_choose_source "$instance" "$family")"; dest="$(fw_choose_destination "$family")"
-            echo "1) Select output interface" >&2; echo "2) Select detected route" >&2; ui_read type "Select [2]: " || return 1; type="${type:-2}"
+            ui_line "1) Select output interface" >&2; ui_line "2) Select detected route" >&2; ui_read type "Select [2]: " || return 1; type="${type:-2}"
             if [[ "$type" == 2 ]]; then rec="$(fw_choose_route "Choose route used by this NAT rule" "$family")" || return 1; IFS='|' read -r rdest rdev rvia rsrc rtable rraw <<<"$rec"; outif="$rdev"; [[ "$dest" == any && "$rdest" != default ]] && dest="$rdest"; else outif="$(fw_choose_interface "Choose output interface" "" 0)"; fi
             if [[ "$kind" == nat_snat ]]; then [[ "$family" == ipv4 ]] && tosrc="$(fw_choose_local_ipv4 "Choose the local/source IPv4 used for SNAT")" || tosrc="$(ask_value "IPv6 source address for SNAT" "")"; fi
             ;;
@@ -15884,18 +16054,18 @@ fw_base_policy_menu() {
     ensure_firewall_policy_file "$instance" || return 1
     while true; do
         echo; echo "==== Base ocserv firewall policy: $instance ===="
-        echo "1) Toggle managed TCP/UDP ingress (current: $(state_get "$instance" FIREWALL_BASE_INGRESS 2>/dev/null || echo 1))"
-        echo "2) Toggle base VPN FORWARD pair (current: $(state_get "$instance" FIREWALL_BASE_FORWARD 2>/dev/null || echo 1))"
-        echo "3) IPv4 NAT mode (current: $(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || echo masquerade))"
-        echo "4) Primary outbound interface / detected route (current: $(fw_primary_out_iface "$instance"))"
-        echo "5) IPv6 NAT66 toggle (current: $(state_get "$instance" IPV6_NAT 2>/dev/null || echo 0))"
-        echo "0) Back"
+        ui_line "1) Toggle managed TCP/UDP ingress (current: $(state_get "$instance" FIREWALL_BASE_INGRESS 2>/dev/null || echo 1))"
+        ui_line "2) Toggle base VPN FORWARD pair (current: $(state_get "$instance" FIREWALL_BASE_FORWARD 2>/dev/null || echo 1))"
+        ui_line "3) IPv4 NAT mode (current: $(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || echo masquerade))"
+        ui_line "4) Primary outbound interface / detected route (current: $(fw_primary_out_iface "$instance"))"
+        ui_line "5) IPv6 NAT66 toggle (current: $(state_get "$instance" IPV6_NAT 2>/dev/null || echo 0))"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) rollback="$(fw_prepare_change "$instance" base-ingress)"; [[ "$(state_get "$instance" FIREWALL_BASE_INGRESS 2>/dev/null || echo 1)" == 1 ]] && state_set "$instance" FIREWALL_BASE_INGRESS 0 || state_set "$instance" FIREWALL_BASE_INGRESS 1; fw_commit_or_rollback "$instance" "$rollback" ;;
             2) rollback="$(fw_prepare_change "$instance" base-forward)"; [[ "$(state_get "$instance" FIREWALL_BASE_FORWARD 2>/dev/null || echo 1)" == 1 ]] && state_set "$instance" FIREWALL_BASE_FORWARD 0 || state_set "$instance" FIREWALL_BASE_FORWARD 1; fw_commit_or_rollback "$instance" "$rollback" ;;
             3)
-                echo "1) MASQUERADE (recommended for dynamic/default egress)"; echo "2) SNAT to a selected local IP"; echo "3) No base IPv4 NAT"
+                ui_line "1) MASQUERADE (recommended for dynamic/default egress)"; ui_line "2) SNAT to a selected local IP"; ui_line "3) No base IPv4 NAT"
                 ui_read mode "Select: " || return 1; rollback="$(fw_prepare_change "$instance" base-nat)"
                 case "$mode" in 1) state_set "$instance" FIREWALL_BASE_NAT_MODE masquerade; state_set "$instance" FIREWALL_BASE_SNAT_IP "" ;; 2) ip="$(fw_choose_local_ipv4 "Choose local IPv4 for base SNAT")"; state_set "$instance" FIREWALL_BASE_NAT_MODE snat; state_set "$instance" FIREWALL_BASE_SNAT_IP "$ip" ;; 3) state_set "$instance" FIREWALL_BASE_NAT_MODE none ;; *) rm -rf "$rollback"; continue ;; esac
                 fw_commit_or_rollback "$instance" "$rollback"
@@ -15989,7 +16159,7 @@ fw_restore_snapshot_menu() {
     root="$(fw_snapshot_dir_for_instance "$instance")"; [[ -d "$root" ]] || { print_warn "No persistent firewall snapshots exist for $instance."; return 0; }
     while IFS= read -r d; do [[ -d "$d" ]] && snaps+=("$d"); done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%p\n' | sort -r)
     ((${#snaps[@]})) || { print_warn "No snapshots found."; return 0; }
-    echo "Firewall snapshots:"; for ((i=0;i<${#snaps[@]};i++)); do printf '%d) %s\n' "$((i+1))" "${snaps[$i]}"; done; echo "0) Cancel"
+    echo "Firewall snapshots:"; for ((i=0;i<${#snaps[@]};i++)); do ui_line "$((i+1))) ${snaps[$i]}"; done; ui_line "0) Cancel"
     ui_read choice "Select: " || return 1
     [[ "$choice" == 0 ]] && return 0
     [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#snaps[@]})) || { print_warn "Invalid selection."; return 0; }
@@ -16016,7 +16186,7 @@ fw_restore_snapshot_menu() {
 
 fw_reset_defaults() {
     local instance="$1" rollback mode file tmp
-    echo "Reset options:"; echo "1) Reset base/custom policy but keep current backend"; echo "2) Full Manager firewall defaults (iptables + base ingress/forward/MASQUERADE + no custom rules)"; echo "0) Cancel"
+    echo "Reset options:"; ui_line "1) Reset base/custom policy but keep current backend"; ui_line "2) Full Manager firewall defaults (iptables + base ingress/forward/MASQUERADE + no custom rules)"; ui_line "0) Cancel"
     ui_read mode "Select: " || return 1; [[ "$mode" == 0 ]] && return 0
     ask_yes_no "Reset the saved firewall policy for $instance?" "n" || return 0; rollback="$(fw_prepare_change "$instance" reset-defaults)"
     state_set "$instance" FIREWALL_PROFILE iptables-standard; state_set "$instance" FIREWALL_BASE_INGRESS 1; state_set "$instance" FIREWALL_BASE_FORWARD 1; state_set "$instance" FIREWALL_BASE_NAT_MODE masquerade; state_set "$instance" FIREWALL_BASE_SNAT_IP ""; state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 0; state_set "$instance" FIREWALL_PERSISTENCE manager; state_set "$instance" OUT_IFACE "$(default_route_iface)"; state_set "$instance" FIREWALL_PRIMARY_ROUTE "default(auto)"
@@ -16048,9 +16218,9 @@ fw_choose_interface_simple() {
         items+=("$name"); states+=("${state:-?}"); addrs+=("${addr:-no-ipv4}")
     done < <(ip -o link show 2>/dev/null)
     echo "$prompt" >&2
-    [[ "$allow_any" == 1 ]] && echo "0) Any interface" >&2
+    [[ "$allow_any" == 1 ]] && ui_line "0) Any interface" >&2
     for ((i=0;i<${#items[@]};i++)); do
-        printf '%d) %s  state=%s  ipv4=%s\n' "$((i+1))" "${items[$i]}" "${states[$i]}" "${addrs[$i]}" >&2
+        ui_line "$((i+1))) ${items[$i]} state=${states[$i]} ipv4=${addrs[$i]}"
     done
     echo "m) Enter interface manually" >&2
     while true; do
@@ -16132,10 +16302,10 @@ fw_backup_restore_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Firewall backup / restore: $instance ===="
-        echo "1) Create snapshot"
-        echo "2) Restore snapshot"
-        echo "3) Reset firewall profile to Manager defaults"
-        echo "0) Back"
+        ui_line "1) Create snapshot"
+        ui_line "2) Restore snapshot"
+        ui_line "3) Reset firewall profile to Manager defaults"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) fw_create_snapshot "$instance" manual || true; pause ;;
@@ -16150,10 +16320,10 @@ fw_backup_restore_menu() {
 fw_netfilter_persistent_service_menu() {
     local choice
     echo "netfilter-persistent service: $(systemctl is-enabled netfilter-persistent.service 2>/dev/null || echo not-installed/disabled) / $(systemctl is-active netfilter-persistent.service 2>/dev/null || echo inactive)"
-    echo "1) Enable service at boot"
-    echo "2) Disable service at boot"
-    echo "3) Restart/reload service now"
-    echo "0) Back"
+    ui_line "1) Enable service at boot"
+    ui_line "2) Disable service at boot"
+    ui_line "3) Restart/reload service now"
+    ui_line "0) Back"
     ui_read choice "Select: " || return 1
     case "$choice" in
         1) install_available_packages iptables iptables-persistent; systemctl enable netfilter-persistent.service; print_ok "netfilter-persistent enabled." ;;
@@ -16172,13 +16342,13 @@ fw_iptables_management_menu() {
         echo "Global MASQUERADE: $(iptables -t nat -C POSTROUTING -j MASQUERADE >/dev/null 2>&1 && echo ON || echo OFF)"
         echo "Saved IPv4 rules: $([[ -s "$IPTABLES_RULES_V4" ]] && echo present || echo not-saved)"
         echo
-        echo "1) Apply iptables-persistent legacy/plain mode"
-        echo "2) Show current rules"
-        echo "3) Save current IPv4 rules"
-        echo "4) Reload saved IPv4 rules"
-        echo "5) Global MASQUERADE on/off"
-        echo "6) netfilter-persistent service"
-        echo "0) Back"
+        ui_line "1) Apply iptables-persistent legacy/plain mode"
+        ui_line "2) Show current rules"
+        ui_line "3) Save current IPv4 rules"
+        ui_line "4) Reload saved IPv4 rules"
+        ui_line "5) Global MASQUERADE on/off"
+        ui_line "6) netfilter-persistent service"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) fw_activate_simple_persistent_now "$instance"; pause ;;
@@ -16233,15 +16403,15 @@ fw_ufw_management_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== UFW management: $instance ===="
-        echo "1) Install UFW package"
-        echo "2) Show UFW status / numbered rules"
-        echo "3) Enable UFW"
-        echo "4) Disable UFW"
-        echo "5) Reload UFW"
-        echo "6) Add a managed UFW rule"
-        echo "7) Delete a UFW rule by number"
-        echo "8) Switch this instance backend to UFW"
-        echo "0) Back"
+        ui_line "1) Install UFW package"
+        ui_line "2) Show UFW status / numbered rules"
+        ui_line "3) Enable UFW"
+        ui_line "4) Disable UFW"
+        ui_line "5) Reload UFW"
+        ui_line "6) Add a managed UFW rule"
+        ui_line "7) Delete a UFW rule by number"
+        ui_line "8) Switch this instance backend to UFW"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) install_available_packages ufw; pause ;;
@@ -16262,13 +16432,13 @@ fw_routing_nat_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Routing / NAT: $instance ===="
-        echo "1) Select primary outbound interface / detected route"
-        echo "2) Configure base IPv4 NAT (MASQUERADE / SNAT / none)"
-        echo "3) Add VPN FORWARD rule through an interface"
-        echo "4) Add VPN MASQUERADE rule on an interface"
-        echo "5) Add/edit advanced NAT or forwarding rule"
-        echo "6) Show detected interfaces, local IPs, routes and policy rules"
-        echo "0) Back"
+        ui_line "1) Select primary outbound interface / detected route"
+        ui_line "2) Configure base IPv4 NAT (MASQUERADE / SNAT / none)"
+        ui_line "3) Add VPN FORWARD rule through an interface"
+        ui_line "4) Add VPN MASQUERADE rule on an interface"
+        ui_line "5) Add/edit advanced NAT or forwarding rule"
+        ui_line "6) Show detected interfaces, local IPs, routes and policy rules"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) local rb; rb="$(fw_prepare_change "$instance" primary-outbound)"; fw_select_primary_outbound "$instance"; fw_commit_or_rollback "$instance" "$rb"; pause ;;
@@ -16289,13 +16459,13 @@ fw_rules_management_menu() {
         echo; echo "==== Managed firewall rules: $instance ===="
         fw_simple_rule_list "$instance"
         echo
-        echo "1) Add rule"
-        echo "2) Edit rule"
-        echo "3) Enable/disable rule"
-        echo "4) Delete rule"
-        echo "5) Clone rule"
-        echo "6) Remove all managed custom rules"
-        echo "0) Back"
+        ui_line "1) Add rule"
+        ui_line "2) Edit rule"
+        ui_line "3) Enable/disable rule"
+        ui_line "4) Delete rule"
+        ui_line "5) Clone rule"
+        ui_line "6) Remove all managed custom rules"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) fw_policy_add_rule "$instance"; pause ;;
@@ -16323,12 +16493,12 @@ fw_status_menu() {
         echo; echo "==== Firewall status: $instance ===="
         fw_policy_summary "$instance"
         echo
-        echo "1) Apply current saved profile"
-        echo "2) Show Manager-owned rules"
-        echo "3) Show full host firewall (read-only)"
-        echo "4) Show detected network"
-        echo "5) Network path report (read-only)"
-        echo "0) Back"
+        ui_line "1) Apply current saved profile"
+        ui_line "2) Show Manager-owned rules"
+        ui_line "3) Show full host firewall (read-only)"
+        ui_line "4) Show detected network"
+        ui_line "5) Network path report (read-only)"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) apply_firewall_for_instance "$instance"; pause ;;
@@ -16350,13 +16520,13 @@ firewall_manager_menu() {
         echo "Current profile: $(fw_profile_for_instance "$instance")"
         echo "Global MASQUERADE: $(iptables -t nat -C POSTROUTING -j MASQUERADE >/dev/null 2>&1 && echo ON || echo OFF)"
         echo
-        echo "1) Choose/change firewall mode"
-        echo "2) iptables"
-        echo "3) UFW"
-        echo "4) Advanced NAT / routing / managed rules"
-        echo "5) Backup / restore"
-        echo "6) Status / diagnostics"
-        echo "0) Back"
+        ui_line "1) Choose/change firewall mode"
+        ui_line "2) iptables"
+        ui_line "3) UFW"
+        ui_line "4) Advanced NAT / routing / managed rules"
+        ui_line "5) Backup / restore"
+        ui_line "6) Status / diagnostics"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) fw_backend_menu "$instance"; pause ;;
@@ -16375,13 +16545,13 @@ instance_detail_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Instance: $instance ===="
-        echo "1) Status"; echo "2) Start"; echo "3) Stop"; echo "4) Restart"; echo "5) Reload"
-        echo "6) Logs"; echo "7) Users"; echo "8) Groups"; echo "9) Configuration"
-        echo "10) Virtual hosts (SNI)"; echo "11) Diagnostics"; echo "12) Repair"
-        echo "13) Clone"; echo "14) Delete instance"; echo "15) Connection stability / mobile roaming / restore"
-        echo "16) config-per-user / config-per-group settings"
-        echo "17) Firewall (iptables / iptables-persistent / UFW)"
-        echo "0) Back"
+        ui_line "1) Status"; ui_line "2) Start"; ui_line "3) Stop"; ui_line "4) Restart"; ui_line "5) Reload"
+        ui_line "6) Logs"; ui_line "7) Users"; ui_line "8) Groups"; ui_line "9) Configuration"
+        ui_line "10) Virtual hosts (SNI)"; ui_line "11) Diagnostics"; ui_line "12) Repair"
+        ui_line "13) Clone"; ui_line "14) Delete instance"; ui_line "15) Connection stability / mobile roaming / restore"
+        ui_line "16) config-per-user / config-per-group settings"
+        ui_line "17) Firewall (iptables / iptables-persistent / UFW)"
+        ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) show_instance_status "$instance"; pause;;
@@ -16402,7 +16572,7 @@ instances_menu() {
     local choice instance
     while true; do
         echo; echo "==== Ocserv Instances ===="
-        echo "1) List/status dashboard"; echo "2) Create new instance"; echo "3) Manage existing instance"; echo "4) Import existing ocserv installation"; echo "5) Migrate/copy default single instance to named multi-instance"; echo "0) Back"
+        ui_line "1) List/status dashboard"; ui_line "2) Create new instance"; ui_line "3) Manage existing instance"; ui_line "4) Import existing ocserv installation"; ui_line "5) Migrate/copy default single instance to named multi-instance"; ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) status_dashboard || print_warn "Dashboard completed with one or more non-fatal errors."; pause;; 2) create_instance_wizard; pause;;
@@ -16494,7 +16664,7 @@ uninstall_menu() {
     local choice instance
     while true; do
         echo; echo "==== Safe Uninstall ===="
-        echo "1) Remove one instance"; echo "2) Remove manager UI/API only (preserve VPN runtime)"; echo "3) Full cleanup"; echo "0) Back"
+        ui_line "1) Remove one instance"; ui_line "2) Remove manager UI/API only (preserve VPN runtime)"; ui_line "3) Full cleanup"; ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in 1) instance="$(choose_instance)" && delete_instance "$instance"; pause;; 2) uninstall_manager_ui_only; return;; 3) uninstall_everything_menu; return;; 0) return;; *) print_warn "Invalid selection.";; esac
     done
@@ -16552,7 +16722,7 @@ backup_menu() {
     local choice
     while true; do
         echo; echo "==== Backup / Restore ===="
-        echo "1) Create backup"; echo "2) Restore backup"; echo "3) List backups"; echo "0) Back"
+        ui_line "1) Create backup"; ui_line "2) Restore backup"; ui_line "3) List backups"; ui_line "0) Back"
         ui_read choice "Select: " || return 1
         case "$choice" in 1) backup_interactive; pause;; 2) restore_backup_interactive; pause;; 3) ls -lh "$BACKUP_ROOT"/*.tar.gz 2>/dev/null || echo "No backups."; pause;; 0) return;; *) print_warn "Invalid selection.";; esac
     done
@@ -16578,20 +16748,20 @@ main_menu() {
         echo "=================================================="
         echo " $PROGRAM_NAME v$PROGRAM_VERSION"
         echo "=================================================="
-        echo "1) Install / update ocserv (choose version, no reconfigure)"
-        echo "2) Instances (default + multi-instance)"
-        echo "3) Users"
-        echo "4) Groups"
-        echo "5) Certificates"
-        echo "6) Backup / restore"
-        echo "7) Diagnostics dashboard"
-        echo "8) Open integrated Ocserv Central Manager"
-        echo "9) JSON / read-only API"
-        echo "10) Audit logging settings"
-        echo "11) Version information"
-        echo "12) Apply this Manager code update without reconfigure"
-        echo "13) Safe uninstall"
-        echo "0) Exit"
+        ui_line "1) Install / update ocserv (choose version, no reconfigure)"
+        ui_line "2) Instances (default + multi-instance)"
+        ui_line "3) Users"
+        ui_line "4) Groups"
+        ui_line "5) Certificates"
+        ui_line "6) Backup / restore"
+        ui_line "7) Diagnostics dashboard"
+        ui_line "8) Open integrated Ocserv Central Manager"
+        ui_line "9) JSON / read-only API"
+        ui_line "10) Audit logging settings"
+        ui_line "11) Version information"
+        ui_line "12) Apply this Manager code update without reconfigure"
+        ui_line "13) Safe uninstall"
+        ui_line "0) Exit"
         ui_read choice "Select: " || return 1
         case "$choice" in
             1) install_or_update_ocserv; pause;;
