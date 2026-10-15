@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Ocserv Manager v3.9.4.2 (terminal I/O improvements on top of v3.9.4.1)
+# Ocserv Manager v3.9.1
 # Multi-instance installer and manager for ocserv on Ubuntu/Debian.
 # Designed as a replacement for the original single-instance ocserv.sh.
 
 set -Eeuo pipefail
 IFS=$' \t\n'
 
-PROGRAM_VERSION="3.9.4.2"
+PROGRAM_VERSION="3.9.1"
 PROGRAM_NAME="Ocserv Manager"
 OCSERV_SILENT_CLIENT_FIX_VERSION="1.5.0"
 OCSERV_PASSWORD_RETRY_FIXED="1.4.2"
@@ -36,8 +36,6 @@ CENTRAL_LIB_DIR="/usr/local/lib/ocserv-manager/central"
 CENTRAL_EMBED_STATE="$MANAGER_ETC/central-embedded.env"
 CENTRAL_PROFILE="$CENTRAL_INTEGRATION_DIR/profile.env"
 CENTRAL_EMBEDDED_VERSION="v20.4.4"
-CENTRAL_FULL_STATE="$MANAGER_ETC/central-full-suspend"
-CENTRAL_FULL_LOCK="$MANAGER_ETC/.central-full-suspend.lock"
 TEMPLATE_ROOT="$MANAGER_ETC/templates"
 INSTANCE_BASE_ROOT="$MANAGER_ETC/config-bases"
 STABILITY_BACKUP_ROOT="$BACKUP_ROOT/stability"
@@ -57,143 +55,10 @@ CURRENT_TXN_SERVICE=""
 CURRENT_TXN_CONFIG=""
 CURRENT_TXN_APPLY_MODE="restart"
 
-# UI messages use stderr so functions returning data through $(...) never mix
-# a warning/menu/prompt with their machine-readable return value.
-# Escape codes are emitted only to an interactive terminal.
-if [[ ! -t 2 || "${TERM:-dumb}" == "dumb" || "${NO_COLOR:-}" != "" ]]; then
-    C_RESET='' C_RED='' C_GREEN='' C_YELLOW='' C_CYAN=''
-fi
-# Terminal output is word-wrapped only for a real terminal (or a UI test).
-# Data returned on stdout by functions and CLI commands is never modified.
-ui_columns() {
-    local dest="$1" terminal_width="${COLUMNS:-80}" detected=''
-    if [[ -t 2 && -r /dev/tty ]]; then
-        if [[ "${UI_WIDTH_CACHE_SECONDS:-}" == "$SECONDS" && "${UI_WIDTH_CACHE:-}" =~ ^[0-9]+$ ]]; then
-            terminal_width="$UI_WIDTH_CACHE"
-        else
-            detected="$(stty size </dev/tty 2>/dev/null || true)"
-            detected="${detected##* }"
-            [[ "$detected" =~ ^[0-9]+$ ]] && terminal_width="$detected"
-            UI_WIDTH_CACHE="$terminal_width"
-            UI_WIDTH_CACHE_SECONDS="$SECONDS"
-        fi
-    fi
-    [[ "$terminal_width" =~ ^[0-9]+$ ]] || terminal_width=80
-    (( terminal_width >= 24 )) || terminal_width=24
-    (( terminal_width <= 500 )) || terminal_width=500
-    printf -v "$dest" '%s' "$terminal_width"
-}
-
-# Usage: ui_render "visible prefix" "ANSI color" "message".
-# Hanging indentation keeps menu numbers and status labels legible.
-ui_render() {
-    local prefix="$1" color="$2" content="$3" cols first next words word piece
-    local first_prefix="$prefix" next_prefix='' line='' used=0 available
-    if [[ ! -t 2 && "${OCSERV_UI_TEST_WRAP:-0}" != 1 ]]; then
-        printf '%b%s%b%s\n' "$color" "$prefix" "$C_RESET" "$content" >&2
-        return 0
-    fi
-    ui_columns cols
-    if [[ -z "$prefix" && "$content" =~ ^([0-9]+\)[[:space:]]+)(.*)$ ]]; then
-        first_prefix="${BASH_REMATCH[1]}"
-        content="${BASH_REMATCH[2]}"
-    elif [[ -z "$prefix" && "$content" =~ ^(-[[:space:]]+)(.*)$ ]]; then
-        first_prefix="${BASH_REMATCH[1]}"
-        content="${BASH_REMATCH[2]}"
-    fi
-    printf -v next_prefix '%*s' "${#first_prefix}" ''
-    # UI text is not a data serialization format. Only spaces and tabs used
-    # for layout are collapsed, never the contents of captured stdout.
-    content="${content//$'\t'/ }"
-    content="${content//$'\r'/}"
-    local -a chunks=()
-    while [[ "$content" == *$'\n'* ]]; do
-        chunks+=("${content%%$'\n'*}")
-        content="${content#*$'\n'}"
-    done
-    chunks+=("$content")
-    local chunk last=0 current_prefix="$first_prefix" emit_color="$color"
-    for chunk in "${chunks[@]}"; do
-        local -a tokens=()
-        read -r -a tokens <<< "$chunk"
-        line=''
-        if (( ${#tokens[@]} == 0 )); then
-            printf '%b%s%b\n' "$emit_color" "$current_prefix" "$C_RESET" >&2
-            current_prefix="$next_prefix"; emit_color=''
-            continue
-        fi
-        for word in "${tokens[@]}"; do
-            while [[ -n "$word" ]]; do
-                available=$((cols - ${#current_prefix} - 1))
-                (( available >= 8 )) || available=8
-                if [[ -n "$line" ]] && (( ${#line} + 1 + ${#word} > available )); then
-                    printf '%b%s%b%s\n' "$emit_color" "$current_prefix" "$C_RESET" "$line" >&2
-                    line=''; current_prefix="$next_prefix"; emit_color=''
-                    continue
-                fi
-                if (( ${#word} > available )); then
-                    piece="${word:0:available}"
-                    word="${word:available}"
-                    if [[ -n "$line" ]]; then
-                        printf '%b%s%b%s\n' "$emit_color" "$current_prefix" "$C_RESET" "$line" >&2
-                        line=''; current_prefix="$next_prefix"; emit_color=''
-                    fi
-                    printf '%b%s%b%s\n' "$emit_color" "$current_prefix" "$C_RESET" "$piece" >&2
-                    current_prefix="$next_prefix"; emit_color=''
-                else
-                    if [[ -z "$line" ]]; then line="$word"; else line+=" $word"; fi
-                    word=''
-                fi
-            done
-        done
-        if [[ -n "$line" ]]; then
-            printf '%b%s%b%s\n' "$emit_color" "$current_prefix" "$C_RESET" "$line" >&2
-        fi
-        current_prefix="$next_prefix"; emit_color=''
-    done
-}
-ui_line()   { ui_render '' '' "$*"; }
-print_ok()   { ui_render '[OK] '   "$C_GREEN" "$*"; }
-print_warn() { ui_render '[WARN] ' "$C_YELLOW" "$*"; }
-print_err()  { ui_render '[ERR] '  "$C_RED" "$*"; }
-print_info() { ui_render '[INFO] ' "$C_CYAN" "$*"; }
-
-ui_read() {
-    local dest="$1" prompt="$2" answer='' cols question label='Answer: ' trimmed
-    ui_columns cols
-    # Keep input on a fresh line when the question/default cannot fit.
-    if (( ${#prompt} >= cols - 3 )) || [[ "$prompt" == *$'\n'* ]]; then
-        trimmed="${prompt% }"
-        question="$trimmed"
-        if [[ "$trimmed" =~ ^(.*)[[:space:]](\[[^]]+\]:)$ ]]; then
-            question="${BASH_REMATCH[1]}"
-            label="${BASH_REMATCH[2]} "
-        elif [[ "$trimmed" == *: ]]; then
-            question="${trimmed%:}"
-        fi
-        ui_line "$question"
-        if (( ${#label} >= cols - 3 )); then
-            ui_line "Default selection: $label"
-            label='Value: '
-        fi
-        printf '%s' "$label" >&2
-    else
-        printf '%s' "$prompt" >&2
-    fi
-    # Read from controlling tty when stdin is a script/pipe and a tty exists.
-    if [[ -t 0 ]]; then
-        if ! IFS= read -r answer; then printf '\n' >&2; return 1; fi
-    elif [[ -t 2 && -r /dev/tty ]]; then
-        if ! IFS= read -r answer </dev/tty; then printf '\n' >&2; return 1; fi
-    elif IFS= read -r answer; then
-        # Piped/test input is not echoed by a terminal; finish the prompt line.
-        [[ -t 2 ]] || printf '\n' >&2
-    else
-        printf '\n' >&2
-        return 1
-    fi
-    printf -v "$dest" '%s' "$answer"
-}
+print_ok()   { echo -e "${C_GREEN}[OK]${C_RESET} $*"; }
+print_warn() { echo -e "${C_YELLOW}[WARN]${C_RESET} $*"; }
+print_err()  { echo -e "${C_RED}[ERR]${C_RESET} $*" >&2; }
+print_info() { echo -e "${C_CYAN}[INFO]${C_RESET} $*"; }
 
 on_error() {
     local rc=$? line="${1:-?}" cmd="${2:-?}"
@@ -240,31 +105,24 @@ ensure_stability_backup_root() {
 }
 
 pause() {
-    printf '\n' >&2
-    local ignored
-    ui_read ignored "Press Enter to continue..." || return 0
+    echo
+    read -r -p "Press Enter to continue..." _unused || true
 }
 
 ask_yes_no() {
     local prompt="$1" default="${2:-y}" ans
     while true; do
         if [[ "$default" == "y" ]]; then
-            if ! ui_read ans "$prompt [Y/n]: "; then
-                print_warn "Input closed: no automatic confirmation or persistent backup."
-                return 1
-            fi
+            read -r -p "$prompt [Y/n]: " ans || true
             ans="${ans:-y}"
         else
-            if ! ui_read ans "$prompt [y/N]: "; then
-                print_warn "Input closed: action cancelled."
-                return 1
-            fi
+            read -r -p "$prompt [y/N]: " ans || true
             ans="${ans:-n}"
         fi
-        case "${ans,,}" in
-            y|yes) return 0 ;;
-            n|no) return 1 ;;
-            *) print_warn "Please answer y or n." ;;
+        case "$ans" in
+            y|Y|yes|YES|Yes) return 0 ;;
+            n|N|no|NO|No) return 1 ;;
+            *) echo "Please answer y or n." ;;
         esac
     done
 }
@@ -272,10 +130,10 @@ ask_yes_no() {
 ask_value() {
     local prompt="$1" default="${2:-}" ans
     if [[ -n "$default" ]]; then
-        ui_read ans "$prompt [$default]: " || return 1
+        read -r -p "$prompt [$default]: " ans || true
         printf '%s\n' "${ans:-$default}"
     else
-        ui_read ans "$prompt: " || return 1
+        read -r -p "$prompt: " ans || true
         printf '%s\n' "$ans"
     fi
 }
@@ -283,7 +141,7 @@ ask_value() {
 ask_nonempty() {
     local prompt="$1" default="${2:-}" ans
     while true; do
-        ans="$(ask_value "$prompt" "$default")" || return 1
+        ans="$(ask_value "$prompt" "$default")"
         if [[ -n "$ans" ]]; then
             printf '%s\n' "$ans"
             return 0
@@ -295,8 +153,8 @@ ask_nonempty() {
 ask_integer() {
     local prompt="$1" default="${2:-0}" min="${3:-0}" max="${4:-2147483647}" ans
     while true; do
-        ans="$(ask_value "$prompt" "$default")" || return 1
-        if [[ "$ans" =~ ^[0-9]+$ ]] && (( 10#$ans >= min && 10#$ans <= max )); then
+        ans="$(ask_value "$prompt" "$default")"
+        if [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= min && ans <= max )); then
             printf '%s\n' "$ans"
             return 0
         fi
@@ -308,17 +166,17 @@ choose_menu() {
     local prompt="$1"; shift
     local -a options=("$@")
     local i choice
-    printf '\n%s\n' "$prompt" >&2
+    echo "$prompt" >&2
     for ((i=0; i<${#options[@]}; i++)); do
-        ui_line "$((i+1))) ${options[$i]}"
+        printf '%d) %s\n' "$((i+1))" "${options[$i]}" >&2
     done
     while true; do
-        ui_read choice "Select: " || return 1
-        if [[ "$choice" =~ ^[0-9]+$ ]] && (( 10#$choice >= 1 && 10#$choice <= ${#options[@]} )); then
+        read -r -p "Select: " choice || true
+        if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#options[@]} )); then
             printf '%s\n' "$choice"
             return 0
         fi
-        print_warn "Invalid selection."
+        print_warn "Invalid selection." >&2
     done
 }
 
@@ -610,13 +468,13 @@ select_ocserv_install_target() {
     echo "Installed version: ${current:-not installed}" >&2
     echo "Latest upstream tag: ${latest:-unavailable}" >&2
     echo "Choose installation source:" >&2
-    ui_line "1) Latest stable upstream source (${latest:-online lookup})" >&2
-    ui_line "2) Choose an upstream version from online list" >&2
-    ui_line "3) Enter a specific upstream version/tag" >&2
-    ui_line "4) Ubuntu/Debian distribution package" >&2
-    ui_line "0) Back" >&2
+    echo "1) Latest stable upstream source (${latest:-online lookup})" >&2
+    echo "2) Choose an upstream version from online list" >&2
+    echo "3) Enter a specific upstream version/tag" >&2
+    echo "4) Ubuntu/Debian distribution package" >&2
+    echo "0) Back" >&2
     while true; do
-        ui_read choice "Select: " || return 1
+        read -r -p "Select: " choice || true
         case "$choice" in
             0|1|2|3|4) break ;;
             *) print_warn "Invalid selection." >&2 ;;
@@ -637,10 +495,10 @@ select_ocserv_install_target() {
             (( tags_count > 0 )) || { print_err "No versions returned." >&2; return 1; }
             echo "Available upstream versions:" >&2
             for ((i=0; i<tags_count && i<30; i++)); do
-                ui_line "$((i+1))) ${_tags[$i]}"
+                printf '%d) %s\n' "$((i+1))" "${_tags[$i]}" >&2
             done
             while true; do
-                ui_read selection "Select version number: " || return 1
+                read -r -p "Select version number: " selection || true
                 if [[ "$selection" =~ ^[0-9]+$ ]] && (( selection>=1 && selection<=tags_count && selection<=30 )); then
                     printf 'source|%s\n' "${_tags[$((selection-1))]}"
                     return 0
@@ -1114,9 +972,9 @@ choose_instance() {
     while IFS= read -r i; do [[ -n "$i" ]] && items+=("$i"); done < <(list_instances | sort -u)
     ((${#items[@]})) || { print_err "No managed ocserv instance found." >&2; return 1; }
     echo "Instances:" >&2
-    for ((idx=0; idx<${#items[@]}; idx++)); do ui_line "$((idx+1))) ${items[$idx]}"; done
+    for ((idx=0; idx<${#items[@]}; idx++)); do printf '%d) %s\n' "$((idx+1))" "${items[$idx]}" >&2; done
     while true; do
-        ui_read idx "Select instance: " || return 1
+        read -r -p "Select instance: " idx || true
         if [[ "$idx" =~ ^[0-9]+$ ]] && ((idx>=1 && idx<=${#items[@]})); then
             printf '%s\n' "${items[$((idx-1))]}"
             return 0
@@ -1305,7 +1163,6 @@ PYRELOAD
 }
 
 transactional_replace_config() {
-    central_full_assert_normal || return 1
     local instance="$1" newfile="$2" conf service rollback_file="" persistent_backup="" keep_backup=0 apply_mode="restart" connected=0
     conf="$(instance_config "$instance")"
     service="$(instance_service "$instance")"
@@ -1816,11 +1673,11 @@ ipv4_forwarding_menu() {
         echo "Saved Manager policy: $([[ "$desired" == 1 ]] && echo enabled || echo disabled)"
         echo "Persistent sysctl: $persistent"
         echo
-        ui_line "1) Enable and persist"
-        ui_line "2) Reapply saved setting"
-        ui_line "3) Disable and persist (not recommended for a VPN router)"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Enable and persist"
+        echo "2) Reapply saved setting"
+        echo "3) Disable and persist (not recommended for a VPN router)"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) enable_ip_forwarding; print_ok "IPv4 forwarding is enabled now and will persist after reboot."; pause ;;
             2) apply_ip_forwarding_policy; print_ok "Saved IPv4 forwarding policy reapplied."; pause ;;
@@ -1935,14 +1792,14 @@ configure_firewall_mode() {
     profile="$(fw_profile_for_instance "$instance")"
     echo
     echo "==== Firewall setup: $instance ===="
-    ui_line "1) iptables - standard Manager rules"
-    ui_line "2) iptables-persistent - legacy/plain"
-    ui_line "   Uses persistent host-wide NAT and does not create Manager INPUT/FORWARD/NAT rules for this instance."
-    ui_line "3) UFW"
-    ui_line "0) Back / keep current"
+    echo "1) iptables - standard Manager rules"
+    echo "2) iptables-persistent - legacy/plain"
+    echo "   Uses persistent host-wide NAT and does not create Manager INPUT/FORWARD/NAT rules for this instance."
+    echo "3) UFW"
+    echo "0) Back / keep current"
     echo "Current: $profile"
     while true; do
-        ui_read choice "Select [keep current]: " || return 1
+        read -r -p "Select [keep current]: " choice || true
         [[ -n "$choice" ]] || return 0
         case "$choice" in
             1)
@@ -2618,7 +2475,7 @@ choose_shared_passwd() {
                 for candidate in "${paths[@]}"; do echo "$idx) $candidate"; ((idx++)); done
                 echo "$idx) Custom path"
                 while true; do
-                    ui_read choice "Select: " || return 1
+                    read -r -p "Select: " choice || true
                     [[ "$choice" =~ ^[0-9]+$ ]] || continue
                     if (( choice >=1 && choice <= ${#paths[@]} )); then
                         printf '%s\n' "${paths[$((choice-1))]}"; return
@@ -3084,9 +2941,7 @@ rebase_instance_on_stock_config() {
         if (( keep_oldbase == 1 )) && [[ -f "$oldbase" ]]; then print_info "Previous base backup: $oldbase"; else rm -f "$oldbase" 2>/dev/null || true; fi
     else
         [[ -f "$oldbase" ]] && cp -a "$oldbase" "$base" || true
-        rm -f "$tmp"
-        (( keep_oldbase == 0 )) && rm -f "$oldbase" 2>/dev/null || true
-        return 1
+        rm -f "$tmp"; return 1
     fi
     rm -f "$tmp"
 }
@@ -3497,12 +3352,12 @@ supplemental_files_menu() {
         echo
         echo "==== config-per-$kind files: $instance ===="
         echo "Directory: $dir"
-        ui_line "1) List files"
-        ui_line "2) Show one file"
-        ui_line "3) Edit/create one raw file"
-        ui_line "4) Delete one file"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) List files"
+        echo "2) Show one file"
+        echo "3) Edit/create one raw file"
+        echo "4) Delete one file"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) [[ -d "$dir" ]] && find "$dir" -maxdepth 1 -type f -printf '%f\n' | sort || echo "No directory/files yet."; pause ;;
             2) name="$(ask_nonempty "File name (username/group name)")"; safe_name "$name" || { print_err "Invalid file name."; pause; continue; }; file="${dir%/}/$name"; [[ -f "$file" ]] && cat "$file" || print_warn "File not found."; pause ;;
@@ -3534,16 +3389,16 @@ supplemental_config_menu() {
         echo "==== Per-user / Per-group supplemental configuration: $instance ===="
         echo "config-per-user:  $([[ "$ustate" == 1 ]] && echo enabled || echo disabled) | $udir"
         echo "config-per-group: $([[ "$gstate" == 1 ]] && echo enabled || echo disabled) | $gdir"
-        ui_line "1) Enable config-per-user"
-        ui_line "2) Disable config-per-user"
-        ui_line "3) Change config-per-user directory"
-        ui_line "4) Manage config-per-user files"
-        ui_line "5) Enable config-per-group"
-        ui_line "6) Disable config-per-group"
-        ui_line "7) Change config-per-group directory"
-        ui_line "8) Manage config-per-group files"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Enable config-per-user"
+        echo "2) Disable config-per-user"
+        echo "3) Change config-per-user directory"
+        echo "4) Manage config-per-user files"
+        echo "5) Enable config-per-group"
+        echo "6) Disable config-per-group"
+        echo "7) Change config-per-group directory"
+        echo "8) Manage config-per-group files"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) set_supplemental_feature "$instance" user enable; pause ;;
             2) set_supplemental_feature "$instance" user disable; pause ;;
@@ -3579,12 +3434,12 @@ choose_user_groups() {
         return 0
     fi
     echo "$prompt" >&2
-    for idx in "${!groups[@]}"; do ui_line "$((idx+1))) ${groups[$idx]}"; done
+    for idx in "${!groups[@]}"; do printf '%d) %s\n' "$((idx+1))" "${groups[$idx]}" >&2; done
     echo "m) Enter group name(s) manually" >&2
-    (( allow_none == 1 )) && ui_line "0) No explicit group / wildcard (*)" >&2
-    ui_line "You may select multiple existing groups with comma-separated numbers, e.g. 1,3." >&2
+    (( allow_none == 1 )) && echo "0) No explicit group / wildcard (*)" >&2
+    echo "You may select multiple existing groups with comma-separated numbers, e.g. 1,3." >&2
     while true; do
-        ui_read input "Select group(s): " || return 1
+        read -r -p "Select group(s): " input || true
         input="${input// /}"
         if (( allow_none == 1 )) && [[ -z "$input" || "$input" == 0 ]]; then
             printf '*\n'
@@ -3695,7 +3550,7 @@ create_user() {
     passwd="$(passwd_for_instance "$instance")"; bin="$(ocpasswd_bin)"
     [[ -x "$bin" ]] || { print_err "ocpasswd not found."; return 1; }
     while true; do
-        ui_read username "Username (blank = cancel): " || return 1
+        read -r -p "Username (blank = cancel): " username || true
         if [[ -z "$username" ]]; then
             print_info "User creation cancelled. You can create users later from the Users menu."
             return 0
@@ -4114,13 +3969,13 @@ bandwidth_limits_menu() {
         echo "==== Bandwidth limits: $instance ===="
         echo "Ocserv native shaping: rx-data-per-sec / tx-data-per-sec (bytes/sec)."
         echo "Manager input is Mbps; 1 Mbps = 125000 bytes/sec."
-        ui_line "1) Set/edit group bandwidth"
-        ui_line "2) Show one group bandwidth"
-        ui_line "3) Set/edit user bandwidth"
-        ui_line "4) Show one user bandwidth"
-        ui_line "5) List all explicit bandwidth limits"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Set/edit group bandwidth"
+        echo "2) Show one group bandwidth"
+        echo "3) Set/edit user bandwidth"
+        echo "4) Show one user bandwidth"
+        echo "5) List all explicit bandwidth limits"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) configure_bandwidth_limit "$instance" group; pause ;;
             2) show_bandwidth_target "$instance" group; pause ;;
@@ -4142,21 +3997,21 @@ user_management_menu() {
     while true; do
         echo
         echo "==== Users: $instance ===="
-        ui_line "1) Create user"
-        ui_line "2) Change password"
-        ui_line "3) Lock user"
-        ui_line "4) Unlock user"
-        ui_line "5) Delete user"
-        ui_line "6) Change user group"
-        ui_line "7) List users (password hashes hidden)"
-        ui_line "8) Show connected users (JSON)"
-        ui_line "9) Connected user count"
-        ui_line "10) Show session client/software information"
-        ui_line "11) Disconnect user"
-        ui_line "12) Bandwidth limits (per-user / per-group)"
-        ui_line "13) config-per-user / config-per-group settings"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Create user"
+        echo "2) Change password"
+        echo "3) Lock user"
+        echo "4) Unlock user"
+        echo "5) Delete user"
+        echo "6) Change user group"
+        echo "7) List users (password hashes hidden)"
+        echo "8) Show connected users (JSON)"
+        echo "9) Connected user count"
+        echo "10) Show session client/software information"
+        echo "11) Disconnect user"
+        echo "12) Bandwidth limits (per-user / per-group)"
+        echo "13) config-per-user / config-per-group settings"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) create_user "$instance" || true; pause ;;
             2) change_user_password "$instance" || true; pause ;;
@@ -4182,13 +4037,13 @@ group_management_menu() {
     while true; do
         echo
         echo "==== Groups: $instance ===="
-        ui_line "1) List groups and settings"
-        ui_line "2) Create/edit group"
-        ui_line "3) Delete group supplemental config"
-        ui_line "4) Bandwidth limits (per-group / per-user)"
-        ui_line "5) config-per-user / config-per-group settings"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) List groups and settings"
+        echo "2) Create/edit group"
+        echo "3) Delete group supplemental config"
+        echo "4) Bandwidth limits (per-group / per-user)"
+        echo "5) config-per-user / config-per-group settings"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) show_groups "$instance"; pause ;;
             2) create_or_edit_group "$instance"; pause ;;
@@ -4545,7 +4400,6 @@ central_register_detected_instances_for_attach() {
 # Exact modern equivalent of the old v19 "Install both master and node on this server":
 # use the local Master and attach every local ocserv instance as its own source-aware Node.
 central_attach_all_local_master() {
-    central_full_assert_normal || return 1
     local token i failed=0 count=0 token_preview
     token="$(detect_local_central_token)"
     [[ -n "$token" ]] || { print_err "Local Central Master token was not detected. Install/start the Master first."; return 1; }
@@ -4574,7 +4428,6 @@ central_attach_all_local_master() {
 }
 
 central_sync_local_master_profile() {
-    central_full_assert_normal || return 1
     local token i failed=0 updated=0
     token="$(detect_local_central_token)"
     [[ -n "$token" ]] || { print_err "Local Central Master token was not detected."; return 1; }
@@ -4652,7 +4505,6 @@ central_profile_load() {
 }
 
 central_profile_configure() {
-    central_full_assert_normal || return 1
     local api token interval timeout fail auto=0 local_token i attached=0 failed=0
     install_runtime_dependencies; install_available_packages curl jq python3
     local_token="$(detect_local_central_token)"
@@ -4697,7 +4549,6 @@ central_profile_configure() {
 }
 
 central_auto_attach_enabled() {
-    central_full_assert_normal >/dev/null 2>&1 || return 1
     [[ -f "$CENTRAL_PROFILE" ]] || return 1
     central_profile_load
     [[ "${AUTO_ATTACH:-0}" == 1 ]]
@@ -4770,7 +4621,6 @@ PYIMPCENTRAL
 }
 
 central_attach_instance_from_profile() {
-    central_full_assert_normal || return 1
     local instance="$1" interactive="${2:-1}" envf node source_id tmp svc passwd
     [[ -f "$CENTRAL_PROFILE" ]] || {
         if [[ "$interactive" == 1 ]]; then central_profile_configure; else return 1; fi
@@ -4826,7 +4676,6 @@ configure_central_for_instance() {
 }
 
 central_detach_instance() {
-    central_full_assert_normal || return 1
     local instance="$1" quiet="${2:-0}" envf svc api token source_id tmp
     envf="$(central_env_file "$instance")"
     api="" token="" source_id="$(state_get "$instance" CENTRAL_SOURCE_ID 2>/dev/null || true)"
@@ -4862,12 +4711,8 @@ central_detach_instance() {
 disable_central_for_instance() { central_detach_instance "$1" 0; }
 
 central_instances_status() {
-    local i enabled svc source passwd sock any=0 narrow=0 width="${COLUMNS:-80}"
-    if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then width="$(tput cols 2>/dev/null || echo 80)"; fi
-    [[ "$width" =~ ^[0-9]+$ ]] || width=80
-    if (( width < 112 )); then narrow=1; else
-        printf '%-20s %-10s %-30s %-28s %-s\n' "INSTANCE" "CENTRAL" "SOURCE-ID" "OCPASSWD" "AGENT"
-    fi
+    local i enabled svc source passwd sock any=0
+    printf '%-20s %-10s %-30s %-28s %-s\n' "INSTANCE" "CENTRAL" "SOURCE-ID" "OCPASSWD" "AGENT"
     while read -r i; do
         [[ -n "$i" ]] || continue; any=1
         enabled="$(state_get "$i" CENTRAL_ENABLED 2>/dev/null || echo 0)"
@@ -4875,11 +4720,7 @@ central_instances_status() {
         passwd="$(instance_passwd "$i" 2>/dev/null || echo '?')"
         svc="$(systemctl is-active "$(central_agent_service "$i")" 2>/dev/null || echo inactive)"
         [[ "$enabled" == 1 ]] || svc="disabled"
-        if (( narrow == 1 )); then
-            printf 'Instance: %s\n  Central enabled: %s\n  Source ID: %s\n  ocpasswd: %s\n  Agent: %s\n\n' "$i" "$enabled" "$source" "$passwd" "$svc"
-        else
-            printf '%-20s %-10s %-30s %-28s %-s\n' "$i" "$enabled" "$source" "$passwd" "$svc"
-        fi
+        printf '%-20s %-10s %-30s %-28s %-s\n' "$i" "$enabled" "$source" "$passwd" "$svc"
     done < <(list_instances | sort -u)
     (( any == 1 )) || echo "No ocserv instances found."
     if [[ -f "$CENTRAL_PROFILE" ]]; then
@@ -4897,7 +4738,6 @@ central_instances_status() {
 }
 
 central_force_sync_instance() {
-    central_full_assert_normal || return 1
     local instance="$1" svc
     svc="$(central_agent_service "$instance")"
     [[ "$(state_get "$instance" CENTRAL_ENABLED 2>/dev/null || echo 0)" == 1 ]] || { print_warn "$instance is not attached."; return 1; }
@@ -4907,7 +4747,6 @@ central_force_sync_instance() {
 }
 
 migrate_central_multi_instance_v20_once() {
-    central_full_assert_normal >/dev/null 2>&1 || return 0
     local marker="$CENTRAL_INTEGRATION_DIR/.v20-migrated" i envf node passwd changed=0
     [[ -f "$marker" ]] && return 0
     # Only do work when an existing v2.5-style attachment is present.
@@ -4939,396 +4778,23 @@ migrate_central_multi_instance_v20_once() {
     print_ok "Existing Central attachments migrated to v20 source-aware agents."
 }
 
-
-# ----------------------------------------------------------------------------
-# FULL Central detachment (local server, reversible; not the timed policy pause)
-# Requires a deliberate ocserv restart when connect/disconnect hooks change.
-# State survives reboot; snapshots are operational rollback, NOT a retained backup.
-# ----------------------------------------------------------------------------
-central_full_is_suspended() { [[ -d "$CENTRAL_FULL_STATE" ]]; }
-central_full_assert_normal() {
-    if central_full_is_suspended; then
-        print_err "Full Central suspension is in progress/active. Resume or recover it before changing Central attachments, ocserv config or performing an integrated update."
-        return 1
-    fi
-}
-central_full_status() {
-    if [[ ! -d "$CENTRAL_FULL_STATE" ]]; then
-        print_info "Full Central integration: NORMAL (not suspended on this host)."
-        return 0
-    fi
-    local phase count units
-    phase="$(cat "$CENTRAL_FULL_STATE/phase" 2>/dev/null || echo unknown)"
-    count="$(wc -l < "$CENTRAL_FULL_STATE/configs.tsv" 2>/dev/null || echo '?')"
-    units="$(wc -l < "$CENTRAL_FULL_STATE/units.tsv" 2>/dev/null || echo '?')"
-    print_warn "Full Central integration state: $phase (local host)."
-    print_info "Recorded ocserv configurations: $count; service units: $units."
-    print_info "Reversible state: $CENTRAL_FULL_STATE (mode 0700); NO user/usage database or source ID was deleted."
-    if [[ "$phase" == pending ]]; then
-        print_warn "An interrupted transition needs recovery. Do not manually start the Central Master until resolved."
-    fi
-}
-
-# Generate a modified config offline, preserving all user-owned hooks.
-# Imported-instance Central blocks are removed; originally preserved user hooks
-# are restored exactly as the legacy imported configuration patch would do.
-central_full_make_offline_config() {
-    local original="$1" output="$2"
-    python3 - "$original" "$output" <<'PYCENTRALOFF'
-import pathlib,re,sys
-original, output=map(pathlib.Path,sys.argv[1:3])
-s=original.read_text(encoding='utf-8')
-lines=s.splitlines(keepends=True)
-start='# BEGIN OCSERV-MANAGER-CENTRAL-IMPORTED'
-end='# END OCSERV-MANAGER-CENTRAL-IMPORTED'
-preserved='# ocserv-manager central preserved: '
-legacy_paths={
-    '/usr/local/sbin/ocserv-central-connect.sh',
-    '/usr/local/sbin/ocserv-central-disconnect.sh',
-    '/usr/local/sbin/ocserv-central-hook.sh',
-}
-result=[]; in_imported=False; imported_count=0; restored_count=0; removed=0
-for line in lines:
-    raw=line.rstrip('\r\n')
-    if raw.strip()==start:
-        if in_imported: raise ValueError('Nested Central imported block')
-        in_imported=True; imported_count+=1
-        continue
-    if raw.strip()==end:
-        if not in_imported: raise ValueError('Unexpected end of imported Central block')
-        in_imported=False
-        continue
-    if in_imported:
-        continue
-    if raw.startswith(preserved):
-        result.append(line.replace(preserved,'',1)); restored_count+=1
-        continue
-    m=re.match(r'^\s*(connect-script|disconnect-script)\s*=\s*(.*)$',raw,re.I)
-    if m:
-        hook=m.group(2).split('#',1)[0].strip().strip('"\'')
-        if hook.startswith('/usr/local/lib/ocserv-manager/central/') or hook in legacy_paths:
-            # No commented Central hook directive left active.
-            result.append('# ocserv-manager full-suspend: '+line)
-            removed+=1
-            continue
-    result.append(line)
-if in_imported: raise ValueError('Unterminated Central imported block')
-if imported_count>1: raise ValueError('Multiple Central imported blocks: manual inspection required')
-if (imported_count or removed or restored_count)==0:
-    # Unrelated instance, preserve exact bytes; never touch its config.
-    output.write_bytes(original.read_bytes())
-else:
-    output.write_text(''.join(result),encoding='utf-8')
-print(f'Central hook directives disabled: {removed}; imported blocks removed: {imported_count}; preserved user directives restored: {restored_count}',file=sys.stderr)
-PYCENTRALOFF
-}
-central_full_atomic_apply() {
-    local dest="$1" src="$2" temp
-    [[ -f "$dest" && ! -L "$dest" ]] || { print_err "Unsafe config path (missing or symlink): $dest"; return 1; }
-    temp="$(mktemp "$(dirname "$dest")/.ocserv-central-switch.XXXXXX")" || return 1
-    if ! cp -a -- "$dest" "$temp" || ! cat -- "$src" > "$temp" || ! mv -f -- "$temp" "$dest"; then
-        rm -f -- "$temp"
-        return 1
-    fi
-}
-central_full_collect_units() {
-    {
-        printf '%s\n' 'ocserv-central.service' 'ocserv-central-agent.service' 'ocserv-central-cleanup.timer' 'ocserv-central-cleanup.service'
-        systemctl list-unit-files --no-legend --no-pager 'ocserv-manager-central@*.service' 2>/dev/null | awk '{print $1}' || true
-        systemctl list-units --all --no-legend --no-pager 'ocserv-manager-central@*.service' 2>/dev/null | awk '{print $1}' || true
-        local i
-        while IFS= read -r i; do
-            [[ "$i" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || continue
-            [[ "$(state_get "$i" CENTRAL_ENABLED 2>/dev/null || echo 0)" == 1 ]] && central_agent_service "$i"
-        done < <(list_instances | sort -u)
-    } | grep -E '^(ocserv-central\.service|ocserv-central-agent\.service|ocserv-central-cleanup\.timer|ocserv-central-cleanup\.service|ocserv-manager-central@[a-zA-Z0-9][a-zA-Z0-9._-]*\.service)$' | sort -u
-}
-central_full_restore_unit() {
-    local unit="$1" was_active="$2" was_enabled="$3"
-    case "$was_enabled" in
-        enabled|linked) systemctl enable "$unit" >/dev/null || return 1 ;;
-        enabled-runtime|linked-runtime) systemctl enable --runtime "$unit" >/dev/null || return 1 ;;
-        disabled) systemctl disable "$unit" >/dev/null || return 1 ;;
-        *) : ;; # static/indirect/alias/masked: do not change boot policy
-    esac
-    if [[ "$was_active" == active && "$unit" != ocserv-central-cleanup.service ]]; then
-        systemctl start "$unit" >/dev/null || return 1
-    elif [[ "$was_active" != not-found ]]; then
-        systemctl stop "$unit" >/dev/null || return 1
-    fi
-}
-central_full_restore_services() {
-    local state="$1" unit active enabled errors=0
-    # Master before Agents when resuming; safe to leave existing inactive off.
-    if [[ -f "$state/units.tsv" ]]; then
-        while IFS=$'\t' read -r unit active enabled; do
-            [[ -n "$unit" ]] || continue
-            [[ "$unit" == ocserv-central.service ]] || continue
-            central_full_restore_unit "$unit" "$active" "$enabled" || errors=$((errors+1))
-        done < "$state/units.tsv"
-        while IFS=$'\t' read -r unit active enabled; do
-            [[ -n "$unit" && "$unit" != ocserv-central.service ]] || continue
-            central_full_restore_unit "$unit" "$active" "$enabled" || errors=$((errors+1))
-        done < "$state/units.tsv"
-    fi
-    (( errors == 0 ))
-}
-central_full_stop_services() {
-    local state="$1" unit active enabled errors=0
-    # Stop agents/timer first, Master last. Never disable a static/indirect unit.
-    while IFS=$'\t' read -r unit active enabled; do
-        [[ "$unit" != ocserv-central.service ]] || continue
-        if [[ "$active" == active ]]; then
-            systemctl stop "$unit" || errors=$((errors+1))
-        fi
-        case "$enabled" in
-            enabled|enabled-runtime|linked|linked-runtime) systemctl disable "$unit" || errors=$((errors+1)) ;;
-        esac
-    done < "$state/units.tsv"
-    while IFS=$'\t' read -r unit active enabled; do
-        [[ "$unit" == ocserv-central.service ]] || continue
-        if [[ "$active" == active ]]; then
-            systemctl stop "$unit" || errors=$((errors+1))
-        fi
-        case "$enabled" in
-            enabled|enabled-runtime|linked|linked-runtime) systemctl disable "$unit" || errors=$((errors+1)) ;;
-        esac
-    done < "$state/units.tsv"
-    # Verify systemd has actually stopped the targeted components.
-    while IFS=$'\t' read -r unit active enabled; do
-        [[ -n "$unit" ]] || continue
-        if systemctl is-active --quiet "$unit" 2>/dev/null; then
-            print_err "Central component is still active after stop: $unit"
-            errors=$((errors+1))
-        fi
-    done < "$state/units.tsv"
-    (( errors == 0 ))
-}
-
-# Restore either original or offline snapshot. Only overwrite when the current
-# bytes are exactly an expected transition snapshot (never destroy later edits).
-central_full_switch_configs() {
-    local state="$1" direction="$2" ix instance conf original offline orig_hash off_hash was_active current target errors=0
-    while IFS=$'\t' read -r ix instance conf orig_hash off_hash was_active; do
-        [[ -n "$ix" ]] || continue
-        original="$state/configs/$ix.original"; offline="$state/configs/$ix.offline"
-        [[ -f "$original" && -f "$offline" && -f "$conf" ]] || { print_err "Missing recorded configuration: $conf"; errors=$((errors+1)); continue; }
-        current="$(sha256sum "$conf" | awk '{print $1}')"
-        if [[ "$direction" == offline ]]; then target="$off_hash"; else target="$orig_hash"; fi
-        if [[ "$current" != "$orig_hash" && "$current" != "$off_hash" ]]; then
-            print_err "Config edited since Central transition began: $conf. Preserving changes; manual reconciliation required."
-            errors=$((errors+1)); continue
-        fi
-        if [[ "$current" != "$target" ]]; then
-            if [[ "$direction" == offline ]]; then
-                central_full_atomic_apply "$conf" "$offline" || { errors=$((errors+1)); continue; }
-            else
-                central_full_atomic_apply "$conf" "$original" || { errors=$((errors+1)); continue; }
-            fi
-        fi
-        # An interrupted restart can leave ocserv running an older in-memory
-        # config even when the on-disk bytes already match our target.
-        # Always reconcile the active daemon on recovery/resume.
-        if [[ "$was_active" == active ]] && ! restart_service_bounded "$(instance_service "$instance")" 30; then
-            print_err "ocserv restart failed for $instance; check journalctl."
-            errors=$((errors+1))
-        fi
-    done < "$state/configs.tsv"
-    (( errors == 0 ))
-}
-central_full_plan() {
-    local state="$1" instance conf unit active enabled i=0 h1 h2
-    mkdir -m 700 -p "$state/configs" || return 1
-    : > "$state/configs.tsv"; : > "$state/units.tsv"
-    while IFS= read -r instance; do
-        [[ "$instance" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || { print_err "Unsafe instance name: $instance"; return 1; }
-        conf="$(instance_config "$instance")"
-        [[ -f "$conf" && ! -L "$conf" && "$conf" != *$'\t'* && "$conf" != *$'\n'* ]] || { print_err "Missing/symlink/unsupported config path: $conf"; return 1; }
-        i=$((i+1))
-        cp -a -- "$conf" "$state/configs/$i.original" || return 1
-        chmod 600 "$state/configs/$i.original"
-        if ! central_full_make_offline_config "$conf" "$state/configs/$i.offline"; then return 1; fi
-        chmod 600 "$state/configs/$i.offline"
-        if cmp -s "$conf" "$state/configs/$i.offline"; then
-            # A registered Central instance with a custom/unrecognized hook must
-            # never be silently treated as detached; stopping the Master could
-            # cause its custom hook to reject VPN logins.
-            if [[ "$(state_get "$instance" CENTRAL_ENABLED 2>/dev/null || echo 0)" == 1 ]] && \
-               grep -Eq '^[[:space:]]*(connect-script|disconnect-script)[[:space:]]*=' "$conf"; then
-                print_err "Central is enabled for $instance but its active hook is not Manager-recognized. Review this custom script before full suspension: $conf"
-                return 1
-            fi
-            rm -f -- "$state/configs/$i.original" "$state/configs/$i.offline"
-            continue  # Unrelated instance: never block its normal config edits.
-        fi
-        validate_config "$state/configs/$i.offline" || { print_err "Offline config validation failed: $conf"; return 1; }
-        h1="$(sha256sum "$state/configs/$i.original" | awk '{print $1}')"
-        h2="$(sha256sum "$state/configs/$i.offline" | awk '{print $1}')"
-        active="$(systemctl is-active "$(instance_service "$instance")" 2>/dev/null || true)"
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$i" "$instance" "$conf" "$h1" "$h2" "$active" >> "$state/configs.tsv"
-    done < <(list_instances | sort -u)
-    while IFS= read -r unit; do
-        [[ -n "$unit" ]] || continue
-        active="$(systemctl is-active "$unit" 2>/dev/null || true)"; active="${active:-inactive}"
-        enabled="$(systemctl is-enabled "$unit" 2>/dev/null || true)"; enabled="${enabled:-not-found}"
-        # Skip services neither installed nor running, so restoring them is a no-op.
-        [[ "$enabled" == not-found && "$active" != active ]] && continue
-        printf '%s\t%s\t%s\n' "$unit" "$active" "$enabled" >> "$state/units.tsv"
-    done < <(central_full_collect_units)
-}
-central_full_suspend() (
-    need_root; ensure_dirs
-    command -v flock >/dev/null 2>&1 || { print_err "flock is required."; return 1; }
-    exec 8> "$CENTRAL_FULL_LOCK"
-    flock -n 8 || { print_err "Another full Central switch is in progress."; return 1; }
-    if central_full_is_suspended; then central_full_status; return 1; fi
-    local staging state="$CENTRAL_FULL_STATE"
-    staging="$(mktemp -d "$MANAGER_ETC/.central-suspend-prepare.XXXXXXXX")" || return 1
-    chmod 700 "$staging"
-    if ! central_full_plan "$staging"; then
-        rm -rf -- "$staging"; print_err "Preparation/validation failed: no changes were applied."; return 1
-    fi
-    print_warn "FULL local suspension will remove Central login hooks, restart active ocserv instances (CONNECTED USERS WILL DISCONNECT), and stop/disable the local Master and Agents at boot."
-    print_warn "No Central DB, users, limits, usage logs, source IDs, or agent configuration will be deleted."
-    print_warn "If this Master serves OTHER servers, their logins may fail with fail-closed! Suspend integration on those nodes separately."
-    print_warn "Restarting ocserv can affect CUSTOM hooks, certificate auth and sessions; inspect the offline configs before production rollout."
-    if ! ask_yes_no "Proceed with FULL Central suspension and possible VPN disconnections?" "n"; then
-        rm -rf -- "$staging"; print_info "Cancelled; no changes made."; return 0
-    fi
-    printf 'pending\n' > "$staging/phase"
-    if ! mv -- "$staging" "$state"; then rm -rf -- "$staging"; return 1; fi
-    if ! central_full_switch_configs "$state" offline || ! central_full_stop_services "$state"; then
-        print_err "Full suspension did not finish. Attempting rollback to original state."
-        local rc=0
-        central_full_switch_configs "$state" original || rc=1
-        central_full_restore_services "$state" || rc=1
-        if (( rc == 0 )); then rm -rf -- "$state"; print_warn "Rolled back; the previous integration is restored."; else
-            print_err "Rollback incomplete. Recovery snapshots preserved at $state. Run --central-full-recover before further changes."
-        fi
-        return 1
-    fi
-    printf 'suspended\n' > "$state/phase"
-    print_ok "Local Central integration is FULLY SUSPENDED; login hooks removed and Central services stopped/disabled. Resume manually to restore."
-    central_full_status
-)
-central_full_check_master_ready() {
-    local state="$1" unit active enabled api token count
-    [[ -f "$CENTRAL_PROFILE" ]] || return 0
-    # The local Master should be healthy BEFORE login hooks are reenabled.
-    while IFS=$'\t' read -r unit active enabled; do
-        [[ "$unit" == ocserv-central.service && "$active" == active ]] || continue
-        central_profile_load
-        api="${API_URL:-}"; token="${API_TOKEN:-}"
-        case "$api" in
-            http://127.0.0.1:8088|http://localhost:8088|http://[::1]:8088) ;;
-            *) return 0 ;; # Master may be remote: do not assume local ownership
-        esac
-        command -v curl >/dev/null 2>&1 || { print_warn "curl unavailable; cannot verify Central health."; return 0; }
-        for ((count=0; count<30; count++)); do
-            if curl --silent --show-error --fail --max-time 2 -H "X-API-Token: $token" "$api/health" >/dev/null 2>&1; then
-                return 0
-            fi
-            sleep 1
-        done
-        print_err "Local Central Master API did not become healthy; leaving VPN login hooks offline."
-        return 1
-    done < "$state/units.tsv"
-    return 0
-}
-central_full_resume() (
-    need_root; ensure_dirs
-    exec 8> "$CENTRAL_FULL_LOCK"
-    flock -n 8 || { print_err "Another full Central switch is in progress."; return 1; }
-    local state="$CENTRAL_FULL_STATE" phase ix instance conf original_hash off_hash was_active current
-    [[ -d "$state" ]] || { print_info "Full Central is already normal (no saved suspend state)."; return 0; }
-    phase="$(cat "$state/phase" 2>/dev/null || echo unknown)"
-    if [[ "$phase" != suspended ]]; then
-        print_err "Incomplete Central transition ($phase). Use --central-full-recover to restore the previous state first."
-        return 1
-    fi
-    # Preflight every target: detect outside edits before restarting anything.
-    while IFS=$'\t' read -r ix instance conf original_hash off_hash was_active; do
-        [[ -n "$ix" ]] || continue
-        [[ -f "$conf" ]] || { print_err "Config missing: $conf"; return 1; }
-        current="$(sha256sum "$conf" | awk '{print $1}')"
-        if [[ "$current" != "$off_hash" && "$current" != "$original_hash" ]]; then
-            print_err "Config was edited during suspension: $conf; will not overwrite. Resolve manually before resuming."
-            return 1
-        fi
-        validate_config "$state/configs/$ix.original" || { print_err "Recorded original config no longer validates: $conf"; return 1; }
-    done < "$state/configs.tsv"
-    print_warn "Resuming full Central integration restarts active ocserv instances to restore login hooks; connected users may disconnect."
-    ask_yes_no "Resume full Central integration now?" "n" || return 0
-    printf 'pending\n' > "$state/phase"
-    if ! central_full_restore_services "$state" || ! central_full_check_master_ready "$state" || ! central_full_switch_configs "$state" original; then
-        print_err "Resume failed; returning local VPN configs to safe OFFLINE mode and stopping Central services."
-        local rc=0
-        central_full_switch_configs "$state" offline || rc=1
-        central_full_stop_services "$state" || rc=1
-        if (( rc == 0 )); then
-            printf 'suspended\n' > "$state/phase"
-        else
-            print_err "Recovery incomplete; use --central-full-recover and inspect logs."
-        fi
-        return 1
-    fi
-    rm -rf -- "$state"
-    print_ok "Full Central integration RESUMED. Original configs and unit activation/boot states restored."
-)
-central_full_recover() (
-    need_root; ensure_dirs
-    exec 8> "$CENTRAL_FULL_LOCK"
-    flock -n 8 || { print_err "Another full Central switch is in progress."; return 1; }
-    [[ -d "$CENTRAL_FULL_STATE" ]] || { print_info "Nothing to recover."; return 0; }
-    print_warn "Recovery restores original configs and service states from the recorded pre-suspension snapshots."
-    ask_yes_no "Recover interrupted full Central transition? (ocserv may restart)" "n" || return 0
-    if central_full_restore_services "$CENTRAL_FULL_STATE" && central_full_switch_configs "$CENTRAL_FULL_STATE" original; then
-        rm -rf -- "$CENTRAL_FULL_STATE"
-        print_ok "Original Central integration restored after interrupted transition."
-    else
-        print_err "Recovery incomplete; no snapshots removed. Examine recorded configs and unit statuses."
-        return 1
-    fi
-)
-central_full_menu() {
-    local choice
-    while true; do
-        echo; echo '==== Fully Suspend / Resume Central (LOCAL HOST) ===='
-        central_full_status
-        echo '1) Fully suspend local Central integration (restart ocserv, stop services)'
-        echo '2) Resume previously suspended integration'
-        echo '3) Recover an interrupted transition'
-        echo '4) Status'
-        echo '0) Back'
-        ui_read choice 'Select: ' || return 1
-        case "$choice" in
-            1) central_full_suspend; pause ;;
-            2) central_full_resume; pause ;;
-            3) central_full_recover; pause ;;
-            4) central_full_status; pause ;;
-            0) return 0 ;;
-            *) print_warn 'Invalid selection.' ;;
-        esac
-    done
-}
-
 central_instances_menu() {
     local choice instance i auto
     while true; do
         echo; echo "==== Central - Local ocserv instances (multi-instance) ===="
-        ui_line "Every attached instance has its own occtl socket, Node ID, source ID and ocpasswd authority."
-        ui_line "The Master receives user/group snapshots from each instance; a single Master-side OCPASSWD_PATH is no longer required for these attached sources."
-        ui_line "1) List instances / attachment status"
-        ui_line "2) Configure shared Central API/agent profile (URL/token/interval/timeout/fail-mode)"
-        ui_line "3) Attach one instance"
-        ui_line "4) Attach ALL discovered instances"
-        ui_line "5) Detach one instance"
-        ui_line "6) Detach ALL instances"
-        ui_line "7) Force user/group + session sync for one instance"
-        ui_line "8) Agent logs for one instance"
-        ui_line "9) Toggle auto-attach for newly created instances"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "Every attached instance has its own occtl socket, Node ID, source ID and ocpasswd authority."
+        echo "The Master receives user/group snapshots from each instance; a single Master-side OCPASSWD_PATH is no longer required for these attached sources."
+        echo "1) List instances / attachment status"
+        echo "2) Configure shared Central API/agent profile (URL/token/interval/timeout/fail-mode)"
+        echo "3) Attach one instance"
+        echo "4) Attach ALL discovered instances"
+        echo "5) Detach one instance"
+        echo "6) Detach ALL instances"
+        echo "7) Force user/group + session sync for one instance"
+        echo "8) Agent logs for one instance"
+        echo "9) Toggle auto-attach for newly created instances"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) central_instances_status; pause;;
             2) central_profile_configure; pause;;
@@ -5380,9 +4846,6 @@ MANAGER_BIN="/usr/local/sbin/ocserv-central-manager"
 
 MASTER_SERVICE="/etc/systemd/system/ocserv-central.service"
 NODE_AGENT_SERVICE="/etc/systemd/system/ocserv-central-agent.service"
-# Temporary Master-side policy override. Entries self-expire on each API request.
-# Root-only; no quotas/users/settings are rewritten by this feature.
-ENFORCEMENT_PAUSE_FILE="$MASTER_ETC/enforcement-pause.json"
 
 HOOK_SCRIPT="/usr/local/sbin/ocserv-central-hook.sh"
 CONNECT_WRAPPER="/usr/local/sbin/ocserv-central-connect.sh"
@@ -5407,237 +4870,61 @@ C_YELLOW="\033[33m"
 C_BLUE="\033[34m"
 C_CYAN="\033[36m"
 
-# UI messages use stderr so functions returning data through $(...) never mix
-# a warning/menu/prompt with their machine-readable return value.
-# Escape codes are emitted only to an interactive terminal.
-if [[ ! -t 2 || "${TERM:-dumb}" == "dumb" || "${NO_COLOR:-}" != "" ]]; then
-    C_RESET='' C_RED='' C_GREEN='' C_YELLOW='' C_CYAN=''
-fi
-# Terminal output is word-wrapped only for a real terminal (or a UI test).
-# Data returned on stdout by functions and CLI commands is never modified.
-ui_columns() {
-    local dest="$1" terminal_width="${COLUMNS:-80}" detected=''
-    if [[ -t 2 && -r /dev/tty ]]; then
-        if [[ "${UI_WIDTH_CACHE_SECONDS:-}" == "$SECONDS" && "${UI_WIDTH_CACHE:-}" =~ ^[0-9]+$ ]]; then
-            terminal_width="$UI_WIDTH_CACHE"
-        else
-            detected="$(stty size </dev/tty 2>/dev/null || true)"
-            detected="${detected##* }"
-            [[ "$detected" =~ ^[0-9]+$ ]] && terminal_width="$detected"
-            UI_WIDTH_CACHE="$terminal_width"
-            UI_WIDTH_CACHE_SECONDS="$SECONDS"
-        fi
-    fi
-    [[ "$terminal_width" =~ ^[0-9]+$ ]] || terminal_width=80
-    (( terminal_width >= 24 )) || terminal_width=24
-    (( terminal_width <= 500 )) || terminal_width=500
-    printf -v "$dest" '%s' "$terminal_width"
-}
+print_ok() { echo -e "${C_GREEN}[OK]${C_RESET} $*"; }
+print_warn() { echo -e "${C_YELLOW}[WARN]${C_RESET} $*"; }
+print_err() { echo -e "${C_RED}[ERR]${C_RESET} $*" >&2; }
+print_info() { echo -e "${C_CYAN}[INFO]${C_RESET} $*"; }
 
-# Usage: ui_render "visible prefix" "ANSI color" "message".
-# Hanging indentation keeps menu numbers and status labels legible.
-ui_render() {
-    local prefix="$1" color="$2" content="$3" cols first next words word piece
-    local first_prefix="$prefix" next_prefix='' line='' used=0 available
-    if [[ ! -t 2 && "${OCSERV_UI_TEST_WRAP:-0}" != 1 ]]; then
-        printf '%b%s%b%s\n' "$color" "$prefix" "$C_RESET" "$content" >&2
-        return 0
-    fi
-    ui_columns cols
-    if [[ -z "$prefix" && "$content" =~ ^([0-9]+\)[[:space:]]+)(.*)$ ]]; then
-        first_prefix="${BASH_REMATCH[1]}"
-        content="${BASH_REMATCH[2]}"
-    elif [[ -z "$prefix" && "$content" =~ ^(-[[:space:]]+)(.*)$ ]]; then
-        first_prefix="${BASH_REMATCH[1]}"
-        content="${BASH_REMATCH[2]}"
-    fi
-    printf -v next_prefix '%*s' "${#first_prefix}" ''
-    # UI text is not a data serialization format. Only spaces and tabs used
-    # for layout are collapsed, never the contents of captured stdout.
-    content="${content//$'\t'/ }"
-    content="${content//$'\r'/}"
-    local -a chunks=()
-    while [[ "$content" == *$'\n'* ]]; do
-        chunks+=("${content%%$'\n'*}")
-        content="${content#*$'\n'}"
-    done
-    chunks+=("$content")
-    local chunk last=0 current_prefix="$first_prefix" emit_color="$color"
-    for chunk in "${chunks[@]}"; do
-        local -a tokens=()
-        read -r -a tokens <<< "$chunk"
-        line=''
-        if (( ${#tokens[@]} == 0 )); then
-            printf '%b%s%b\n' "$emit_color" "$current_prefix" "$C_RESET" >&2
-            current_prefix="$next_prefix"; emit_color=''
-            continue
-        fi
-        for word in "${tokens[@]}"; do
-            while [[ -n "$word" ]]; do
-                available=$((cols - ${#current_prefix} - 1))
-                (( available >= 8 )) || available=8
-                if [[ -n "$line" ]] && (( ${#line} + 1 + ${#word} > available )); then
-                    printf '%b%s%b%s\n' "$emit_color" "$current_prefix" "$C_RESET" "$line" >&2
-                    line=''; current_prefix="$next_prefix"; emit_color=''
-                    continue
-                fi
-                if (( ${#word} > available )); then
-                    piece="${word:0:available}"
-                    word="${word:available}"
-                    if [[ -n "$line" ]]; then
-                        printf '%b%s%b%s\n' "$emit_color" "$current_prefix" "$C_RESET" "$line" >&2
-                        line=''; current_prefix="$next_prefix"; emit_color=''
-                    fi
-                    printf '%b%s%b%s\n' "$emit_color" "$current_prefix" "$C_RESET" "$piece" >&2
-                    current_prefix="$next_prefix"; emit_color=''
-                else
-                    if [[ -z "$line" ]]; then line="$word"; else line+=" $word"; fi
-                    word=''
-                fi
-            done
-        done
-        if [[ -n "$line" ]]; then
-            printf '%b%s%b%s\n' "$emit_color" "$current_prefix" "$C_RESET" "$line" >&2
-        fi
-        current_prefix="$next_prefix"; emit_color=''
-    done
-}
-ui_line()   { ui_render '' '' "$*"; }
-print_ok()   { ui_render '[OK] '   "$C_GREEN" "$*"; }
-print_warn() { ui_render '[WARN] ' "$C_YELLOW" "$*"; }
-print_err()  { ui_render '[ERR] '  "$C_RED" "$*"; }
-print_info() { ui_render '[INFO] ' "$C_CYAN" "$*"; }
-
-ui_read() {
-    local dest="$1" prompt="$2" answer='' cols question label='Answer: ' trimmed
-    ui_columns cols
-    # Keep input on a fresh line when the question/default cannot fit.
-    if (( ${#prompt} >= cols - 3 )) || [[ "$prompt" == *$'\n'* ]]; then
-        trimmed="${prompt% }"
-        question="$trimmed"
-        if [[ "$trimmed" =~ ^(.*)[[:space:]](\[[^]]+\]:)$ ]]; then
-            question="${BASH_REMATCH[1]}"
-            label="${BASH_REMATCH[2]} "
-        elif [[ "$trimmed" == *: ]]; then
-            question="${trimmed%:}"
-        fi
-        ui_line "$question"
-        if (( ${#label} >= cols - 3 )); then
-            ui_line "Default selection: $label"
-            label='Value: '
-        fi
-        printf '%s' "$label" >&2
-    else
-        printf '%s' "$prompt" >&2
-    fi
-    # Read from controlling tty when stdin is a script/pipe and a tty exists.
-    if [[ -t 0 ]]; then
-        if ! IFS= read -r answer; then printf '\n' >&2; return 1; fi
-    elif [[ -t 2 && -r /dev/tty ]]; then
-        if ! IFS= read -r answer </dev/tty; then printf '\n' >&2; return 1; fi
-    elif IFS= read -r answer; then
-        # Piped/test input is not echoed by a terminal; finish the prompt line.
-        [[ -t 2 ]] || printf '\n' >&2
-    else
-        printf '\n' >&2
-        return 1
-    fi
-    printf -v "$dest" '%s' "$answer"
-}
-
-pause() {
-    printf '\n' >&2
-    local ignored
-    ui_read ignored "Press Enter to continue..." || return 0
-}
-
-ask_yes_no() {
-    local prompt="$1" default="${2:-y}" ans
-    while true; do
-        if [[ "$default" == "y" ]]; then
-            if ! ui_read ans "$prompt [Y/n]: "; then
-                print_warn "Input closed: no automatic confirmation or persistent backup."
-                return 1
-            fi
-            ans="${ans:-y}"
-        else
-            if ! ui_read ans "$prompt [y/N]: "; then
-                print_warn "Input closed: action cancelled."
-                return 1
-            fi
-            ans="${ans:-n}"
-        fi
-        case "${ans,,}" in
-            y|yes) return 0 ;;
-            n|no) return 1 ;;
-            *) print_warn "Please answer y or n." ;;
-        esac
-    done
-}
-
-ask_value() {
-    local prompt="$1" default="${2:-}" ans
-    if [[ -n "$default" ]]; then
-        ui_read ans "$prompt [$default]: " || return 1
-        printf '%s\n' "${ans:-$default}"
-    else
-        ui_read ans "$prompt: " || return 1
-        printf '%s\n' "$ans"
+# Never let terminal-clearing break the Central console. Minimal/cloud images may
+# not ship `clear`, and TERM may be unset/unsupported.
+safe_clear() {
+    if [[ -t 1 ]] && [[ -n "${TERM:-}" ]] && [[ "${TERM:-}" != "dumb" ]] && command -v clear >/dev/null 2>&1; then
+        clear 2>/dev/null || true
     fi
 }
 
-ask_nonempty() {
-    local prompt="$1" default="${2:-}" ans
-    while true; do
-        ans="$(ask_value "$prompt" "$default")" || return 1
-        if [[ -n "$ans" ]]; then
-            printf '%s\n' "$ans"
-            return 0
-        fi
-        print_warn "Value cannot be empty."
-    done
-}
-
-ask_integer() {
-    local prompt="$1" default="${2:-0}" min="${3:-0}" max="${4:-2147483647}" ans
-    while true; do
-        ans="$(ask_value "$prompt" "$default")" || return 1
-        if [[ "$ans" =~ ^[0-9]+$ ]] && (( 10#$ans >= min && 10#$ans <= max )); then
-            printf '%s\n' "$ans"
-            return 0
-        fi
-        print_warn "Enter an integer between $min and $max."
-    done
-}
-
-choose_menu() {
-    local prompt="$1"; shift
-    local -a options=("$@")
-    local i choice
-    printf '\n%s\n' "$prompt" >&2
-    for ((i=0; i<${#options[@]}; i++)); do
-        ui_line "$((i+1))) ${options[$i]}"
-    done
-    while true; do
-        ui_read choice "Select: " || return 1
-        if [[ "$choice" =~ ^[0-9]+$ ]] && (( 10#$choice >= 1 && 10#$choice <= ${#options[@]} )); then
-            printf '%s\n' "$choice"
-            return 0
-        fi
-        print_warn "Invalid selection."
-    done
-}
 need_root() {
-    if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    if [[ "${EUID}" -ne 0 ]]; then
         print_err "Run this script as root."
         exit 1
     fi
 }
 
+pause() {
+    echo
+    read -rp "Press Enter to continue..."
+}
 
-safe_clear() {
-    if [[ -t 1 ]] && [[ -n "${TERM:-}" ]] && [[ "${TERM:-}" != "dumb" ]] && command -v clear >/dev/null 2>&1; then
-        clear 2>/dev/null || true
+ask_yes_no() {
+    local prompt="$1"
+    local default="${2:-y}"
+    local ans
+    while true; do
+        if [[ "$default" == "y" ]]; then
+            read -rp "$prompt [Y/n]: " ans
+            ans="${ans:-y}"
+        else
+            read -rp "$prompt [y/N]: " ans
+            ans="${ans:-n}"
+        fi
+        case "$ans" in
+            y|Y|yes|YES) return 0 ;;
+            n|N|no|NO) return 1 ;;
+            *) echo "Please answer y or n." ;;
+        esac
+    done
+}
+
+ask_value() {
+    local prompt="$1"
+    local default="${2:-}"
+    local ans
+    if [[ -n "$default" ]]; then
+        read -rp "$prompt [$default]: " ans
+        echo "${ans:-$default}"
+    else
+        read -rp "$prompt: " ans
+        echo "$ans"
     fi
 }
 
@@ -5646,7 +4933,7 @@ ask_number() {
     local default="${2:-0}"
     local ans
     while true; do
-        ans="$(ask_value "$prompt" "$default")" || return 1
+        ans="$(ask_value "$prompt" "$default")"
         if [[ "$ans" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
             echo "$ans"
             return 0
@@ -5737,8 +5024,6 @@ import re
 import sqlite3
 import time
 import uuid
-import threading
-import logging
 from pathlib import Path
 from fastapi import FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
@@ -5775,22 +5060,6 @@ def human_bytes(value: int | None) -> str | None:
 
 
 app = FastAPI(title="ocserv-central", version="2.4")
-# Log slow API operations without including credentials or usernames.
-SLOW_API_WARN_MS = max(100, int(os.getenv("SLOW_API_WARN_MS", "1000")))
-
-@app.middleware("http")
-async def log_slow_requests(request: Request, call_next):
-    start = time.monotonic()
-    try:
-        response = await call_next(request)
-    except Exception:
-        elapsed_ms = (time.monotonic() - start) * 1000
-        logging.exception("central api_error path=%s elapsed_ms=%.1f", request.url.path, elapsed_ms)
-        raise
-    elapsed_ms = (time.monotonic() - start) * 1000
-    if elapsed_ms >= SLOW_API_WARN_MS:
-        logging.warning("central slow_api path=%s status=%d elapsed_ms=%.1f", request.url.path, response.status_code, elapsed_ms)
-    return response
 
 def now() -> int:
     return int(time.time())
@@ -5802,8 +5071,7 @@ def auth(x_api_token: str | None):
 def db():
     con = sqlite3.connect(DB_PATH, timeout=20)
     con.row_factory = sqlite3.Row
-    # WAL is persistent. Reissuing journal_mode=WAL on every read/write
-    # connection causes unnecessary schema-lock contention.
+    con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
     return con
 
@@ -5814,8 +5082,6 @@ def column_exists(con, table, column):
 def init_db():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     with db() as con:
-        # Configure persistent WAL once, at startup, before opening traffic.
-        con.execute("PRAGMA journal_mode=WAL")
         con.execute("""
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
@@ -5847,11 +5113,6 @@ def init_db():
             PRIMARY KEY (node_id, ocserv_id)
         )
         """)
-
-        # Restored databases can have many inactive historical sessions.
-        # Both indices are needed for login count and expiring active sessions.
-        con.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user_active ON sessions(username, active)")
-        con.execute("CREATE INDEX IF NOT EXISTS idx_sessions_active_seen ON sessions(active, last_seen)")
 
         con.execute("""
         CREATE TABLE IF NOT EXISTS usage_log (
@@ -6192,7 +5453,7 @@ def delete_user_rows_everywhere(con, usernames: list[str]):
     return totals
 
 
-def _sync_ocpasswd_to_db_uncached():
+def sync_ocpasswd_to_db():
     """Synchronize the optional Master-local fallback ocpasswd.
 
     v20 authority_sources are additive and take precedence for their own
@@ -6261,50 +5522,6 @@ def _sync_ocpasswd_to_db_uncached():
         "removed_table_rows": removed_table_rows,
         "prune_skipped_reason": prune_skipped_reason,
     }
-
-# The Master-local ocpasswd is a fallback source, not an event to re-write on
-# every VPN login/heartbeat. Keep a short resync window for external DB changes.
-_LOCAL_SYNC_LOCK = threading.RLock()
-_LOCAL_SYNC_CACHE = {"signature": None, "last_success": 0.0, "result": None}
-LOCAL_SYNC_MAX_AGE = max(5, int(os.getenv("LOCAL_SYNC_MAX_AGE", "60")))
-
-def _local_ocpasswd_signature():
-    try:
-        st = os.stat(OCPASSWD_PATH)
-        return (st.st_ino, st.st_mtime_ns, st.st_ctime_ns, st.st_size)
-    except FileNotFoundError:
-        return ("missing",)
-    except OSError:
-        # Never conceal a transient file error behind a cached good result.
-        return None
-
-def sync_ocpasswd_to_db(force: bool = False):
-    """Sync only on file change, explicit refresh, or periodic reconciliation.
-
-    Serializes same-process sync calls; preserves authority sources, quotas,
-    usage counters, and the existing REMOVE_MISSING_USERS semantics. A file
-    changing while being read is never marked as safely cached.
-    """
-    with _LOCAL_SYNC_LOCK:
-        before = _local_ocpasswd_signature()
-        cache = _LOCAL_SYNC_CACHE
-        if (not force and before is not None and
-                cache["result"] is not None and cache["signature"] == before and
-                time.monotonic() - cache["last_success"] < LOCAL_SYNC_MAX_AGE):
-            return {**cache["result"], "skipped_unchanged": True}
-        start = time.monotonic()
-        result = _sync_ocpasswd_to_db_uncached()
-        elapsed_ms = (time.monotonic() - start) * 1000
-        if elapsed_ms >= SLOW_API_WARN_MS:
-            logging.warning("central slow_local_sync elapsed_ms=%.1f users=%d",
-                            elapsed_ms, result.get("users_found", -1))
-        after = _local_ocpasswd_signature()
-        if before is not None and before == after:
-            cache.update(signature=after, last_success=time.monotonic(), result=result)
-        else:
-            cache.update(signature=None, last_success=0.0, result=None)
-        return {**result, "skipped_unchanged": False}
-
 
 def group_number(groupname: str | None) -> int:
     if not groupname:
@@ -6627,8 +5844,7 @@ def update_node(node_id: str, request: Request | None = None, sessions_count: in
 
 def cleanup_expired(con, t):
     cutoff = t - SESSION_TTL
-    # Crucial: never rewrite already inactive historical rows on each login.
-    con.execute("UPDATE sessions SET active=0 WHERE active=1 AND last_seen < ?", (cutoff,))
+    con.execute("UPDATE sessions SET active=0 WHERE last_seen < ?", (cutoff,))
 
 class ConnectReq(BaseModel):
     node_id: str
@@ -6702,24 +5918,7 @@ class BulkTrafficReq(BaseModel):
 @app.on_event("startup")
 def startup():
     init_db()
-    sync_ocpasswd_to_db(force=True)
-
-# Maintenance override checked on every connect/heartbeat request. The expiration
-# is evaluated at request time, so it survives API restart and requires no timer.
-# A failed, corrupt, or expired state file ALWAYS means normal enforcement.
-ENFORCEMENT_PAUSE_FILE = "/etc/ocserv-central/enforcement-pause.json"
-def enforcement_pause_info():
-    try:
-        with open(ENFORCEMENT_PAUSE_FILE, "r", encoding="utf-8") as f:
-            state = json.load(f)
-        until = state.get("until")
-        if type(until) is not int or until <= now() or until > now() + 3600:
-            return None
-        if state.get("scope") != "central-all":
-            return None
-        return {"until": until, "remaining_seconds": max(0, until - now())}
-    except (FileNotFoundError, PermissionError, ValueError, TypeError, OSError):
-        return None
+    sync_ocpasswd_to_db()
 
 @app.get("/health")
 def health():
@@ -6733,12 +5932,12 @@ def get_config(x_api_token: str | None = Header(default=None)):
 @app.post("/sync-ocpasswd")
 def sync_ocpasswd(x_api_token: str | None = Header(default=None)):
     auth(x_api_token)
-    return sync_ocpasswd_to_db(force=True)
+    return sync_ocpasswd_to_db()
 
 @app.post("/refresh-now")
 def refresh_now(x_api_token: str | None = Header(default=None)):
     auth(x_api_token)
-    result = sync_ocpasswd_to_db(force=True)
+    result = sync_ocpasswd_to_db()
     return {"ok": True, "action": "sync_ocpasswd_and_reload_limits", "sync": result, "note": "limits.json is read on every quota/session check; API restart is not required for group/quota edits."}
 
 @app.post("/sync-source")
@@ -6795,7 +5994,6 @@ def connect(req: ConnectReq, request: Request, x_api_token: str | None = Header(
     req.groupname = authoritative_group_for_user(req.username, req.groupname, req.source_id)
 
     max_sessions, quota_bytes = effective_limits(req.username, req.groupname)
-    policy_paused = enforcement_pause_info() is not None
 
     with db() as con:
         con.execute("BEGIN IMMEDIATE")
@@ -6809,14 +6007,13 @@ def connect(req: ConnectReq, request: Request, x_api_token: str | None = Header(
 
         user = con.execute("SELECT * FROM users WHERE username=?", (req.username,)).fetchone()
 
-        # A maintenance pause never re-enables administratively disabled accounts.
         if user["disabled"]:
             return {"allow": False, "reason": "user disabled"}
 
         if account_is_expired(req.username):
             return {"allow": False, "reason": "account expired"}
 
-        if not policy_paused and quota_bytes > 0 and user["used_bytes"] >= quota_bytes:
+        if quota_bytes > 0 and user["used_bytes"] >= quota_bytes:
             log_quota_exhausted(req.username, req.groupname, user["used_bytes"], quota_bytes, "connect quota exceeded")
             return {"allow": False, "reason": "quota exceeded"}
 
@@ -6827,7 +6024,7 @@ def connect(req: ConnectReq, request: Request, x_api_token: str | None = Header(
             (req.username,)
         ).fetchone()["c"]
 
-        if not policy_paused and active_count >= max_sessions:
+        if active_count >= max_sessions:
             return {"allow": False, "reason": f"session limit exceeded: {active_count}/{max_sessions}", "active_count": active_count, "max_sessions": max_sessions}
 
         con.execute(
@@ -6842,7 +6039,7 @@ def connect(req: ConnectReq, request: Request, x_api_token: str | None = Header(
 
         return {
             "allow": True,
-            "reason": "maintenance pause" if policy_paused else "ok",
+            "reason": "ok",
             "username": req.username,
             "groupname": req.groupname,
             "max_sessions": max_sessions,
@@ -6889,7 +6086,6 @@ def heartbeat(req: HeartbeatReq, request: Request, x_api_token: str | None = Hea
     auth(x_api_token)
     t = now()
     disconnect_ids = []
-    policy_paused = enforcement_pause_info() is not None
     sync_ocpasswd_to_db()
     update_node(req.node_id, request, len(req.sessions))
 
@@ -6952,7 +6148,7 @@ def heartbeat(req: HeartbeatReq, request: Request, x_api_token: str | None = Hea
                 disconnect_ids.append(s.ocserv_id)
             elif account_is_expired(s.username):
                 disconnect_ids.append(s.ocserv_id)
-            elif not policy_paused and quota_bytes > 0 and user["used_bytes"] >= quota_bytes:
+            elif quota_bytes > 0 and user["used_bytes"] >= quota_bytes:
                 log_quota_exhausted(s.username, s.groupname, user["used_bytes"], quota_bytes, "heartbeat quota exceeded")
                 disconnect_ids.append(s.ocserv_id)
 
@@ -8246,7 +7442,7 @@ master_status() {
     echo
     print_info "Master API settings:"
     echo "Local API URL: http://127.0.0.1:8088"
-    ui_line "Listener: 0.0.0.0:8088 (remote reachability still depends on host/network firewall)"
+    echo "Listener: 0.0.0.0:8088 (remote reachability still depends on host/network firewall)"
     [[ -n "$token" ]] && echo "API token: $token_preview (masked)"
     echo "Session TTL: ${ttl:-120} seconds"
     echo "Remove missing ocpasswd users: ${remove:-0}"
@@ -8896,20 +8092,20 @@ exhausted_quota_file_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Exhausted Quota File Tools ===="
-        ui_line "1) List exhausted-quota users, auto-dedupe if duplicates exist"
-        ui_line "2) Reset file only, empty it"
-        ui_line "3) Dedupe file only, keep one row per username"
-        ui_line "4) Rebuild file from current DB state, only users still really over quota"
-        ui_line "5) Prune resolved users, remove users that are no longer over quota"
-        ui_line "6) Delete exhausted-quota file"
-        ui_line "0) Back"
+        echo "1) List exhausted-quota users, auto-dedupe if duplicates exist"
+        echo "2) Reset file only, empty it"
+        echo "3) Dedupe file only, keep one row per username"
+        echo "4) Rebuild file from current DB state, only users still really over quota"
+        echo "5) Prune resolved users, remove users that are no longer over quota"
+        echo "6) Delete exhausted-quota file"
+        echo "0) Back"
         echo
         echo "Important:"
         echo "- Reset only clears the report file."
-        ui_line "- If a user is still over quota, they can be logged again on next connect/heartbeat."
-        ui_line "- Rebuild is usually the cleanest option after changing quotas or adding traffic."
+        echo "- If a user is still over quota, they can be logged again on next connect/heartbeat."
+        echo "- Rebuild is usually the cleanest option after changing quotas or adding traffic."
         echo
-        ui_read choice "Select: " || return 1
+        read -rp "Select: " choice
         case "$choice" in
             1) list_quota_exhausted; pause ;;
             2)
@@ -9440,12 +8636,12 @@ restore_master_data() {
     elif [[ -z "$in" ]] && (( ${#candidates[@]} > 1 )); then
         echo "Detected Central backups (newest first):"
         for i in "${!candidates[@]}"; do
-            ui_line "$((i+1))) ${candidates[$i]} [$(du -h "${candidates[$i]}" 2>/dev/null | awk '{print $1}')]"
+            printf '%d) %s  [%s]\n' "$((i+1))" "${candidates[$i]}" "$(du -h "${candidates[$i]}" 2>/dev/null | awk '{print $1}')"
         done
         echo "$(( ${#candidates[@]} + 1 ))) Enter another path manually"
-        ui_line "0) Cancel"
+        echo "0) Cancel"
         while true; do
-            ui_read choice "Select backup: " || return 1
+            read -r -p "Select backup: " choice || true
             [[ "$choice" =~ ^[0-9]+$ ]] || { echo "Enter a number."; continue; }
             if (( choice == 0 )); then return 0; fi
             if (( choice >= 1 && choice <= ${#candidates[@]} )); then in="${candidates[$((choice-1))]}"; break; fi
@@ -9938,23 +9134,23 @@ backup_cleanup_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Backup / Restore / Cleanup Menu ===="
-        ui_line "1) Show database and usage_log statistics"
-        ui_line "2) Full backup: app + config + full database + full usage history"
-        ui_line "3) Lightweight backup: app + config + database without usage_log history"
-        ui_line "4) Config-only backup"
-        ui_line "5) DB-only backup"
-        ui_line "6) Custom backup"
-        ui_line "7) Restore backup"
-        ui_line "8) Cleanup old usage_log records manually"
-        ui_line "9) VACUUM / compact database"
-        ui_line "10) Configure automatic usage_log cleanup timer"
-        ui_line "11) Disable automatic cleanup timer"
-        ui_line "12) Show automatic cleanup timer status/logs"
-        ui_line "13) RECOMMENDED default backup: lightweight, keeps current usage, removes usage_log history"
-        ui_line "14) DEFAULT cleanup now: delete all usage_log history + VACUUM"
-        ui_line "0) Back"
+        echo "1) Show database and usage_log statistics"
+        echo "2) Full backup: app + config + full database + full usage history"
+        echo "3) Lightweight backup: app + config + database without usage_log history"
+        echo "4) Config-only backup"
+        echo "5) DB-only backup"
+        echo "6) Custom backup"
+        echo "7) Restore backup"
+        echo "8) Cleanup old usage_log records manually"
+        echo "9) VACUUM / compact database"
+        echo "10) Configure automatic usage_log cleanup timer"
+        echo "11) Disable automatic cleanup timer"
+        echo "12) Show automatic cleanup timer status/logs"
+        echo "13) RECOMMENDED default backup: lightweight, keeps current usage, removes usage_log history"
+        echo "14) DEFAULT cleanup now: delete all usage_log history + VACUUM"
+        echo "0) Back"
         echo
-        ui_read choice "Select: " || return 1
+        read -rp "Select: " choice
         case "$choice" in
             1) run_central_menu_action usage_log_stats; pause ;;
             2) run_central_menu_action backup_master_full; pause ;;
@@ -10049,18 +9245,18 @@ bulk_traffic_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Bulk Traffic / Quota Menu ===="
-        ui_line "1) Set one traffic quota for ALL groups"
-        ui_line "2) Remove traffic quota from ALL groups, make unlimited"
-        ui_line "3) Add extra traffic to ALL users"
-        ui_line "4) Set exact extra traffic for ALL users"
-        ui_line "5) Clear extra traffic from ALL users"
-        ui_line "6) Reset used traffic for ALL users"
-        ui_line "7) Show users"
-        ui_line "8) Show current limits.json"
-        ui_line "9) Decrease extra traffic from ALL users"
-        ui_line "0) Back"
+        echo "1) Set one traffic quota for ALL groups"
+        echo "2) Remove traffic quota from ALL groups, make unlimited"
+        echo "3) Add extra traffic to ALL users"
+        echo "4) Set exact extra traffic for ALL users"
+        echo "5) Clear extra traffic from ALL users"
+        echo "6) Reset used traffic for ALL users"
+        echo "7) Show users"
+        echo "8) Show current limits.json"
+        echo "9) Decrease extra traffic from ALL users"
+        echo "0) Back"
         echo
-        ui_read choice "Select: " || return 1
+        read -rp "Select: " choice
         case "$choice" in
             1) bulk_set_all_group_quota; pause ;;
             2) bulk_remove_all_group_quota; pause ;;
@@ -10570,10 +9766,10 @@ handle_group_manual_quota_overrides() {
     jq -r '.users[] | " - \(.username): manual_quota_gb=\(.quota_gb), max_sessions_override=\(.max_sessions // "none")"' <<<"$info"
     echo
     echo "How should these manually configured users be handled?"
-    ui_line "1) Keep their manual quota overrides; the group quota will NOT replace their manual volume"
-    ui_line "2) Apply the new group quota to them; remove only quota_gb override"
+    echo "1) Keep their manual quota overrides; the group quota will NOT replace their manual volume"
+    echo "2) Apply the new group quota to them; remove only quota_gb override"
     echo "   Any manual max_sessions override will be preserved"
-    ui_read choice "Select [1]: " || return 1
+    read -rp "Select [1]: " choice
     choice="${choice:-1}"
 
     case "$choice" in
@@ -10627,11 +9823,11 @@ edit_one_group_quota() {
     echo
     print_warn "This group has $users_count synced users in central DB."
     echo "How should existing used traffic be handled?"
-    ui_line "1) Keep used traffic and apply the new quota immediately"
+    echo "1) Keep used traffic and apply the new quota immediately"
     echo "   Example: user used 80GB, new quota 100GB => remaining 20GB"
-    ui_line "2) Reset used traffic for users in this group to 0"
+    echo "2) Reset used traffic for users in this group to 0"
     echo "   Example: user used 80GB, new quota 100GB => remaining 100GB"
-    ui_read reset_choice "Select [1]: " || return 1
+    read -rp "Select [1]: " reset_choice
     reset_choice="${reset_choice:-1}"
 
     case "$reset_choice" in
@@ -10707,16 +9903,16 @@ group_quota_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Group Quota / New Group Menu ===="
-        ui_line "1) List group limits and user counts"
-        ui_line "2) Add/sync NEW groups from ocpasswd only, keep old group settings"
-        ui_line "3) Edit ONE group quota/sessions and choose used-traffic handling"
-        ui_line "4) Make ONE group unlimited, keep sessions"
-        ui_line "5) Reset used traffic for ONE group"
-        ui_line "6) Configure ALL groups from ocpasswd, may edit existing groups too"
-        ui_line "7) Show current limits.json"
-        ui_line "0) Back"
+        echo "1) List group limits and user counts"
+        echo "2) Add/sync NEW groups from ocpasswd only, keep old group settings"
+        echo "3) Edit ONE group quota/sessions and choose used-traffic handling"
+        echo "4) Make ONE group unlimited, keep sessions"
+        echo "5) Reset used traffic for ONE group"
+        echo "6) Configure ALL groups from ocpasswd, may edit existing groups too"
+        echo "7) Show current limits.json"
+        echo "0) Back"
         echo
-        ui_read choice "Select: " || return 1
+        read -rp "Select: " choice
         case "$choice" in
             1) list_group_limits; pause ;;
             2) sync_new_groups_from_ocpasswd_only; pause ;;
@@ -10749,8 +9945,8 @@ edit_user_override() {
 
     echo
     print_info "Editing user override: $u"
-    ui_line "If max sessions is 0, the user uses group default. Use -1 for unlimited sessions."
-    ui_line "If quota is 0 in user override, it means unlimited for this user override."
+    echo "If max sessions is 0, the user uses group default. Use -1 for unlimited sessions."
+    echo "If quota is 0 in user override, it means unlimited for this user override."
     echo
 
     max_sessions="$(ask_number "User max sessions, 0 = use group default, -1 = unlimited" "$current_ms")"
@@ -10771,11 +9967,11 @@ edit_user_override() {
 
     echo
     echo "How should this user's already-used traffic be handled?"
-    ui_line "1) Keep used traffic and apply the new user quota immediately"
+    echo "1) Keep used traffic and apply the new user quota immediately"
     echo "   Example: user used 80GB, new quota 100GB => remaining 20GB"
-    ui_line "2) Reset used traffic for this user to 0"
+    echo "2) Reset used traffic for this user to 0"
     echo "   Example: user used 80GB, new quota 100GB => remaining 100GB"
-    ui_read reset_choice "Select [1]: " || return 1
+    read -rp "Select [1]: " reset_choice
     reset_choice="${reset_choice:-1}"
 
     case "$reset_choice" in
@@ -11055,16 +10251,16 @@ db_user_cleanup_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Database User Cleanup / ocpasswd Prune Menu ===="
-        ui_line "1) Show DB vs ocpasswd user statistics"
-        ui_line "2) List DB users missing from ocpasswd"
-        ui_line "3) Delete DB users missing from ocpasswd"
-        ui_line "4) List inactive DB users older than N days"
-        ui_line "5) Delete inactive users older than N days ONLY if missing from ocpasswd"
-        ui_line "6) DANGER: Delete inactive users older than N days even if still in ocpasswd"
-        ui_line "7) VACUUM / compact database"
-        ui_line "0) Back"
+        echo "1) Show DB vs ocpasswd user statistics"
+        echo "2) List DB users missing from ocpasswd"
+        echo "3) Delete DB users missing from ocpasswd"
+        echo "4) List inactive DB users older than N days"
+        echo "5) Delete inactive users older than N days ONLY if missing from ocpasswd"
+        echo "6) DANGER: Delete inactive users older than N days even if still in ocpasswd"
+        echo "7) VACUUM / compact database"
+        echo "0) Back"
         echo
-        ui_read choice "Select: " || return 1
+        read -rp "Select: " choice
 
         case "$choice" in
             1)
@@ -11262,9 +10458,9 @@ restore_usage_reset_snapshot() {
         return 1
     fi
 
-    ui_line "1) Recommended: old value before reset + current usage accumulated after reset"
-    ui_line "2) Exact old value: overwrite current usage with the value before reset"
-    ui_read mode "Select [1]: " || return 1
+    echo "1) Recommended: old value before reset + current usage accumulated after reset"
+    echo "2) Exact old value: overwrite current usage with the value before reset"
+    read -rp "Select [1]: " mode
     mode="${mode:-1}"
 
     if ! ask_yes_no "Apply this snapshot recovery now?" "n"; then
@@ -11326,9 +10522,9 @@ PYRESTORESNAPSHOT
 
 usage_log_recovery_cutoff() {
     local choice date_text
-    ui_line "1) Use ALL currently available usage_log records" >&2
-    ui_line "2) Use logs from a specific local date/time" >&2
-    ui_read choice "Select [1]: " || return 1
+    echo "1) Use ALL currently available usage_log records" >&2
+    echo "2) Use logs from a specific local date/time" >&2
+    read -rp "Select [1]: " choice
     choice="${choice:-1}"
     if [[ "$choice" == "2" ]]; then
         date_text="$(ask_value "Start local date/time, example 2026-07-01 00:00:00" "")"
@@ -11341,9 +10537,9 @@ usage_log_recovery_cutoff() {
 
 preview_usage_log_recovery() {
     local scope target cutoff db="$DB_DIR/central.db"
-    ui_line "1) One group"
-    ui_line "2) One user"
-    ui_read scope "Select: " || return 1
+    echo "1) One group"
+    echo "2) One user"
+    read -rp "Select: " scope
     case "$scope" in
         1) target="$(ask_value "Group name" "group2")" ;;
         2) target="$(ask_value "Username" "")" ;;
@@ -11385,9 +10581,9 @@ PYPREVIEWLOGRECOVERY
 
 apply_usage_log_recovery() {
     local scope target cutoff db="$DB_DIR/central.db" was_active=0 rc=0
-    ui_line "1) Recover one group"
-    ui_line "2) Recover one user"
-    ui_read scope "Select: " || return 1
+    echo "1) Recover one group"
+    echo "2) Recover one user"
+    read -rp "Select: " scope
     case "$scope" in
         1) target="$(ask_value "Group name" "group2")" ;;
         2) target="$(ask_value "Username" "")" ;;
@@ -11460,18 +10656,18 @@ usage_recovery_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Used Traffic Recovery / Undo Reset ===="
-        ui_line "1) Show recovery statistics"
-        ui_line "2) List exact pre-reset snapshot batches"
-        ui_line "3) Preview one snapshot batch"
-        ui_line "4) Restore one exact snapshot batch"
-        ui_line "5) Preview fallback recovery from usage_log"
-        ui_line "6) Apply fallback recovery from usage_log"
-        ui_line "0) Back"
+        echo "1) Show recovery statistics"
+        echo "2) List exact pre-reset snapshot batches"
+        echo "3) Preview one snapshot batch"
+        echo "4) Restore one exact snapshot batch"
+        echo "5) Preview fallback recovery from usage_log"
+        echo "6) Apply fallback recovery from usage_log"
+        echo "0) Back"
         echo
-        ui_line "v14 and newer create an exact snapshot automatically before user/group/all usage resets."
+        echo "v14 and newer create an exact snapshot automatically before user/group/all usage resets."
         echo "For resets that happened before v14, use usage_log fallback recovery."
         echo
-        ui_read choice "Select: " || return 1
+        read -rp "Select: " choice
         case "$choice" in
             1) usage_recovery_stats; pause ;;
             2) list_usage_reset_snapshot_batches; pause ;;
@@ -11667,15 +10863,15 @@ extra_traffic_recovery_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Extra Traffic History / Recovery ===="
-        ui_line "1) Show extra traffic and snapshot statistics"
-        ui_line "2) List extra traffic snapshot batches"
-        ui_line "3) Preview one snapshot batch"
-        ui_line "4) Restore one exact snapshot batch"
-        ui_line "0) Back"
+        echo "1) Show extra traffic and snapshot statistics"
+        echo "2) List extra traffic snapshot batches"
+        echo "3) Preview one snapshot batch"
+        echo "4) Restore one exact snapshot batch"
+        echo "0) Back"
         echo
-        ui_line "v15 records exact quota_extra_bytes values before add, decrease, set, and clear operations."
+        echo "v15 records exact quota_extra_bytes values before add, decrease, set, and clear operations."
         echo
-        ui_read choice "Select: " || return 1
+        read -rp "Select: " choice
         case "$choice" in
             1) extra_traffic_recovery_stats; pause ;;
             2) list_extra_traffic_snapshot_batches; pause ;;
@@ -12192,15 +11388,6 @@ show_preserved_update_settings() {
 }
 
 apply_program_update_without_reconfigure() {
-    if [[ -d /etc/ocserv-manager/central-full-suspend ]]; then print_err "Resume full Central integration before updating Central components."; return 1; fi
-    # 'ask' preserves the standalone Central menu/CLI behavior. Integrated
-    # Manager updates pass the already confirmed policy ('yes' or 'no') so
-    # Central never asks the same backup question a second time.
-    local update_backup_policy="${1:-ask}"
-    case "$update_backup_policy" in
-        ask|yes|no) ;;
-        *) print_err "Invalid Central update backup policy: $update_backup_policy"; return 2 ;;
-    esac
     need_root
 
     local master_found=0 node_found=0
@@ -12227,27 +11414,16 @@ apply_program_update_without_reconfigure() {
 
     timestamp="$(date +%Y%m%d-%H%M%S)"
     local keep_update_backup=0
-    if [[ "$update_backup_policy" == "ask" ]]; then
-        if ask_yes_no "Create a persistent Central update backup before applying code updates?" "y"; then
-            keep_update_backup=1
-        fi
-    elif [[ "$update_backup_policy" == "yes" ]]; then
-        keep_update_backup=1
-        print_info "Central backup policy inherited from the Manager update: keep a persistent backup."
-    else
-        print_info "Central backup policy inherited from the Manager update: no persistent backup."
-    fi
-
-    if (( keep_update_backup == 1 )); then
+    if ask_yes_no "Create a persistent Central update backup before applying code updates?" "y"; then
         backup_root="$UPDATE_BACKUP_ROOT/$timestamp-$PROGRAM_VERSION"
+        keep_update_backup=1
     else
-        backup_root="$(mktemp -d /tmp/ocserv-central-update-rollback.XXXXXX)" || return 1
+        backup_root="$(mktemp -d /tmp/ocserv-central-update-rollback.XXXXXX)"
         print_warn "No persistent Central update backup will be kept; the temporary rollback bundle exists only for this update."
     fi
 
     if ! create_update_backup_bundle "$backup_root"; then
         print_err "Update stopped because the rollback bundle could not be created."
-        (( keep_update_backup == 0 )) && rm -rf -- "$backup_root" 2>/dev/null || true
         return 1
     fi
 
@@ -12302,17 +11478,9 @@ apply_master_update_menu() {
     timestamp="$(date +%Y%m%d-%H%M%S)"
     local keep_backup=0
     if ask_yes_no "Create a persistent Master update backup?" "y"; then backup_root="$UPDATE_BACKUP_ROOT/$timestamp-$PROGRAM_VERSION-master"; keep_backup=1; else backup_root="$(mktemp -d /tmp/ocserv-central-master-update-rollback.XXXXXX)"; fi
-    if ! create_update_backup_bundle "$backup_root"; then
-        (( keep_backup == 0 )) && rm -rf -- "$backup_root" 2>/dev/null || true
-        return 1
-    fi
+    create_update_backup_bundle "$backup_root" || return 1
     install_self_manager
-    local update_rc=0
-    apply_master_code_update_without_reconfigure "$backup_root" || update_rc=$?
-    if (( update_rc != 0 )); then
-        (( keep_backup == 0 )) && rm -rf -- "$backup_root" 2>/dev/null || true
-        return "$update_rc"
-    fi
+    apply_master_code_update_without_reconfigure "$backup_root"
     apply_cleanup_code_update_without_reconfigure || true
     show_preserved_update_settings
     print_ok "Master code update completed without reconfigure."
@@ -12325,17 +11493,9 @@ apply_node_update_menu() {
     timestamp="$(date +%Y%m%d-%H%M%S)"
     local keep_backup=0
     if ask_yes_no "Create a persistent Node update backup?" "y"; then backup_root="$UPDATE_BACKUP_ROOT/$timestamp-$PROGRAM_VERSION-node"; keep_backup=1; else backup_root="$(mktemp -d /tmp/ocserv-central-node-update-rollback.XXXXXX)"; fi
-    if ! create_update_backup_bundle "$backup_root"; then
-        (( keep_backup == 0 )) && rm -rf -- "$backup_root" 2>/dev/null || true
-        return 1
-    fi
+    create_update_backup_bundle "$backup_root" || return 1
     install_self_manager
-    local update_rc=0
-    apply_node_code_update_without_reconfigure "$backup_root" || update_rc=$?
-    if (( update_rc != 0 )); then
-        (( keep_backup == 0 )) && rm -rf -- "$backup_root" 2>/dev/null || true
-        return "$update_rc"
-    fi
+    apply_node_code_update_without_reconfigure "$backup_root"
     show_preserved_update_settings
     print_ok "Node code update completed without reconfigure."
     (( keep_backup == 0 )) && rm -rf "$backup_root" 2>/dev/null || true
@@ -12345,47 +11505,47 @@ master_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Master Menu ===="
-        ui_line "1) Install / reconfigure master (API token / TTL / prune / features)"
-        ui_line "2) Configure features: session limit / quota"
-        ui_line "3) Configure group limits from synchronized authority sources"
-        ui_line "4) Sync ocpasswd now"
-        ui_line "5) List users"
-        ui_line "6) Show one user"
-        ui_line "7) List active sessions"
-        ui_line "8) Add/edit user override"
-        ui_line "9) Remove user override"
-        ui_line "10) Reset user usage"
-        ui_line "11) Add traffic to user"
-        ui_line "12) Add time to user account"
-        ui_line "13) Set exact account expiry"
-        ui_line "14) Clear account expiry"
-        ui_line "15) Enable/disable user"
-        ui_line "16) List connected nodes / API servers"
-        ui_line "17) List exhausted-quota users"
-        ui_line "18) Exhausted-quota file tools: reset / dedupe / rebuild"
-        ui_line "19) Delete exhausted-quota file"
-        ui_line "20) Status"
-        ui_line "21) Show current limits.json"
-        ui_line "22) Backup / restore / cleanup menu"
-        ui_line "23) Restore program data directly"
-        ui_line "24) Uninstall master"
-        ui_line "25) Bulk traffic / quota menu"
-        ui_line "26) Group quota / new group menu"
-        ui_line "27) Database user cleanup / ocpasswd prune menu"
-        ui_line "28) Restart ocserv-central API"
-        ui_line "29) Refresh ocpasswd groups / apply current limits now"
-        ui_line "30) Used traffic recovery / undo accidental reset"
-        ui_line "31) Decrease added traffic from one user"
-        ui_line "32) Extra traffic change history / restore"
-        ui_line "33) Export usage information for one group to a TXT file"
-        ui_line "34) Export users at or above a used-traffic threshold to a TXT file"
-        ui_line "35) Prune central DB users missing from ocpasswd now"
-        ui_line "36) Configure automatic ocpasswd prune without reconfigure"
-        ui_line "37) Apply Master/API code update without reconfigure"
-        ui_line "38) List synchronized authority sources / conflicts"
-        ui_line "0) Back"
+        echo "1) Install / reconfigure master (API token / TTL / prune / features)"
+        echo "2) Configure features: session limit / quota"
+        echo "3) Configure group limits from synchronized authority sources"
+        echo "4) Sync ocpasswd now"
+        echo "5) List users"
+        echo "6) Show one user"
+        echo "7) List active sessions"
+        echo "8) Add/edit user override"
+        echo "9) Remove user override"
+        echo "10) Reset user usage"
+        echo "11) Add traffic to user"
+        echo "12) Add time to user account"
+        echo "13) Set exact account expiry"
+        echo "14) Clear account expiry"
+        echo "15) Enable/disable user"
+        echo "16) List connected nodes / API servers"
+        echo "17) List exhausted-quota users"
+        echo "18) Exhausted-quota file tools: reset / dedupe / rebuild"
+        echo "19) Delete exhausted-quota file"
+        echo "20) Status"
+        echo "21) Show current limits.json"
+        echo "22) Backup / restore / cleanup menu"
+        echo "23) Restore program data directly"
+        echo "24) Uninstall master"
+        echo "25) Bulk traffic / quota menu"
+        echo "26) Group quota / new group menu"
+        echo "27) Database user cleanup / ocpasswd prune menu"
+        echo "28) Restart ocserv-central API"
+        echo "29) Refresh ocpasswd groups / apply current limits now"
+        echo "30) Used traffic recovery / undo accidental reset"
+        echo "31) Decrease added traffic from one user"
+        echo "32) Extra traffic change history / restore"
+        echo "33) Export usage information for one group to a TXT file"
+        echo "34) Export users at or above a used-traffic threshold to a TXT file"
+        echo "35) Prune central DB users missing from ocpasswd now"
+        echo "36) Configure automatic ocpasswd prune without reconfigure"
+        echo "37) Apply Master/API code update without reconfigure"
+        echo "38) List synchronized authority sources / conflicts"
+        echo "0) Back"
         echo
-        ui_read choice "Select: " || return 1
+        read -rp "Select: " choice
         case "$choice" in
             1) install_master; pause ;;
             2) configure_features; systemctl restart ocserv-central 2>/dev/null || true; pause ;;
@@ -12439,18 +11599,18 @@ node_menu() {
     while true; do
         safe_clear
         echo "==== Ocserv Central - Node Menu ===="
-        ui_line "1) Install / reconfigure node"
-        ui_line "2) Edit node API settings"
-        ui_line "3) Enable live quota agent"
-        ui_line "4) Disable live quota agent"
-        ui_line "5) Status / logs"
-        ui_line "6) Test API connection"
-        ui_line "7) Re-apply ocserv.conf hook"
-        ui_line "8) Uninstall node and restore ocserv.conf"
-        ui_line "9) Apply Node code update without reconfigure"
-        ui_line "0) Back"
+        echo "1) Install / reconfigure node"
+        echo "2) Edit node API settings"
+        echo "3) Enable live quota agent"
+        echo "4) Disable live quota agent"
+        echo "5) Status / logs"
+        echo "6) Test API connection"
+        echo "7) Re-apply ocserv.conf hook"
+        echo "8) Uninstall node and restore ocserv.conf"
+        echo "9) Apply Node code update without reconfigure"
+        echo "0) Back"
         echo
-        ui_read choice "Select: " || return 1
+        read -rp "Select: " choice
         case "$choice" in
             1) install_node; pause ;;
             2) edit_node_settings; pause ;;
@@ -12549,188 +11709,6 @@ install_both_master_and_local_nodes() {
     return 0
 }
 
-# ----- Root-only Central maintenance and service controls -----
-central_service_action() {
-    if [[ -d /etc/ocserv-manager/central-full-suspend && "${2:-}" =~ ^(start|restart|enable)$ ]]; then
-        print_err "Full Central integration is suspended. Use option 11 to Resume instead of starting individual components."; return 1
-    fi
-    local unit="$1" action="$2" valid=0
-    case "$unit" in
-        ocserv-central.service|ocserv-central-agent.service|ocserv-manager-central@*.service) valid=1 ;;
-    esac
-    [[ "$valid" == 1 && "$unit" != *[!a-zA-Z0-9@._-]* ]] || { print_err "Unsafe service name."; return 2; }
-    case "$action" in
-        start|stop|restart|enable|disable|status|logs) ;;
-        *) print_err "Invalid service action."; return 2 ;;
-    esac
-    if [[ "$action" == stop && "$unit" == ocserv-central.service ]]; then
-        print_warn "Stopping the Master does NOT remove limits. fail-closed nodes may deny new logins."
-        print_warn "For a short policy break, use Temporary enforcement pause instead."
-        ask_yes_no "Stop Central Master service anyway?" "n" || return 0
-    elif [[ "$action" == stop && "$unit" != ocserv-central.service ]]; then
-        print_warn "Stopping this Agent suspends live heartbeat, traffic accounting and quota disconnects."
-        print_warn "Login connect hooks can remain active; this is NOT a controlled policy pause."
-        ask_yes_no "Stop the selected Agent anyway?" "n" || return 0
-    fi
-    case "$action" in
-        status)
-            printf 'Service: %s\n' "$unit"
-            printf '  Active: %s\n' "$(systemctl is-active "$unit" 2>/dev/null || echo unavailable)"
-            printf '  Boot:   %s\n' "$(systemctl is-enabled "$unit" 2>/dev/null || echo unavailable)"
-            # One short field per line is easier to read with screen readers
-            # and avoids wrapped, colorized `systemctl status` output.
-            systemctl show "$unit" --no-pager \
-                -p LoadState -p SubState -p Result -p MainPID --no-legend 2>/dev/null || true
-            ;;
-        logs) journalctl -u "$unit" -n 80 --no-pager -l || true ;;
-        enable|disable)
-            systemctl "$action" "$unit" && print_ok "$unit: $action completed."
-            ;;
-        *)
-            systemctl "$action" "$unit" && print_ok "$unit: $action completed."
-            ;;
-    esac
-}
-
-central_service_control_menu() {
-    local choice unit action i n found
-    while true; do
-        safe_clear
-        echo "==== Central - Service Controls ===="
-        echo "Master:       $(systemctl is-active ocserv-central.service 2>/dev/null || echo missing)"
-        echo "Legacy Node:  $(systemctl is-active ocserv-central-agent.service 2>/dev/null || echo missing)"
-        ui_line "1) Manage Central Master service"
-        ui_line "2) Manage legacy Node Agent service"
-        ui_line "3) Manage a local per-instance Central agent"
-        ui_line "4) Show all Central component service statuses"
-        ui_line "0) Back"
-        echo
-        ui_read choice "Select: " || return 1
-        case "$choice" in
-            0) return 0 ;;
-            1) unit="ocserv-central.service" ;;
-            2) unit="ocserv-central-agent.service" ;;
-            3)
-                if ! command -v /usr/local/sbin/ocserv-manager >/dev/null 2>&1; then
-                    print_warn "Ocserv Manager runtime is not installed."; pause; continue
-                fi
-                local -a local_units=()
-                mapfile -t local_units < <(
-                    {
-                        systemctl list-unit-files --no-legend 'ocserv-manager-central@*.service' 2>/dev/null | awk '{print $1}' || true
-                        systemctl list-units --all --no-legend 'ocserv-manager-central@*.service' 2>/dev/null | awk '{print $1}' || true
-                        if [[ -d /etc/ocserv-manager/central ]]; then
-                            find /etc/ocserv-manager/central -maxdepth 1 -type f -name '*.env' ! -name 'profile.env' -printf '%f\n' 2>/dev/null | sed -nE 's/^([A-Za-z0-9][A-Za-z0-9._-]*)[.]env$/ocserv-manager-central@\1.service/p'
-                        fi
-                    } | grep -E '^ocserv-manager-central@[A-Za-z0-9][A-Za-z0-9._-]*\.service$' | sort -u
-                )
-                if (( ${#local_units[@]} == 0 )); then
-                    print_warn "No installed per-instance Central agent units found."; pause; continue
-                fi
-                printf 'Local Central agents:\n'
-                for ((i=0; i<${#local_units[@]}; i++)); do
-                    ui_line "$((i+1))) ${local_units[$i]} ($(systemctl is-active "${local_units[$i]}" 2>/dev/null || echo missing))"
-                done
-                ui_read n "Choose agent (0=Back): " || return 1
-                [[ "$n" =~ ^[0-9]+$ ]] && (( 10#$n >= 1 && 10#$n <= ${#local_units[@]} )) || continue
-                unit="${local_units[$((10#$n-1))]}"
-                ;;
-            4)
-                systemctl --no-pager --all status ocserv-central.service ocserv-central-agent.service 2>&1 || true
-                systemctl list-units --no-pager --all 'ocserv-manager-central@*.service' 2>/dev/null || true
-                pause; continue ;;
-            *) print_warn "Invalid choice."; continue ;;
-        esac
-        while true; do
-            echo
-            printf 'Selected: %s (%s)\n' "$unit" "$(systemctl is-active "$unit" 2>/dev/null || echo missing)"
-            ui_line "1) Start   2) Stop   3) Restart   4) Status   5) Recent logs"
-            ui_line "6) Enable at boot   7) Disable at boot   0) Back"
-            ui_read choice "Select: " || return 1
-            case "$choice" in
-                1) action=start ;; 2) action=stop ;; 3) action=restart ;;
-                4) action=status ;; 5) action=logs ;; 6) action=enable ;; 7) action=disable ;;
-                0) break ;; *) print_warn "Invalid choice."; continue ;;
-            esac
-            central_service_action "$unit" "$action" || print_warn "Service command did not succeed."
-            pause
-        done
-    done
-}
-
-central_pause_status() {
-    local until now_epoch remaining
-    if [[ ! -f "$ENFORCEMENT_PAUSE_FILE" ]]; then
-        print_info "Central enforcement: ACTIVE (no maintenance pause)."; return 0
-    fi
-    until="$(jq -er 'if (.scope=="central-all" and (.until|type)=="number") then .until|floor else empty end' "$ENFORCEMENT_PAUSE_FILE" 2>/dev/null || true)"
-    now_epoch="$(date +%s)"
-    if [[ ! "$until" =~ ^[0-9]+$ ]] || (( until <= now_epoch || until > now_epoch + 3600 )); then
-        print_info "Central enforcement: ACTIVE (pause expired or invalid)."
-    else
-        remaining="$((until - now_epoch))"
-        print_warn "Central enforcement is PAUSED on this Master for another ${remaining} seconds (all attached Nodes)."
-        print_info "The API stays online; traffic is counted. Disabled/expired accounts and local limits still apply."
-    fi
-}
-
-central_pause_enforcement() {
-    need_root
-    local minutes until tmp
-    [[ -f "$MASTER_SERVICE" ]] || { print_err "Central Master is not installed."; return 1; }
-    systemctl is-active --quiet ocserv-central.service || {
-        print_err "Central Master must be running. Start it in Service Controls first."; return 1;
-    }
-    central_pause_status
-    print_warn "This temporarily bypasses ONLY Central session limits and traffic quota."
-    print_warn "Password authentication, disabled users, expiry, local limits and external auth remain enforced."
-    print_warn "All Nodes connected to THIS Master will be affected. Usage is still counted."
-    minutes="$(ask_integer "Pause duration in minutes (1-60)" "5" 1 60)" || return 1
-    ask_yes_no "Temporarily bypass Central enforcement for $minutes minutes?" "n" || return 0
-    until="$(( $(date +%s) + minutes*60 ))"
-    mkdir -p "$MASTER_ETC"
-    tmp="$(mktemp "$MASTER_ETC/.enforcement-pause.XXXXXX")" || return 1
-    chmod 600 "$tmp"
-    if ! jq -nc --argjson until "$until" '{scope:"central-all",until:$until}' > "$tmp"; then
-        rm -f "$tmp"; return 1
-    fi
-    mv -f "$tmp" "$ENFORCEMENT_PAUSE_FILE"
-    chmod 600 "$ENFORCEMENT_PAUSE_FILE"
-    logger -t ocserv-central-manager "TEMPORARY Central enforcement pause enabled until epoch=$until (minutes=$minutes)"
-    print_ok "Central policy pause enabled; expires automatically at $(date -d "@$until" '+%Y-%m-%d %H:%M:%S %Z')."
-}
-
-central_resume_enforcement() {
-    need_root
-    central_pause_status
-    [[ -f "$ENFORCEMENT_PAUSE_FILE" ]] || return 0
-    ask_yes_no "Resume normal Central enforcement immediately?" "n" || return 0
-    rm -f -- "$ENFORCEMENT_PAUSE_FILE"
-    logger -t ocserv-central-manager "Central enforcement pause cancelled manually"
-    print_ok "Normal Central enforcement restored. Over-quota/disabled users may be disconnected on next heartbeat."
-}
-
-central_pause_menu() {
-    local choice
-    while true; do
-        safe_clear
-        echo "==== Central - Temporary Enforcement Pause ===="
-        central_pause_status
-        ui_line "1) Pause Central limits temporarily (1-60 minutes)"
-        ui_line "2) Resume Central limits now"
-        ui_line "3) Show pause status"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
-        case "$choice" in
-            1) run_central_menu_action central_pause_enforcement; pause ;;
-            2) run_central_menu_action central_resume_enforcement; pause ;;
-            3) central_pause_status; pause ;;
-            0) return 0 ;;
-            *) print_warn "Invalid choice." ;;
-        esac
-    done
-}
-
 central_self_test_handlers() {
     local fn missing=0
     local handlers=(
@@ -12746,10 +11724,6 @@ central_self_test_handlers() {
         install_node
         apply_master_update_menu
         apply_node_update_menu
-        central_service_control_menu
-        central_pause_menu
-        central_pause_enforcement
-        central_resume_enforcement
     )
     for fn in "${handlers[@]}"; do
         if ! declare -F "$fn" >/dev/null 2>&1; then
@@ -12787,26 +11761,17 @@ main_menu() {
         echo "=============================================="
         echo "       Ocserv Central Manager v20.4.4"
         echo "=============================================="
-        ui_line "1) Master server menu"
-        ui_line "2) Local ocserv instances / Node integration (multi-instance, recommended)"
-        ui_line "3) Install both Master and Node(s) on this server (all local ocserv instances)"
-        ui_line "4) Legacy single-instance Node menu (standalone/non-Manager installs)"
-        ui_line "5) Full status"
-        ui_line "6) Uninstall legacy Node part"
-        ui_line "7) Uninstall Master part"
-        ui_line "8) Apply program update without reconfigure"
-        ui_line "9) Service controls (Master, Agent, status, logs)"
-        ui_line "10) Temporary Central enforcement pause (timed, reversible)"
-        ui_line "11) Fully suspend / resume Central integration (local host)"
-        ui_line "0) Exit"
+        echo "1) Master server menu"
+        echo "2) Local ocserv instances / Node integration (multi-instance, recommended)"
+        echo "3) Install both Master and Node(s) on this server (all local ocserv instances)"
+        echo "4) Legacy single-instance Node menu (standalone/non-Manager installs)"
+        echo "5) Full status"
+        echo "6) Uninstall legacy Node part"
+        echo "7) Uninstall Master part"
+        echo "8) Apply program update without reconfigure"
+        echo "0) Exit"
         echo
-        ui_read choice "Select: " || return 1
-        if [[ -d /etc/ocserv-manager/central-full-suspend ]]; then
-            case "$choice" in
-                0|5|9|11) : ;;
-                *) print_err "Full Central is suspended. Resume it via option 11 before managing Central services, profiles, quotas, sources or updates."; pause; continue ;;
-            esac
-        fi
+        read -rp "Select: " choice
         case "$choice" in
             1) master_menu ;;
             2) open_manager_multi_instance ;;
@@ -12816,9 +11781,6 @@ main_menu() {
             6) uninstall_node; pause ;;
             7) uninstall_master; pause ;;
             8) apply_program_update_without_reconfigure; pause ;;
-            9) central_service_control_menu ;;
-            10) central_pause_menu ;;
-            11) if manager_multi_instance_available; then /usr/local/sbin/ocserv-manager --central-full-menu; else print_err "Use the integrated Ocserv Manager to suspend the local integration."; pause; fi ;;
             0) exit 0 ;;
             *) echo "Invalid choice"; sleep 1 ;;
         esac
@@ -12827,9 +11789,7 @@ main_menu() {
 
 case "${1:-}" in
     --apply-update)
-        # Optional positional policy: yes/no for integrated Manager updates;
-        # absent means ask as before for standalone Central invocation.
-        apply_program_update_without_reconfigure "${2:-ask}"
+        apply_program_update_without_reconfigure
         exit $?
         ;;
     --apply-master-update)
@@ -12957,12 +11917,7 @@ EOF
 }
 
 update_embedded_central_without_reconfigure() {
-    central_full_assert_normal || return 1
-    local tmp update_backup_policy="${1:-ask}"
-    case "$update_backup_policy" in
-        ask|yes|no) ;;
-        *) print_err "Invalid integrated Central backup policy: $update_backup_policy"; return 2 ;;
-    esac
+    local tmp
     need_root
     tmp="$(mktemp)"
     extract_embedded_central_manager "$tmp"
@@ -12970,7 +11925,7 @@ update_embedded_central_without_reconfigure() {
     "$tmp" --self-test-handlers >/dev/null || { rm -f "$tmp"; print_err "Embedded Central Manager failed handler self-test; update was not applied."; return 1; }
     if [[ -x "$CENTRAL_MANAGER_BIN" || -f /etc/systemd/system/ocserv-central.service || -f /etc/systemd/system/ocserv-central-agent.service ]]; then
         print_info "Applying integrated Central $CENTRAL_EMBEDDED_VERSION code update without reconfigure..."
-        "$tmp" --apply-update "$update_backup_policy"
+        "$tmp" --apply-update
         local rc=$?
         if (( rc == 0 )); then
             install -m 700 "$tmp" "$CENTRAL_MANAGER_BIN"
@@ -13108,13 +12063,8 @@ create_backup_archive() {
             [[ -e "$p" ]] && cp -a "$p" "$staging/rootfs/etc/systemd/system/"
         done
     fi
-    if ! tar -C "$staging" -czf "$archive" .; then
-        rm -f -- "$archive"
-        rm -rf -- "$staging"
-        print_err "Archive creation failed; incomplete backup deleted."
-        return 1
-    fi
-    rm -rf -- "$staging"
+    tar -C "$staging" -czf "$archive" .
+    rm -rf "$staging"
     chmod 600 "$archive"
     audit "backup-create archive=$archive letsencrypt=$include_le central=$include_central"
     echo "$archive"
@@ -13270,9 +12220,7 @@ restore_backup_interactive() {
     (( keep_safety == 1 )) && print_ok "Persistent current-state safety backup: $safety"
     tmp="$(mktemp -d /tmp/ocserv-manager-restore.XXXXXX)"
     if ! extract_manager_archive_safe "$archive" "$tmp"; then
-        rm -rf "$tmp"
-        if (( keep_safety == 0 )); then rm -f "$safety" 2>/dev/null || true; rmdir "$safety_root" 2>/dev/null || true; fi
-        print_err "Safe extraction failed. Nothing was changed."; return 1
+        rm -rf "$tmp"; print_err "Safe extraction failed. Nothing was changed."; return 1
     fi
 
     # Stop only manager-owned control services while their files may be replaced.
@@ -13769,7 +12717,6 @@ delete_vhost() {
         transactional_replace_config "$instance" "$tmp" || true
         print_err "Could not safely apply vhost deletion; the vhost file was restored automatically."
         rm -f "$tmp"
-        (( keep_vbackup == 0 )) && rm -f "$vbackup" 2>/dev/null || true
         return 1
     fi
     rm -f "$tmp"
@@ -13780,8 +12727,8 @@ vhost_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Virtual Hosts: $instance ===="
-        ui_line "1) List virtual hosts"; ui_line "2) Create virtual host"; ui_line "3) Delete virtual host"; ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) List virtual hosts"; echo "2) Create virtual host"; echo "3) Delete virtual host"; echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in 1) list_vhosts "$instance"; pause;; 2) create_vhost "$instance"; pause;; 3) delete_vhost "$instance"; pause;; 0) return;; *) print_warn "Invalid selection.";; esac
     done
 }
@@ -14365,10 +13312,10 @@ doctor_no_udp_test() {
     doctor_ocpasswd_user_line "$instance" "$user" >/dev/null 2>&1 || { print_err "Username is not present in this instance's ocpasswd file."; return 1; }
     file="$(user_dir "$instance")/$user"
     mkdir -p "$(dirname "$file")"
-    ui_line "1) Enable temporary no-udp=true for this user"
-    ui_line "2) Remove only the Doctor-managed temporary no-udp test"
-    ui_line "0) Cancel"
-    ui_read mode "Select: " || return 1
+    echo "1) Enable temporary no-udp=true for this user"
+    echo "2) Remove only the Doctor-managed temporary no-udp test"
+    echo "0) Cancel"
+    read -r -p "Select: " mode || true
     case "$mode" in
         1)
             if grep -qE '^[[:space:]]*no-udp[[:space:]]*=' "$file" 2>/dev/null; then print_info "An active manual no-udp directive already exists; Doctor will not override or take ownership of it."; return 0; fi
@@ -14404,12 +13351,12 @@ stability_doctor_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Stability Doctor: $instance ===="
-        ui_line "1) Full instance stability audit"
-        ui_line "2) Diagnose one username"
-        ui_line "3) Live login-failure capture + username diagnosis"
-        ui_line "4) Temporary per-user TCP-only (no-udp) isolation test"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Full instance stability audit"
+        echo "2) Diagnose one username"
+        echo "3) Live login-failure capture + username diagnosis"
+        echo "4) Temporary per-user TCP-only (no-udp) isolation test"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) stability_doctor_instance "$instance"; pause ;;
             2) stability_doctor_user "$instance"; pause ;;
@@ -14425,15 +13372,15 @@ connection_stability_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Connection Stability / Mobile Roaming: $instance ===="
-        ui_line "1) Show current connection timers/settings"
-        ui_line "2) Apply RECOMMENDED service profile (30/30/60 timers, cookie 86400, roaming allowed, persistent cookies OFF)"
-        ui_line "3) Apply Aggressive roaming profile (persistent cookies ON; security tradeoff)"
-        ui_line "4) Apply upstream/default connection profile"
-        ui_line "5) Custom connection stability settings"
-        ui_line "6) Stability Doctor (instance/user/live diagnosis)"
-        ui_line "7) Restore a previous stability snapshot"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Show current connection timers/settings"
+        echo "2) Apply RECOMMENDED service profile (30/30/60 timers, cookie 86400, roaming allowed, persistent cookies OFF)"
+        echo "3) Apply Aggressive roaming profile (persistent cookies ON; security tradeoff)"
+        echo "4) Apply upstream/default connection profile"
+        echo "5) Custom connection stability settings"
+        echo "6) Stability Doctor (instance/user/live diagnosis)"
+        echo "7) Restore a previous stability snapshot"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) show_connection_stability_values "$instance"; pause ;;
             2) apply_connection_stability_profile "$instance" mobile-stable; pause ;;
@@ -14452,14 +13399,14 @@ repair_instance_menu() {
     local instance="$1" choice tmp
     while true; do
         echo; echo "==== Repair: $instance ===="
-        ui_line "1) Reapply scoped ingress/forwarding/NAT rules"
-        ui_line "2) Rebuild systemd units"
-        ui_line "3) Reapply saved manager state onto the preserved original/base config"
-        ui_line "4) Restart service"
-        ui_line "5) Reinstall Let's Encrypt reload hook"
-        ui_line "6) Restart Central live agent"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Reapply scoped ingress/forwarding/NAT rules"
+        echo "2) Rebuild systemd units"
+        echo "3) Reapply saved manager state onto the preserved original/base config"
+        echo "4) Restart service"
+        echo "5) Reinstall Let's Encrypt reload hook"
+        echo "6) Restart Central live agent"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) remove_firewall_for_instance "$instance"; apply_firewall_for_instance "$instance"; pause ;;
             2) write_systemd_units; print_ok "systemd units rebuilt."; pause ;;
@@ -14484,24 +13431,15 @@ status_dashboard() {
     echo "ocserv binary: ${binary:-not found}"
     echo "Outbound interface: $(default_route_iface || echo unknown)"
     echo "IPv4 forwarding: $(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo unknown) (saved policy=$(ipv4_forwarding_policy))"
-    ui_line "Firewall: per-instance simple setup; iptables is default, UFW is opt-in and never auto-enabled."
-    ui_line "Advanced rules remain available under Firewall -> Advanced and stay isolated in manager-owned chains."
+    echo "Firewall: per-instance simple setup; iptables is default, UFW is opt-in and never auto-enabled."
+    echo "Advanced rules remain available under Firewall -> Advanced and stay isolated in manager-owned chains."
     echo
-    local narrow_dashboard=0 term_cols="${COLUMNS:-80}"
-    if [[ -t 1 ]] && command -v tput >/dev/null 2>&1; then term_cols="$(tput cols 2>/dev/null || echo 80)"; fi
-    [[ "$term_cols" =~ ^[0-9]+$ ]] || term_cols=80
-    if (( term_cols < 105 )); then narrow_dashboard=1; else
-        printf '%-18s %-9s %-23s %-18s %-10s %-10s\n' "INSTANCE" "STATE" "LISTEN" "SUBNET" "ONLINE" "CERT-DAYS"
-    fi
+    printf '%-18s %-9s %-23s %-18s %-10s %-10s\n' "INSTANCE" "STATE" "LISTEN" "SUBNET" "ONLINE" "CERT-DAYS"
     while read -r i; do
         [[ -n "$i" ]] || continue
         svc="$(instance_service "$i")"; active="$(systemctl is-active "$svc" 2>/dev/null || echo unknown)"
         tcp="$(state_get "$i" TCP_PORT 2>/dev/null || echo '?')"; udp="$(state_get "$i" UDP_PORT 2>/dev/null || echo '?')"; listen="$(state_get "$i" LISTEN_HOST 2>/dev/null || echo '*')"; subnet="$(state_get "$i" SUBNET 2>/dev/null || echo '?')"; connected="$(connected_users_count "$i" 2>/dev/null || echo 0)"; cert="$(state_get "$i" SERVER_CERT 2>/dev/null || true)"; days="$(certificate_days_left "$cert" 2>/dev/null || echo -1)"
-        if (( narrow_dashboard == 1 )); then
-            printf 'Instance: %s\n  State: %s\n  Listen: %s\n  Subnet: %s\n  Online: %s\n  Certificate days: %s\n\n' "$i" "$active" "$listen:$tcp/$udp" "$subnet" "$connected" "$days"
-        else
-            printf '%-18s %-9s %-23s %-18s %-10s %-10s\n' "$i" "$active" "$listen:$tcp/$udp" "$subnet" "$connected" "$days"
-        fi
+        printf '%-18s %-9s %-23s %-18s %-10s %-10s\n' "$i" "$active" "$listen:$tcp/$udp" "$subnet" "$connected" "$days"
     done < <(list_instances | sort -u)
 
     echo
@@ -14530,12 +13468,12 @@ certificate_manager() {
     local choice instance cert tmp
     while true; do
         echo; echo "==== Certificate Manager ===="
-        ui_line "1) Show certificate status for all instances"
-        ui_line "2) Change certificate for a manager-owned instance"
-        ui_line "3) Run certbot renew"
-        ui_line "4) Install/repair ocserv certificate reload hook"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Show certificate status for all instances"
+        echo "2) Change certificate for a manager-owned instance"
+        echo "3) Run certbot renew"
+        echo "4) Install/repair ocserv certificate reload hook"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1)
                 while read -r instance; do [[ -n "$instance" ]] || continue; cert="$(state_get "$instance" SERVER_CERT 2>/dev/null || true)"; echo "$instance: ${cert:-unknown} | expires $(certificate_expiry_text "$cert") | days $(certificate_days_left "$cert")"; done < <(list_instances | sort -u); pause ;;
@@ -14578,7 +13516,7 @@ reconfigure_managed_instance() {
     oldsub="$(state_get "$instance" SUBNET)"; oldiface="$(state_get "$instance" OUT_IFACE 2>/dev/null || true)"
     oldipv6="$(state_get "$instance" IPV6_NETWORK 2>/dev/null || true)"; oldnat6="$(state_get "$instance" IPV6_NAT 2>/dev/null || echo 0)"
     oldtcp="$(state_get "$instance" TCP_PORT 2>/dev/null || echo 443)"; oldudp="$(state_get "$instance" UDP_PORT 2>/dev/null || echo "$oldtcp")"; oldfw="$(firewall_mode_for_instance "$instance")"
-    ui_line "Reconfigure sections. Existing values are preserved unless the selected section is changed."
+    echo "Reconfigure sections. Existing values are preserved unless the selected section is changed."
     while true; do
         choice="$(choose_menu "Select section:" "Listen IP and TCP/UDP ports" "VPN subnet" "Server certificate" "Authentication" "DNS" "Client/session and ban limits" "MTU/DPD/keepalive/IPv6 network profile" "Full/split routing, DNS leak and bypass" "Firewall mode (iptables / iptables-persistent / UFW)" "Open per-instance Firewall Manager" "Finish and apply" "Cancel")"
         case "$choice" in
@@ -14594,12 +13532,12 @@ reconfigure_managed_instance() {
             9) configure_firewall_mode "$instance" ;;
             10) firewall_manager_menu "$instance" ;;
             11) break ;;
-            12) cp -a "$backup_state" "$state"; (( keep_state_backup == 0 )) && rm -f "$backup_state" 2>/dev/null || true; print_info "Changes cancelled."; return 0 ;;
+            12) cp -a "$backup_state" "$state"; print_info "Changes cancelled."; return 0 ;;
         esac
     done
     tmp="$(mktemp)"; generate_ocserv_config "$instance" "$tmp"
-    if ! validate_config "$tmp"; then cp -a "$backup_state" "$state"; rm -f "$tmp"; (( keep_state_backup == 0 )) && rm -f "$backup_state" 2>/dev/null || true; print_err "Generated config failed validation; state rolled back."; return 1; fi
-    if ! transactional_replace_config "$instance" "$tmp"; then cp -a "$backup_state" "$state"; rm -f "$tmp"; (( keep_state_backup == 0 )) && rm -f "$backup_state" 2>/dev/null || true; return 1; fi
+    if ! validate_config "$tmp"; then cp -a "$backup_state" "$state"; rm -f "$tmp"; print_err "Generated config failed validation; state rolled back."; return 1; fi
+    if ! transactional_replace_config "$instance" "$tmp"; then cp -a "$backup_state" "$state"; rm -f "$tmp"; return 1; fi
     rm -f "$tmp"
     remove_firewall_values "$instance" "$oldsub" "$oldiface"
     remove_ipv6_firewall_values "$instance" "$oldipv6" "$oldiface" "$oldnat6"
@@ -14629,8 +13567,8 @@ configuration_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Configuration: $instance ===="
-        ui_line "1) Show config"; ui_line "2) Validate config"; ui_line "3) Guided reconfigure (patches the preserved original config structure)"; ui_line "4) Advanced raw edit (switches to preservation mode)"; ui_line "5) Restore exact version sample as base, then reapply selected values"; ui_line "6) config-per-user / config-per-group settings"; ui_line "7) IPv4 forwarding (global server setting)"; ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Show config"; echo "2) Validate config"; echo "3) Guided reconfigure (patches the preserved original config structure)"; echo "4) Advanced raw edit (switches to preservation mode)"; echo "5) Restore exact version sample as base, then reapply selected values"; echo "6) config-per-user / config-per-group settings"; echo "7) IPv4 forwarding (global server setting)"; echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) cat "$(instance_config "$instance")"; pause;;
             2) validate_config "$(instance_config "$instance")" && print_ok "Valid." || print_err "Invalid."; pause;;
@@ -14763,8 +13701,8 @@ api_menu() {
     local choice
     while true; do
         echo; echo "==== JSON / Read-only API ===="
-        ui_line "1) Print JSON status now"; ui_line "2) Enable/reconfigure read-only HTTP API"; ui_line "3) Disable API"; ui_line "4) API service status"; ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Print JSON status now"; echo "2) Enable/reconfigure read-only HTTP API"; echo "3) Disable API"; echo "4) API service status"; echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) json_status | jq .; pause;; 2) configure_readonly_api; pause;; 3) disable_readonly_api; pause;; 4) systemctl status ocserv-manager-api --no-pager || true; pause;; 0) return;; *) print_warn "Invalid selection.";; esac
     done
@@ -15346,10 +14284,6 @@ fw_optional_backup_existing_persistent_rules() {
     local stamp
     [[ -f "$IPTABLES_RULES_V4" || -f "$IPTABLES_RULES_V6" ]] || return 0
     if ask_yes_no "Create a persistent backup of the current $IPTABLES_RULES_V4 / $IPTABLES_RULES_V6 before they are overwritten?" "y"; then
-        if [[ ! -f "$IPTABLES_RULES_V4" && ! -f "$IPTABLES_RULES_V6" ]]; then
-            print_info "No existing persistent rules files to back up."
-            return 0
-        fi
         ensure_backup_root; stamp="$(date +%Y%m%d-%H%M%S)"
         mkdir -p "$BACKUP_ROOT/iptables-persistent-$stamp"
         [[ -f "$IPTABLES_RULES_V4" ]] && cp -a "$IPTABLES_RULES_V4" "$BACKUP_ROOT/iptables-persistent-$stamp/rules.v4"
@@ -15381,9 +14315,9 @@ fw_reload_iptables_persistent() {
 
 fw_set_persistence_mode() {
     local instance="$1" choice rollback
-    ui_line "1) Manager boot reapply only"
-    ui_line "2) iptables-persistent (save the complete host ruleset to /etc/iptables/rules.v4)"
-    ui_read choice "Select persistence mode: " || return 1
+    echo "1) Manager boot reapply only"
+    echo "2) iptables-persistent (save the complete host ruleset to /etc/iptables/rules.v4)"
+    read -r -p "Select persistence mode: " choice || true
     case "$choice" in
         1)
             rollback="$(fw_prepare_change "$instance" persistence-manager)"
@@ -15697,13 +14631,11 @@ fw_choose_interface() {
         items+=("$name"); states+=("${state:-?}"); addrs+=("${addr:-no-ipv4}")
     done < <(ip -o link show 2>/dev/null)
     echo "$prompt" >&2
-    [[ "$allow_any" == 1 ]] && ui_line "0) Any interface" >&2
-    for ((i=0;i<${#items[@]};i++)); do
-        printf '%d) %s (state: %s)\n   IPv4: %s\n' "$((i+1))" "${items[$i]}" "${states[$i]}" "${addrs[$i]}" >&2
-    done
+    [[ "$allow_any" == 1 ]] && echo "0) Any interface" >&2
+    for ((i=0;i<${#items[@]};i++)); do printf '%d) %s  state=%s  ipv4=%s\n' "$((i+1))" "${items[$i]}" "${states[$i]}" "${addrs[$i]}" >&2; done
     echo "m) Enter interface manually" >&2
     while true; do
-        ui_read choice "Select${default:+ [$default]}: " || return 1
+        read -r -p "Select${default:+ [$default]}: " choice || true
         choice="${choice:-$default}"
         [[ "$allow_any" == 1 && "$choice" == 0 ]] && { echo ""; return 0; }
         if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#items[@]})); then echo "${items[$((choice-1))]}"; return 0; fi
@@ -15728,10 +14660,10 @@ fw_choose_local_ipv4() {
     local -a ips=() ifs=()
     while read -r iface cidr; do [[ -n "$iface" && -n "$cidr" ]] || continue; ip="${cidr%%/*}"; [[ "$ip" == 127.* ]] && continue; ips+=("$ip"); ifs+=("$iface"); done < <(ip -o -4 addr show 2>/dev/null | awk '{print $2, $4}')
     echo "$prompt" >&2
-    for ((i=0;i<${#ips[@]};i++)); do ui_line "$((i+1))) ${ips[$i]} on ${ifs[$i]}"; done
+    for ((i=0;i<${#ips[@]};i++)); do printf '%d) %s on %s\n' "$((i+1))" "${ips[$i]}" "${ifs[$i]}" >&2; done
     echo "m) Enter IPv4 manually" >&2
     while true; do
-        ui_read choice "Select: " || return 1
+        read -r -p "Select: " choice || true
         if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#ips[@]})); then echo "${ips[$((choice-1))]}"; return 0; fi
         if [[ "$choice" == m || "$choice" == M ]]; then ip="$(ask_value "IPv4 address" "")"; valid_ipv4 "$ip" && { echo "$ip"; return 0; }; print_warn "Invalid IPv4." >&2; else print_warn "Invalid selection." >&2; fi
     done
@@ -15756,24 +14688,24 @@ fw_choose_route() {
     local -a recs=()
     while IFS= read -r r; do [[ -n "$r" ]] && recs+=("$r"); done < <(fw_route_records "$family")
     echo "$prompt" >&2
-    for ((i=0;i<${#recs[@]};i++)); do IFS='|' read -r d dev via src table raw <<<"${recs[$i]}"; ui_line "$((i+1))) dest=$d dev=$dev via=${via:--} src=${src:--} table=$table"; done
-    ui_line "0) Cancel" >&2
-    while true; do ui_read choice "Select route: " || return 1; [[ "$choice" == 0 ]] && return 1; if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#recs[@]})); then echo "${recs[$((choice-1))]}"; return 0; fi; print_warn "Invalid selection." >&2; done
+    for ((i=0;i<${#recs[@]};i++)); do IFS='|' read -r d dev via src table raw <<<"${recs[$i]}"; printf '%d) dest=%s dev=%s via=%s src=%s table=%s\n' "$((i+1))" "$d" "$dev" "${via:--}" "${src:--}" "$table" >&2; done
+    echo "0) Cancel" >&2
+    while true; do read -r -p "Select route: " choice || true; [[ "$choice" == 0 ]] && return 1; if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#recs[@]})); then echo "${recs[$((choice-1))]}"; return 0; fi; print_warn "Invalid selection." >&2; done
 }
 
 fw_choose_source() {
     local instance="$1" family="${2:-ipv4}" choice value
     echo "Source selector:" >&2
-    if [[ "$family" == ipv6 ]]; then ui_line "1) Instance IPv6 VPN pool (@vpn6)" >&2; else ui_line "1) Instance IPv4 VPN pool (@vpn)" >&2; fi
-    ui_line "2) Any source" >&2; ui_line "3) Custom IP/CIDR" >&2
-    ui_read choice "Select [1]: " || return 1; choice="${choice:-1}"
+    if [[ "$family" == ipv6 ]]; then echo "1) Instance IPv6 VPN pool (@vpn6)" >&2; else echo "1) Instance IPv4 VPN pool (@vpn)" >&2; fi
+    echo "2) Any source" >&2; echo "3) Custom IP/CIDR" >&2
+    read -r -p "Select [1]: " choice || true; choice="${choice:-1}"
     case "$choice" in 1) [[ "$family" == ipv6 ]] && echo @vpn6 || echo @vpn ;; 2) echo any ;; 3) value="$(ask_value "Source IP/CIDR" "")"; echo "$value" ;; *) echo any ;; esac
 }
 
 fw_choose_destination() {
     local family="${1:-ipv4}" choice rec dest
-    echo "Destination selector:" >&2; ui_line "1) Any destination" >&2; ui_line "2) Choose from detected routing table" >&2; ui_line "3) Custom IP/CIDR" >&2
-    ui_read choice "Select [1]: " || return 1; choice="${choice:-1}"
+    echo "Destination selector:" >&2; echo "1) Any destination" >&2; echo "2) Choose from detected routing table" >&2; echo "3) Custom IP/CIDR" >&2
+    read -r -p "Select [1]: " choice || true; choice="${choice:-1}"
     case "$choice" in
         1) echo any ;;
         2)
@@ -15787,8 +14719,8 @@ fw_choose_destination() {
 
 fw_select_primary_outbound() {
     local instance="$1" choice iface rec dest dev via src table raw
-    echo "Primary outbound selection:"; ui_line "1) Auto-detect current default route"; ui_line "2) Choose an interface"; ui_line "3) Choose from detected routes"
-    ui_read choice "Select [1]: " || return 1; choice="${choice:-1}"
+    echo "Primary outbound selection:"; echo "1) Auto-detect current default route"; echo "2) Choose an interface"; echo "3) Choose from detected routes"
+    read -r -p "Select [1]: " choice || true; choice="${choice:-1}"
     case "$choice" in
         1) iface="$(default_route_iface)"; state_set "$instance" OUT_IFACE "$iface"; state_set "$instance" FIREWALL_PRIMARY_ROUTE "default(auto)" ;;
         2) iface="$(fw_choose_interface "Choose primary outbound interface" "" 0)"; state_set "$instance" OUT_IFACE "$iface"; state_set "$instance" FIREWALL_PRIMARY_ROUTE "interface:$iface" ;;
@@ -15832,18 +14764,18 @@ fw_rule_wizard() {
     local instance="$1" replace_index="${2:-}" existing="${3:-}" type kind family source dest inif outif action proto dport tosrc todst desc ret id table chain target match targetargs rec rdest rdev rvia rsrc rtable rraw
     id="$(jq -r '.id // empty' <<<"${existing:-{}}" 2>/dev/null || true)"; [[ -n "$id" ]] || id="$(fw_new_rule_id)"
     echo "Rule type:" >&2
-    ui_line "1) Stateful FORWARD pair (outbound + established return)" >&2
-    ui_line "2) One-way FORWARD rule" >&2
-    ui_line "3) NAT MASQUERADE" >&2
-    ui_line "4) NAT SNAT to a local/source IP" >&2
-    ui_line "5) DNAT / port forward" >&2
-    ui_line "6) INPUT allow/deny/reject" >&2
-    ui_line "7) OUTPUT allow/deny/reject" >&2
-    ui_line "8) Advanced managed netfilter rule (filter/nat/mangle/raw; no flush/policy commands)" >&2
-    ui_line "9) Native UFW rule (in / out / route; UFW backend only)" >&2
-    ui_line "10) TCP MSS clamp to PMTU on a forwarded path" >&2
-    ui_line "0) Cancel" >&2
-    ui_read type "Select: " || return 1
+    echo "1) Stateful FORWARD pair (outbound + established return)" >&2
+    echo "2) One-way FORWARD rule" >&2
+    echo "3) NAT MASQUERADE" >&2
+    echo "4) NAT SNAT to a local/source IP" >&2
+    echo "5) DNAT / port forward" >&2
+    echo "6) INPUT allow/deny/reject" >&2
+    echo "7) OUTPUT allow/deny/reject" >&2
+    echo "8) Advanced managed netfilter rule (filter/nat/mangle/raw; no flush/policy commands)" >&2
+    echo "9) Native UFW rule (in / out / route; UFW backend only)" >&2
+    echo "10) TCP MSS clamp to PMTU on a forwarded path" >&2
+    echo "0) Cancel" >&2
+    read -r -p "Select: " type || true
     [[ "$type" == 0 ]] && return 1
     case "$type" in 1) kind=forward_pair ;; 2) kind=forward ;; 3) kind=nat_masquerade ;; 4) kind=nat_snat ;; 5) kind=dnat ;; 6) kind=input ;; 7) kind=output ;; 8) kind=advanced ;; 9) kind=ufw_native ;; 10) kind=mss_clamp ;; *) print_warn "Invalid selection." >&2; return 1 ;; esac
     family="$(choose_menu "Address family:" "IPv4" "IPv6")"; [[ "$family" == 2 ]] && family=ipv6 || family=ipv4
@@ -15853,15 +14785,15 @@ fw_rule_wizard() {
         forward_pair|forward)
             source="$(fw_choose_source "$instance" "$family")"; dest="$(fw_choose_destination "$family")"
             echo "Inbound interface is optional." >&2; inif="$(fw_choose_interface "Choose inbound interface" "" 1)"
-            echo "Outbound interface can be selected directly or from a route." >&2; ui_line "1) Interface" >&2; ui_line "2) Detected route" >&2
-            ui_read type "Select [1]: " || return 1; type="${type:-1}"
+            echo "Outbound interface can be selected directly or from a route." >&2; echo "1) Interface" >&2; echo "2) Detected route" >&2
+            read -r -p "Select [1]: " type || true; type="${type:-1}"
             if [[ "$type" == 2 ]]; then rec="$(fw_choose_route "Choose route" "$family")" || return 1; IFS='|' read -r rdest rdev rvia rsrc rtable rraw <<<"$rec"; outif="$rdev"; [[ "$dest" == any && "$rdest" != default ]] && dest="$rdest"; else outif="$(fw_choose_interface "Choose outbound interface" "" 0)"; fi
-            echo "Action: 1) ACCEPT  2) DROP  3) REJECT" >&2; ui_read type "Select [1]: " || return 1; case "${type:-1}" in 2) action=DROP;;3) action=REJECT;;*) action=ACCEPT;; esac
+            echo "Action: 1) ACCEPT  2) DROP  3) REJECT" >&2; read -r -p "Select [1]: " type || true; case "${type:-1}" in 2) action=DROP;;3) action=REJECT;;*) action=ACCEPT;; esac
             [[ "$kind" == forward_pair && "$action" == ACCEPT ]] && ret=true
             ;;
         nat_masquerade|nat_snat)
             source="$(fw_choose_source "$instance" "$family")"; dest="$(fw_choose_destination "$family")"
-            ui_line "1) Select output interface" >&2; ui_line "2) Select detected route" >&2; ui_read type "Select [2]: " || return 1; type="${type:-2}"
+            echo "1) Select output interface" >&2; echo "2) Select detected route" >&2; read -r -p "Select [2]: " type || true; type="${type:-2}"
             if [[ "$type" == 2 ]]; then rec="$(fw_choose_route "Choose route used by this NAT rule" "$family")" || return 1; IFS='|' read -r rdest rdev rvia rsrc rtable rraw <<<"$rec"; outif="$rdev"; [[ "$dest" == any && "$rdest" != default ]] && dest="$rdest"; else outif="$(fw_choose_interface "Choose output interface" "" 0)"; fi
             if [[ "$kind" == nat_snat ]]; then [[ "$family" == ipv4 ]] && tosrc="$(fw_choose_local_ipv4 "Choose the local/source IPv4 used for SNAT")" || tosrc="$(ask_value "IPv6 source address for SNAT" "")"; fi
             ;;
@@ -15872,16 +14804,16 @@ fw_rule_wizard() {
             ;;
         dnat)
             source="$(fw_choose_source "$instance" "$family")"; dest="$(fw_choose_destination "$family")"; inif="$(fw_choose_interface "Choose inbound interface (0=any)" "" 1)"
-            echo "Protocol: 1) TCP  2) UDP  3) Any" >&2; ui_read type "Select [1]: " || return 1; case "${type:-1}" in 2) proto=udp;;3) proto=all;;*) proto=tcp;; esac
+            echo "Protocol: 1) TCP  2) UDP  3) Any" >&2; read -r -p "Select [1]: " type || true; case "${type:-1}" in 2) proto=udp;;3) proto=all;;*) proto=tcp;; esac
             if [[ "$proto" != all ]]; then dport="$(ask_value "Destination port to match (blank=any)" "")"; fw_validate_port_optional "$dport" || { print_warn "Invalid port." >&2; return 1; }; fi
             todst="$(ask_nonempty "DNAT destination (IP or IP:port)")"
             ;;
         input|output)
             source="$(fw_choose_source "$instance" "$family")"; dest="$(fw_choose_destination "$family")"
             if [[ "$kind" == input ]]; then inif="$(fw_choose_interface "Choose inbound interface (0=any)" "" 1)"; else outif="$(fw_choose_interface "Choose outbound interface (0=any)" "" 1)"; fi
-            echo "Protocol: 1) TCP  2) UDP  3) Any" >&2; ui_read type "Select [3]: " || return 1; case "${type:-3}" in 1) proto=tcp;;2) proto=udp;;*) proto=all;; esac
+            echo "Protocol: 1) TCP  2) UDP  3) Any" >&2; read -r -p "Select [3]: " type || true; case "${type:-3}" in 1) proto=tcp;;2) proto=udp;;*) proto=all;; esac
             if [[ "$proto" != all ]]; then dport="$(ask_value "Destination port (blank=any)" "")"; fw_validate_port_optional "$dport" || { print_warn "Invalid port." >&2; return 1; }; fi
-            echo "Action: 1) ACCEPT  2) DROP  3) REJECT" >&2; ui_read type "Select [1]: " || return 1; case "${type:-1}" in 2) action=DROP;;3) action=REJECT;;*) action=ACCEPT;; esac
+            echo "Action: 1) ACCEPT  2) DROP  3) REJECT" >&2; read -r -p "Select [1]: " type || true; case "${type:-1}" in 2) action=DROP;;3) action=REJECT;;*) action=ACCEPT;; esac
             ;;
         ufw_native)
             if [[ "$(firewall_mode_for_instance "$instance")" != ufw ]]; then
@@ -15889,9 +14821,9 @@ fw_rule_wizard() {
                 return 1
             fi
             local direction ufwaction
-            echo "Direction: 1) in  2) out  3) route/forward" >&2; ui_read type "Select [1]: " || return 1
+            echo "Direction: 1) in  2) out  3) route/forward" >&2; read -r -p "Select [1]: " type || true
             case "${type:-1}" in 2) direction=out;;3) direction=route;;*) direction=in;; esac
-            echo "UFW action: 1) allow  2) deny  3) reject  4) limit" >&2; ui_read type "Select [1]: " || return 1
+            echo "UFW action: 1) allow  2) deny  3) reject  4) limit" >&2; read -r -p "Select [1]: " type || true
             case "${type:-1}" in 2) ufwaction=deny;;3) ufwaction=reject;;4) ufwaction=limit;;*) ufwaction=allow;; esac
             source="$(fw_choose_source "$instance" "$family")"; dest="$(fw_choose_destination "$family")"
             case "$direction" in
@@ -15899,20 +14831,20 @@ fw_rule_wizard() {
                 out) outif="$(fw_choose_interface "Choose outbound interface (0=any)" "" 1)" ;;
                 route) inif="$(fw_choose_interface "Choose inbound interface (0=any)" "" 1)"; outif="$(fw_choose_interface "Choose outbound interface (0=any)" "" 1)" ;;
             esac
-            echo "Protocol: 1) TCP  2) UDP  3) Any" >&2; ui_read type "Select [3]: " || return 1; case "${type:-3}" in 1) proto=tcp;;2) proto=udp;;*) proto=all;; esac
+            echo "Protocol: 1) TCP  2) UDP  3) Any" >&2; read -r -p "Select [3]: " type || true; case "${type:-3}" in 1) proto=tcp;;2) proto=udp;;*) proto=all;; esac
             if [[ "$proto" != all ]]; then dport="$(ask_value "Destination port (blank=any)" "")"; fw_validate_port_optional "$dport" || { print_warn "Invalid port." >&2; return 1; }; fi
             jq -n --arg id "$id" --arg family "$family" --arg desc "$desc" --arg direction "$direction" --arg action "$ufwaction" --arg source "$source" --arg destination "$dest" --arg in_iface "$inif" --arg out_iface "$outif" --arg protocol "$proto" --arg dport "$dport" '{id:$id,enabled:true,kind:"ufw_native",family:$family,description:$desc,direction:$direction,ufw_action:$action,source:$source,destination:$destination,in_iface:$in_iface,out_iface:$out_iface,protocol:$protocol,dport:$dport}'
             return 0
             ;;
         advanced)
             print_warn "Expert mode can still break this instance's traffic. Global flush/policy/chain-delete operations are blocked." >&2
-            echo "Table: 1) filter  2) nat  3) mangle  4) raw" >&2; ui_read type "Select [1]: " || return 1
+            echo "Table: 1) filter  2) nat  3) mangle  4) raw" >&2; read -r -p "Select [1]: " type || true
             case "${type:-1}" in 2) table=nat;;3) table=mangle;;4) table=raw;;*) table=filter;; esac
             case "$table" in
-                filter) echo "Chain: 1) INPUT 2) FORWARD 3) OUTPUT" >&2; ui_read type "Select [2]: " || return 1; case "${type:-2}" in 1) chain=INPUT;;3) chain=OUTPUT;;*) chain=FORWARD;; esac ;;
-                nat) echo "Chain: 1) PREROUTING 2) POSTROUTING" >&2; ui_read type "Select [2]: " || return 1; [[ "${type:-2}" == 1 ]] && chain=PREROUTING || chain=POSTROUTING ;;
-                mangle) echo "Chain: 1) PREROUTING 2) INPUT 3) FORWARD 4) OUTPUT 5) POSTROUTING" >&2; ui_read type "Select [3]: " || return 1; case "${type:-3}" in 1) chain=PREROUTING;;2) chain=INPUT;;4) chain=OUTPUT;;5) chain=POSTROUTING;;*) chain=FORWARD;; esac ;;
-                raw) echo "Chain: 1) PREROUTING 2) OUTPUT" >&2; ui_read type "Select [1]: " || return 1; [[ "${type:-1}" == 2 ]] && chain=OUTPUT || chain=PREROUTING ;;
+                filter) echo "Chain: 1) INPUT 2) FORWARD 3) OUTPUT" >&2; read -r -p "Select [2]: " type || true; case "${type:-2}" in 1) chain=INPUT;;3) chain=OUTPUT;;*) chain=FORWARD;; esac ;;
+                nat) echo "Chain: 1) PREROUTING 2) POSTROUTING" >&2; read -r -p "Select [2]: " type || true; [[ "${type:-2}" == 1 ]] && chain=PREROUTING || chain=POSTROUTING ;;
+                mangle) echo "Chain: 1) PREROUTING 2) INPUT 3) FORWARD 4) OUTPUT 5) POSTROUTING" >&2; read -r -p "Select [3]: " type || true; case "${type:-3}" in 1) chain=PREROUTING;;2) chain=INPUT;;4) chain=OUTPUT;;5) chain=POSTROUTING;;*) chain=FORWARD;; esac ;;
+                raw) echo "Chain: 1) PREROUTING 2) OUTPUT" >&2; read -r -p "Select [1]: " type || true; [[ "${type:-1}" == 2 ]] && chain=OUTPUT || chain=PREROUTING ;;
             esac
             match="$(ask_value "Match arguments, e.g. -s 10.10.0.0/16 -o eth1 -p tcp --dport 443" "")"
             target="$(ask_nonempty "Target, e.g. ACCEPT, DROP, REJECT, MASQUERADE, SNAT, DNAT")"
@@ -15968,31 +14900,24 @@ fw_restore_temp_bundle() {
     fw_sync_manager_reapply_service >/dev/null 2>&1 || true
 }
 
-fw_keep_prechange_snapshot() {
-    local instance="$1" label="$2" source_dir="$3" root snap f
-    if ! ask_yes_no "Create a persistent firewall snapshot before '$label'?" "y"; then
-        print_info "Persistent firewall snapshot skipped; temporary rollback copy is removed when this change completes."
-        return 0
-    fi
-    ensure_backup_root
-    root="$(fw_snapshot_dir_for_instance "$instance")"
-    mkdir -p "$root"; chmod 700 "$root"
-    snap="$root/$(date +%Y%m%d-%H%M%S)-before-${label//[^A-Za-z0-9_.-]/_}-$RANDOM"
-    mkdir -p "$snap"
-    for f in policy.json state.env rules.v4 rules.v6; do
-        [[ -f "$source_dir/$f" ]] && cp -a "$source_dir/$f" "$snap/$f"
-    done
-    printf 'instance=%s\ncreated=%s\nlabel=before-%s\n' "$instance" "$(date -Is)" "$label" > "$snap/meta.env"
-    fw_show_live_rules "$instance" > "$snap/live-rules.txt" 2>&1 || true
-    chmod -R go-rwx "$snap" 2>/dev/null || true
-    print_ok "Firewall snapshot saved: $snap"
-}
-
 fw_prepare_change() {
     local instance="$1" label="$2" dir
-    dir="$(fw_temp_rollback_bundle "$instance")" || return 1
-    fw_keep_prechange_snapshot "$instance" "$label" "$dir" >&2
-    printf '%s\n' "$dir"
+    dir="$(fw_temp_rollback_bundle "$instance")"
+    if ask_yes_no "Create a persistent firewall snapshot before '$label'?" "y"; then
+        # The user already confirmed; create directly without a second prompt.
+        ensure_backup_root; local root snap policy state; root="$(fw_snapshot_dir_for_instance "$instance")"; mkdir -p "$root"; chmod 700 "$root"
+        snap="$root/$(date +%Y%m%d-%H%M%S)-before-${label//[^A-Za-z0-9_.-]/_}-$RANDOM"; mkdir -p "$snap"
+        policy="$(firewall_policy_file "$instance")"; state="$(instance_state_file "$instance")"
+        [[ -f "$policy" ]] && cp -a "$policy" "$snap/policy.json"; [[ -f "$state" ]] && cp -a "$state" "$snap/state.env"
+        command -v iptables-save >/dev/null 2>&1 && iptables-save > "$snap/rules.v4" 2>/dev/null || true
+        command -v ip6tables-save >/dev/null 2>&1 && ip6tables-save > "$snap/rules.v6" 2>/dev/null || true
+        { echo "instance=$instance"; echo "created=$(date -Is)"; echo "label=before-$label"; } > "$snap/meta.env"
+        fw_show_live_rules "$instance" > "$snap/live-rules.txt" 2>&1 || true
+        print_ok "Firewall snapshot saved: $snap" >&2
+    else
+        print_info "No persistent snapshot will be kept; a temporary rollback copy exists only for this change." >&2
+    fi
+    echo "$dir"
 }
 
 fw_commit_or_rollback() {
@@ -16005,8 +14930,8 @@ fw_commit_or_rollback() {
 fw_policy_add_rule() {
     local instance="$1" rollback rule file tmp
     ensure_firewall_policy_file "$instance" || return 1
-    rule="$(fw_rule_wizard "$instance" || true)"; [[ -n "$rule" ]] || return 0
     rollback="$(fw_prepare_change "$instance" add-rule)"
+    rule="$(fw_rule_wizard "$instance" || true)"; [[ -n "$rule" ]] || { rm -rf "$rollback"; return 0; }
     file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"; jq --argjson r "$rule" '.rules += [$r]' "$file" > "$tmp" && mv "$tmp" "$file"
     fw_commit_or_rollback "$instance" "$rollback"
 }
@@ -16014,16 +14939,15 @@ fw_policy_add_rule() {
 fw_choose_rule_index() {
     local instance="$1" count choice
     fw_list_rules "$instance" >&2; count="$(jq '.rules|length' "$(firewall_policy_file "$instance")")"; ((count>0)) || return 1
-    while true; do ui_read choice "Select rule number (0=cancel): " || return 1; [[ "$choice" == 0 ]] && return 1; [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=count)) && { echo "$choice"; return 0; }; print_warn "Invalid selection." >&2; done
+    while true; do read -r -p "Select rule number (0=cancel): " choice || true; [[ "$choice" == 0 ]] && return 1; [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=count)) && { echo "$choice"; return 0; }; print_warn "Invalid selection." >&2; done
 }
 
 fw_policy_edit_rule() {
     local instance="$1" idx old rollback rule file tmp oldid
     ensure_firewall_policy_file "$instance" || return 1; idx="$(fw_choose_rule_index "$instance" || true)"; [[ -n "$idx" ]] || return 0
-    old="$(fw_rule_json_by_index "$instance" "$idx")"; oldid="$(jq -r '.id' <<<"$old")"
+    old="$(fw_rule_json_by_index "$instance" "$idx")"; oldid="$(jq -r '.id' <<<"$old")"; rollback="$(fw_prepare_change "$instance" edit-rule)"
     print_info "Rebuild the selected rule. Its stable ID will be preserved: $oldid"
-    rule="$(fw_rule_wizard "$instance" "$idx" "$old" || true)"; [[ -n "$rule" ]] || return 0
-    rollback="$(fw_prepare_change "$instance" edit-rule)"
+    rule="$(fw_rule_wizard "$instance" "$idx" "$old" || true)"; [[ -n "$rule" ]] || { rm -rf "$rollback"; return 0; }
     rule="$(jq --arg id "$oldid" '.id=$id' <<<"$rule")"; file="$(firewall_policy_file "$instance")"; tmp="$(mktemp)"
     jq --argjson i "$((idx-1))" --argjson r "$rule" '.rules[$i]=$r' "$file" > "$tmp" && mv "$tmp" "$file"
     fw_commit_or_rollback "$instance" "$rollback"
@@ -16054,19 +14978,19 @@ fw_base_policy_menu() {
     ensure_firewall_policy_file "$instance" || return 1
     while true; do
         echo; echo "==== Base ocserv firewall policy: $instance ===="
-        ui_line "1) Toggle managed TCP/UDP ingress (current: $(state_get "$instance" FIREWALL_BASE_INGRESS 2>/dev/null || echo 1))"
-        ui_line "2) Toggle base VPN FORWARD pair (current: $(state_get "$instance" FIREWALL_BASE_FORWARD 2>/dev/null || echo 1))"
-        ui_line "3) IPv4 NAT mode (current: $(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || echo masquerade))"
-        ui_line "4) Primary outbound interface / detected route (current: $(fw_primary_out_iface "$instance"))"
-        ui_line "5) IPv6 NAT66 toggle (current: $(state_get "$instance" IPV6_NAT 2>/dev/null || echo 0))"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Toggle managed TCP/UDP ingress (current: $(state_get "$instance" FIREWALL_BASE_INGRESS 2>/dev/null || echo 1))"
+        echo "2) Toggle base VPN FORWARD pair (current: $(state_get "$instance" FIREWALL_BASE_FORWARD 2>/dev/null || echo 1))"
+        echo "3) IPv4 NAT mode (current: $(state_get "$instance" FIREWALL_BASE_NAT_MODE 2>/dev/null || echo masquerade))"
+        echo "4) Primary outbound interface / detected route (current: $(fw_primary_out_iface "$instance"))"
+        echo "5) IPv6 NAT66 toggle (current: $(state_get "$instance" IPV6_NAT 2>/dev/null || echo 0))"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) rollback="$(fw_prepare_change "$instance" base-ingress)"; [[ "$(state_get "$instance" FIREWALL_BASE_INGRESS 2>/dev/null || echo 1)" == 1 ]] && state_set "$instance" FIREWALL_BASE_INGRESS 0 || state_set "$instance" FIREWALL_BASE_INGRESS 1; fw_commit_or_rollback "$instance" "$rollback" ;;
             2) rollback="$(fw_prepare_change "$instance" base-forward)"; [[ "$(state_get "$instance" FIREWALL_BASE_FORWARD 2>/dev/null || echo 1)" == 1 ]] && state_set "$instance" FIREWALL_BASE_FORWARD 0 || state_set "$instance" FIREWALL_BASE_FORWARD 1; fw_commit_or_rollback "$instance" "$rollback" ;;
             3)
-                ui_line "1) MASQUERADE (recommended for dynamic/default egress)"; ui_line "2) SNAT to a selected local IP"; ui_line "3) No base IPv4 NAT"
-                ui_read mode "Select: " || return 1; rollback="$(fw_prepare_change "$instance" base-nat)"
+                echo "1) MASQUERADE (recommended for dynamic/default egress)"; echo "2) SNAT to a selected local IP"; echo "3) No base IPv4 NAT"
+                read -r -p "Select: " mode || true; rollback="$(fw_prepare_change "$instance" base-nat)"
                 case "$mode" in 1) state_set "$instance" FIREWALL_BASE_NAT_MODE masquerade; state_set "$instance" FIREWALL_BASE_SNAT_IP "" ;; 2) ip="$(fw_choose_local_ipv4 "Choose local IPv4 for base SNAT")"; state_set "$instance" FIREWALL_BASE_NAT_MODE snat; state_set "$instance" FIREWALL_BASE_SNAT_IP "$ip" ;; 3) state_set "$instance" FIREWALL_BASE_NAT_MODE none ;; *) rm -rf "$rollback"; continue ;; esac
                 fw_commit_or_rollback "$instance" "$rollback"
                 ;;
@@ -16081,9 +15005,9 @@ fw_base_policy_menu() {
 
 fw_activate_simple_persistent_now() {
     local instance="$1" rollback
-    print_warn "This mode disables Manager-owned INPUT/FORWARD/NAT rules for this instance and uses broad host-wide source NAT."
-    ask_yes_no "Apply iptables-persistent legacy/plain mode now?" "n" || return 0
     rollback="$(fw_prepare_change "$instance" iptables-persistent-legacy-plain)"
+    print_warn "This mode disables Manager-owned INPUT/FORWARD/NAT rules for this instance and uses broad host-wide source NAT."
+    ask_yes_no "Apply iptables-persistent legacy/plain mode now?" "n" || { rm -rf "$rollback"; return 0; }
     fw_optional_backup_existing_persistent_rules
 
     # Migration cleanup is internal and runs only once when moving an older
@@ -16117,19 +15041,14 @@ fw_activate_simple_persistent_now() {
 }
 
 fw_backend_menu() {
-    local instance="$1" rollback state
-    rollback="$(fw_temp_rollback_bundle "$instance")" || return 1
+    local instance="$1" rollback
+    rollback="$(fw_prepare_change "$instance" firewall-profile-change)"
     if ! configure_firewall_mode "$instance"; then
         rm -rf "$rollback"
         return 1
     fi
-    state="$(instance_state_file "$instance")"
-    if [[ -f "$rollback/state.env" ]] && cmp -s "$rollback/state.env" "$state"; then
-        rm -rf "$rollback"
-        print_info "Firewall profile unchanged; no snapshot was created."
-        return 0
-    fi
-    fw_keep_prechange_snapshot "$instance" firewall-profile-change "$rollback"
+    # A profile change can keep the same backend while changing NAT/persistence,
+    # so always re-apply the full saved policy instead of comparing only backend.
     fw_commit_or_rollback "$instance" "$rollback"
 }
 
@@ -16159,8 +15078,8 @@ fw_restore_snapshot_menu() {
     root="$(fw_snapshot_dir_for_instance "$instance")"; [[ -d "$root" ]] || { print_warn "No persistent firewall snapshots exist for $instance."; return 0; }
     while IFS= read -r d; do [[ -d "$d" ]] && snaps+=("$d"); done < <(find "$root" -mindepth 1 -maxdepth 1 -type d -printf '%p\n' | sort -r)
     ((${#snaps[@]})) || { print_warn "No snapshots found."; return 0; }
-    echo "Firewall snapshots:"; for ((i=0;i<${#snaps[@]};i++)); do ui_line "$((i+1))) ${snaps[$i]}"; done; ui_line "0) Cancel"
-    ui_read choice "Select: " || return 1
+    echo "Firewall snapshots:"; for ((i=0;i<${#snaps[@]};i++)); do printf '%d) %s\n' "$((i+1))" "${snaps[$i]}"; done; echo "0) Cancel"
+    read -r -p "Select: " choice || true
     [[ "$choice" == 0 ]] && return 0
     [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#snaps[@]})) || { print_warn "Invalid selection."; return 0; }
     d="${snaps[$((choice-1))]}"
@@ -16186,8 +15105,8 @@ fw_restore_snapshot_menu() {
 
 fw_reset_defaults() {
     local instance="$1" rollback mode file tmp
-    echo "Reset options:"; ui_line "1) Reset base/custom policy but keep current backend"; ui_line "2) Full Manager firewall defaults (iptables + base ingress/forward/MASQUERADE + no custom rules)"; ui_line "0) Cancel"
-    ui_read mode "Select: " || return 1; [[ "$mode" == 0 ]] && return 0
+    echo "Reset options:"; echo "1) Reset base/custom policy but keep current backend"; echo "2) Full Manager firewall defaults (iptables + base ingress/forward/MASQUERADE + no custom rules)"; echo "0) Cancel"
+    read -r -p "Select: " mode || true; [[ "$mode" == 0 ]] && return 0
     ask_yes_no "Reset the saved firewall policy for $instance?" "n" || return 0; rollback="$(fw_prepare_change "$instance" reset-defaults)"
     state_set "$instance" FIREWALL_PROFILE iptables-standard; state_set "$instance" FIREWALL_BASE_INGRESS 1; state_set "$instance" FIREWALL_BASE_FORWARD 1; state_set "$instance" FIREWALL_BASE_NAT_MODE masquerade; state_set "$instance" FIREWALL_BASE_SNAT_IP ""; state_set "$instance" FIREWALL_GLOBAL_MASQUERADE 0; state_set "$instance" FIREWALL_PERSISTENCE manager; state_set "$instance" OUT_IFACE "$(default_route_iface)"; state_set "$instance" FIREWALL_PRIMARY_ROUTE "default(auto)"
     [[ "$mode" == 2 ]] && state_set "$instance" FIREWALL_MODE iptables
@@ -16218,13 +15137,13 @@ fw_choose_interface_simple() {
         items+=("$name"); states+=("${state:-?}"); addrs+=("${addr:-no-ipv4}")
     done < <(ip -o link show 2>/dev/null)
     echo "$prompt" >&2
-    [[ "$allow_any" == 1 ]] && ui_line "0) Any interface" >&2
+    [[ "$allow_any" == 1 ]] && echo "0) Any interface" >&2
     for ((i=0;i<${#items[@]};i++)); do
-        ui_line "$((i+1))) ${items[$i]} state=${states[$i]} ipv4=${addrs[$i]}"
+        printf '%d) %s  state=%s  ipv4=%s\n' "$((i+1))" "${items[$i]}" "${states[$i]}" "${addrs[$i]}" >&2
     done
     echo "m) Enter interface manually" >&2
     while true; do
-        ui_read choice "Select: " || return 1
+        read -r -p "Select: " choice || true
         [[ "$allow_any" == 1 && "$choice" == 0 ]] && { echo ""; return 0; }
         if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#items[@]})); then
             echo "${items[$((choice-1))]}"; return 0
@@ -16279,8 +15198,7 @@ fw_simple_rule_list() {
         print_info "No extra managed firewall rules for $instance."
         return 0
     fi
-    # One compact record per rule; avoid a 100+-column row on SSH terminals.
-    jq -r '.rules | to_entries[] | . as $e | (if $e.value.enabled==false then "OFF" else "ON " end) as $st | [$e.key+1,$st,($e.value.kind // "unknown"),($e.value.source // "any"),($e.value.destination // "any"),($e.value.out_iface // "any"),($e.value.description // "")] | @tsv' "$file" | awk -F '\t' '{printf "%s) %s - %s\n   Source: %s\n   Destination: %s\n   Interface: %s\n   Description: %s\n",$1,$2,$3,$4,$5,$6,$7}'
+    jq -r '.rules | to_entries[] | . as $e | (if $e.value.enabled==false then "OFF" else "ON " end) as $st | [$e.key+1,$st,($e.value.kind // "unknown"),($e.value.source // "any"),($e.value.destination // "any"),($e.value.out_iface // "any"),($e.value.description // "")] | @tsv' "$file" | awk -F '\t' '{printf "%s) %s  %s  src=%s  dst=%s  out=%s  %s\n",$1,$2,$3,$4,$5,$6,$7}'
 }
 
 fw_reload_rules_v4() {
@@ -16302,11 +15220,11 @@ fw_backup_restore_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Firewall backup / restore: $instance ===="
-        ui_line "1) Create snapshot"
-        ui_line "2) Restore snapshot"
-        ui_line "3) Reset firewall profile to Manager defaults"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Create snapshot"
+        echo "2) Restore snapshot"
+        echo "3) Reset firewall profile to Manager defaults"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) fw_create_snapshot "$instance" manual || true; pause ;;
             2) fw_restore_snapshot_menu "$instance"; pause ;;
@@ -16320,11 +15238,11 @@ fw_backup_restore_menu() {
 fw_netfilter_persistent_service_menu() {
     local choice
     echo "netfilter-persistent service: $(systemctl is-enabled netfilter-persistent.service 2>/dev/null || echo not-installed/disabled) / $(systemctl is-active netfilter-persistent.service 2>/dev/null || echo inactive)"
-    ui_line "1) Enable service at boot"
-    ui_line "2) Disable service at boot"
-    ui_line "3) Restart/reload service now"
-    ui_line "0) Back"
-    ui_read choice "Select: " || return 1
+    echo "1) Enable service at boot"
+    echo "2) Disable service at boot"
+    echo "3) Restart/reload service now"
+    echo "0) Back"
+    read -r -p "Select: " choice || true
     case "$choice" in
         1) install_available_packages iptables iptables-persistent; systemctl enable netfilter-persistent.service; print_ok "netfilter-persistent enabled." ;;
         2) print_warn "Disabling this service affects the whole host, not only ocserv."; ask_yes_no "Disable netfilter-persistent at boot?" "n" && systemctl disable netfilter-persistent.service ;;
@@ -16342,14 +15260,14 @@ fw_iptables_management_menu() {
         echo "Global MASQUERADE: $(iptables -t nat -C POSTROUTING -j MASQUERADE >/dev/null 2>&1 && echo ON || echo OFF)"
         echo "Saved IPv4 rules: $([[ -s "$IPTABLES_RULES_V4" ]] && echo present || echo not-saved)"
         echo
-        ui_line "1) Apply iptables-persistent legacy/plain mode"
-        ui_line "2) Show current rules"
-        ui_line "3) Save current IPv4 rules"
-        ui_line "4) Reload saved IPv4 rules"
-        ui_line "5) Global MASQUERADE on/off"
-        ui_line "6) netfilter-persistent service"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Apply iptables-persistent legacy/plain mode"
+        echo "2) Show current rules"
+        echo "3) Save current IPv4 rules"
+        echo "4) Reload saved IPv4 rules"
+        echo "5) Global MASQUERADE on/off"
+        echo "6) netfilter-persistent service"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) fw_activate_simple_persistent_now "$instance"; pause ;;
             2) iptables -S 2>/dev/null || true; echo; iptables -t nat -S 2>/dev/null || true; pause ;;
@@ -16370,11 +15288,11 @@ fw_add_ufw_rule_simple() {
         ask_yes_no "Switch this instance backend to UFW so the managed UFW rule is applied?" "n" || return 0
         state_set "$instance" FIREWALL_MODE ufw
     fi
-    echo "Direction: 1) in  2) out  3) route"; ui_read choice "Select [1]: " || return 1
+    echo "Direction: 1) in  2) out  3) route"; read -r -p "Select [1]: " choice || true
     case "${choice:-1}" in 2) direction=out ;; 3) direction=route ;; *) direction=in ;; esac
-    echo "Action: 1) allow  2) deny  3) reject  4) limit"; ui_read choice "Select [1]: " || return 1
+    echo "Action: 1) allow  2) deny  3) reject  4) limit"; read -r -p "Select [1]: " choice || true
     case "${choice:-1}" in 2) action=deny ;; 3) action=reject ;; 4) action=limit ;; *) action=allow ;; esac
-    echo "Protocol: 1) any  2) tcp  3) udp"; ui_read choice "Select [1]: " || return 1
+    echo "Protocol: 1) any  2) tcp  3) udp"; read -r -p "Select [1]: " choice || true
     case "${choice:-1}" in 2) proto=tcp ;; 3) proto=udp ;; *) proto=all ;; esac
     dport="$(ask_value "Destination port (blank = any)" "")"
     source="$(fw_choose_source "$instance" ipv4)"; dest="$(fw_choose_destination ipv4)"
@@ -16403,16 +15321,16 @@ fw_ufw_management_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== UFW management: $instance ===="
-        ui_line "1) Install UFW package"
-        ui_line "2) Show UFW status / numbered rules"
-        ui_line "3) Enable UFW"
-        ui_line "4) Disable UFW"
-        ui_line "5) Reload UFW"
-        ui_line "6) Add a managed UFW rule"
-        ui_line "7) Delete a UFW rule by number"
-        ui_line "8) Switch this instance backend to UFW"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Install UFW package"
+        echo "2) Show UFW status / numbered rules"
+        echo "3) Enable UFW"
+        echo "4) Disable UFW"
+        echo "5) Reload UFW"
+        echo "6) Add a managed UFW rule"
+        echo "7) Delete a UFW rule by number"
+        echo "8) Switch this instance backend to UFW"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) install_available_packages ufw; pause ;;
             2) command -v ufw >/dev/null 2>&1 && { ufw status verbose || true; ufw status numbered || true; } || print_warn "UFW is not installed."; pause ;;
@@ -16432,14 +15350,14 @@ fw_routing_nat_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Routing / NAT: $instance ===="
-        ui_line "1) Select primary outbound interface / detected route"
-        ui_line "2) Configure base IPv4 NAT (MASQUERADE / SNAT / none)"
-        ui_line "3) Add VPN FORWARD rule through an interface"
-        ui_line "4) Add VPN MASQUERADE rule on an interface"
-        ui_line "5) Add/edit advanced NAT or forwarding rule"
-        ui_line "6) Show detected interfaces, local IPs, routes and policy rules"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Select primary outbound interface / detected route"
+        echo "2) Configure base IPv4 NAT (MASQUERADE / SNAT / none)"
+        echo "3) Add VPN FORWARD rule through an interface"
+        echo "4) Add VPN MASQUERADE rule on an interface"
+        echo "5) Add/edit advanced NAT or forwarding rule"
+        echo "6) Show detected interfaces, local IPs, routes and policy rules"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) local rb; rb="$(fw_prepare_change "$instance" primary-outbound)"; fw_select_primary_outbound "$instance"; fw_commit_or_rollback "$instance" "$rb"; pause ;;
             2) fw_base_policy_menu "$instance" ;;
@@ -16459,14 +15377,14 @@ fw_rules_management_menu() {
         echo; echo "==== Managed firewall rules: $instance ===="
         fw_simple_rule_list "$instance"
         echo
-        ui_line "1) Add rule"
-        ui_line "2) Edit rule"
-        ui_line "3) Enable/disable rule"
-        ui_line "4) Delete rule"
-        ui_line "5) Clone rule"
-        ui_line "6) Remove all managed custom rules"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Add rule"
+        echo "2) Edit rule"
+        echo "3) Enable/disable rule"
+        echo "4) Delete rule"
+        echo "5) Clone rule"
+        echo "6) Remove all managed custom rules"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) fw_policy_add_rule "$instance"; pause ;;
             2) fw_policy_edit_rule "$instance"; pause ;;
@@ -16493,13 +15411,13 @@ fw_status_menu() {
         echo; echo "==== Firewall status: $instance ===="
         fw_policy_summary "$instance"
         echo
-        ui_line "1) Apply current saved profile"
-        ui_line "2) Show Manager-owned rules"
-        ui_line "3) Show full host firewall (read-only)"
-        ui_line "4) Show detected network"
-        ui_line "5) Network path report (read-only)"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Apply current saved profile"
+        echo "2) Show Manager-owned rules"
+        echo "3) Show full host firewall (read-only)"
+        echo "4) Show detected network"
+        echo "5) Network path report (read-only)"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) apply_firewall_for_instance "$instance"; pause ;;
             2) fw_show_live_rules "$instance"; pause ;;
@@ -16520,14 +15438,14 @@ firewall_manager_menu() {
         echo "Current profile: $(fw_profile_for_instance "$instance")"
         echo "Global MASQUERADE: $(iptables -t nat -C POSTROUTING -j MASQUERADE >/dev/null 2>&1 && echo ON || echo OFF)"
         echo
-        ui_line "1) Choose/change firewall mode"
-        ui_line "2) iptables"
-        ui_line "3) UFW"
-        ui_line "4) Advanced NAT / routing / managed rules"
-        ui_line "5) Backup / restore"
-        ui_line "6) Status / diagnostics"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Choose/change firewall mode"
+        echo "2) iptables"
+        echo "3) UFW"
+        echo "4) Advanced NAT / routing / managed rules"
+        echo "5) Backup / restore"
+        echo "6) Status / diagnostics"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) fw_backend_menu "$instance"; pause ;;
             2) fw_iptables_management_menu "$instance" ;;
@@ -16545,14 +15463,14 @@ instance_detail_menu() {
     local instance="$1" choice
     while true; do
         echo; echo "==== Instance: $instance ===="
-        ui_line "1) Status"; ui_line "2) Start"; ui_line "3) Stop"; ui_line "4) Restart"; ui_line "5) Reload"
-        ui_line "6) Logs"; ui_line "7) Users"; ui_line "8) Groups"; ui_line "9) Configuration"
-        ui_line "10) Virtual hosts (SNI)"; ui_line "11) Diagnostics"; ui_line "12) Repair"
-        ui_line "13) Clone"; ui_line "14) Delete instance"; ui_line "15) Connection stability / mobile roaming / restore"
-        ui_line "16) config-per-user / config-per-group settings"
-        ui_line "17) Firewall (iptables / iptables-persistent / UFW)"
-        ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Status"; echo "2) Start"; echo "3) Stop"; echo "4) Restart"; echo "5) Reload"
+        echo "6) Logs"; echo "7) Users"; echo "8) Groups"; echo "9) Configuration"
+        echo "10) Virtual hosts (SNI)"; echo "11) Diagnostics"; echo "12) Repair"
+        echo "13) Clone"; echo "14) Delete instance"; echo "15) Connection stability / mobile roaming / restore"
+        echo "16) config-per-user / config-per-group settings"
+        echo "17) Firewall (iptables / iptables-persistent / UFW)"
+        echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) show_instance_status "$instance"; pause;;
             2) start_instance "$instance"; pause;; 3) stop_instance "$instance"; pause;; 4) restart_instance "$instance"; pause;; 5) reload_instance "$instance"; pause;;
@@ -16572,8 +15490,8 @@ instances_menu() {
     local choice instance
     while true; do
         echo; echo "==== Ocserv Instances ===="
-        ui_line "1) List/status dashboard"; ui_line "2) Create new instance"; ui_line "3) Manage existing instance"; ui_line "4) Import existing ocserv installation"; ui_line "5) Migrate/copy default single instance to named multi-instance"; ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) List/status dashboard"; echo "2) Create new instance"; echo "3) Manage existing instance"; echo "4) Import existing ocserv installation"; echo "5) Migrate/copy default single instance to named multi-instance"; echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) status_dashboard || print_warn "Dashboard completed with one or more non-fatal errors."; pause;; 2) create_instance_wizard; pause;;
             3) instance="$(choose_instance)" && instance_detail_menu "$instance";;
@@ -16664,8 +15582,8 @@ uninstall_menu() {
     local choice instance
     while true; do
         echo; echo "==== Safe Uninstall ===="
-        ui_line "1) Remove one instance"; ui_line "2) Remove manager UI/API only (preserve VPN runtime)"; ui_line "3) Full cleanup"; ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Remove one instance"; echo "2) Remove manager UI/API only (preserve VPN runtime)"; echo "3) Full cleanup"; echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in 1) instance="$(choose_instance)" && delete_instance "$instance"; pause;; 2) uninstall_manager_ui_only; return;; 3) uninstall_everything_menu; return;; 0) return;; *) print_warn "Invalid selection.";; esac
     done
 }
@@ -16692,14 +15610,10 @@ show_versions() {
 }
 
 apply_manager_self_update() {
-    central_full_assert_normal || return 1
-    local backup backup_policy="no"
+    local backup
     bash -n "$0" || { print_err "Current script syntax is invalid; refusing update."; return 1; }
     backup=""
-    # This is one coordinated update transaction. The user's answer also
-    # controls persistent backups for an installed integrated Central runtime.
-    if ask_yes_no "Keep a persistent backup for this update (Manager + Central)?" "y"; then
-        backup_policy="yes"
+    if ask_yes_no "Create a persistent backup before updating the Manager code?" "y"; then
         ensure_backup_root
         backup="$BACKUP_ROOT/manager-update-$(date +%Y%m%d-%H%M%S)"; mkdir -p "$backup"
         [[ -f "$MANAGER_BIN" ]] && cp -a "$MANAGER_BIN" "$backup/ocserv-manager.previous"
@@ -16714,7 +15628,7 @@ apply_manager_self_update() {
     [[ -n "$backup" ]] && print_info "Backup: $backup" || print_info "Backup: not created (declined)"
     if [[ -x "$CENTRAL_MANAGER_BIN" || -f /etc/systemd/system/ocserv-central.service || -f /etc/systemd/system/ocserv-central-agent.service ]]; then
         print_info "An integrated Central installation was detected. Updating its embedded code/components without reconfigure..."
-        update_embedded_central_without_reconfigure "$backup_policy" || print_warn "Central update reported an error; existing Central configuration was not intentionally reconfigured."
+        update_embedded_central_without_reconfigure || print_warn "Central update reported an error; existing Central configuration was not intentionally reconfigured."
     fi
 }
 
@@ -16722,8 +15636,8 @@ backup_menu() {
     local choice
     while true; do
         echo; echo "==== Backup / Restore ===="
-        ui_line "1) Create backup"; ui_line "2) Restore backup"; ui_line "3) List backups"; ui_line "0) Back"
-        ui_read choice "Select: " || return 1
+        echo "1) Create backup"; echo "2) Restore backup"; echo "3) List backups"; echo "0) Back"
+        read -r -p "Select: " choice || true
         case "$choice" in 1) backup_interactive; pause;; 2) restore_backup_interactive; pause;; 3) ls -lh "$BACKUP_ROOT"/*.tar.gz 2>/dev/null || echo "No backups."; pause;; 0) return;; *) print_warn "Invalid selection.";; esac
     done
 }
@@ -16748,21 +15662,21 @@ main_menu() {
         echo "=================================================="
         echo " $PROGRAM_NAME v$PROGRAM_VERSION"
         echo "=================================================="
-        ui_line "1) Install / update ocserv (choose version, no reconfigure)"
-        ui_line "2) Instances (default + multi-instance)"
-        ui_line "3) Users"
-        ui_line "4) Groups"
-        ui_line "5) Certificates"
-        ui_line "6) Backup / restore"
-        ui_line "7) Diagnostics dashboard"
-        ui_line "8) Open integrated Ocserv Central Manager"
-        ui_line "9) JSON / read-only API"
-        ui_line "10) Audit logging settings"
-        ui_line "11) Version information"
-        ui_line "12) Apply this Manager code update without reconfigure"
-        ui_line "13) Safe uninstall"
-        ui_line "0) Exit"
-        ui_read choice "Select: " || return 1
+        echo "1) Install / update ocserv (choose version, no reconfigure)"
+        echo "2) Instances (default + multi-instance)"
+        echo "3) Users"
+        echo "4) Groups"
+        echo "5) Certificates"
+        echo "6) Backup / restore"
+        echo "7) Diagnostics dashboard"
+        echo "8) Open integrated Ocserv Central Manager"
+        echo "9) JSON / read-only API"
+        echo "10) Audit logging settings"
+        echo "11) Version information"
+        echo "12) Apply this Manager code update without reconfigure"
+        echo "13) Safe uninstall"
+        echo "0) Exit"
+        read -r -p "Select: " choice || true
         case "$choice" in
             1) install_or_update_ocserv; pause;;
             2) instances_menu;;
@@ -16770,7 +15684,7 @@ main_menu() {
             4) instance="$(choose_instance)" && group_management_menu "$instance";;
             5) certificate_manager;;
             6) backup_menu;;
-            7) status_dashboard; if instance="$(choose_instance)"; then if ask_yes_no "Run detailed diagnostics for $instance?" "n"; then run_instance_diagnostics "$instance"; fi; if ask_yes_no "Open Stability Doctor for $instance?" "n"; then stability_doctor_menu "$instance"; fi; fi; pause;;
+            7) status_dashboard; if instance="$(choose_instance 2>/dev/null)"; then if ask_yes_no "Run detailed diagnostics for $instance?" "n"; then run_instance_diagnostics "$instance"; fi; if ask_yes_no "Open Stability Doctor for $instance?" "n"; then stability_doctor_menu "$instance"; fi; fi; pause;;
             8) central_menu;;
             9) api_menu;;
             10) configure_audit_logging; pause;;
@@ -16861,27 +15775,7 @@ case "${1:-}" in
         exit $?
         ;;
     --central-install)
-        need_root; ensure_dirs; central_full_assert_normal || exit 1; install_embedded_central_manager_code
-        exit $?
-        ;;
-    --central-full-menu)
-        need_root; ensure_dirs; central_full_menu
-        exit $?
-        ;;
-    --central-full-status)
-        need_root; central_full_status
-        exit $?
-        ;;
-    --central-full-suspend)
-        need_root; ensure_dirs; central_full_suspend
-        exit $?
-        ;;
-    --central-full-resume)
-        need_root; ensure_dirs; central_full_resume
-        exit $?
-        ;;
-    --central-full-recover)
-        need_root; ensure_dirs; central_full_recover
+        need_root; ensure_dirs; install_embedded_central_manager_code
         exit $?
         ;;
     --central-menu)
@@ -16917,11 +15811,6 @@ Usage: $0 [option]
   --central-sync-local-master-profile Sync current local Master token/profile to already attached local instances
   --central-import-v19-node [node.env] Import v19 Node API settings into the v20.4.4 source-aware shared instance profile
   --central-menu            Open the integrated Central Manager console
-  --central-full-menu       Full suspend/resume maintenance console (LOCAL host)
-  --central-full-status     Show whether the local Central integration is suspended
-  --central-full-suspend    Safely detach all local Central hooks; stop/disable Master/Agents
-  --central-full-resume     Restore captured hook configs and original service states
-  --central-full-recover    Recover interrupted suspend/resume transaction
   --central-update          Update installed Central code/components without reconfigure
   --central-status          Show integrated Central status
   (no option)               Interactive menu
